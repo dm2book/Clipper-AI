@@ -1,0 +1,372 @@
+{
+  "source_id": "demo-founder-interview",
+  "language": "en",
+  "utterances": [
+    {
+      "start_ms": 1000,
+      "end_ms": 9076,
+      "speaker": "HOST",
+      "text": "Welcome back to the show. I'm here with Dana, who I've been trying to get on for about a year now."
+    },
+    {
+      "start_ms": 9296,
+      "end_ms": 11603,
+      "speaker": "GUEST",
+      "text": "Thanks for having me. Long overdue."
+    },
+    {
+      "start_ms": 11823,
+      "end_ms": 13746,
+      "speaker": "HOST",
+      "text": "How was the flight in?"
+    },
+    {
+      "start_ms": 13966,
+      "end_ms": 17812,
+      "speaker": "GUEST",
+      "text": "Fine, delayed a bit, but fine. Slept most of it."
+    },
+    {
+      "start_ms": 18032,
+      "end_ms": 23032,
+      "speaker": "HOST",
+      "text": "Good. So let's start at the beginning. Walk me through the early days."
+    },
+    {
+      "start_ms": 23252,
+      "end_ms": 29021,
+      "speaker": "GUEST",
+      "text": "So we started in 2019, two of us, working out of my apartment in Oakland."
+    },
+    {
+      "start_ms": 29241,
+      "end_ms": 32317,
+      "speaker": "HOST",
+      "text": "And what was the product at that point?"
+    },
+    {
+      "start_ms": 32537,
+      "end_ms": 38306,
+      "speaker": "GUEST",
+      "text": "Honestly it was a spreadsheet with a login screen bolted on top. That was it."
+    },
+    {
+      "start_ms": 38526,
+      "end_ms": 44679,
+      "speaker": "GUEST",
+      "text": "We hit a hundred thousand dollars in revenue in the first eleven months, which nobody believed."
+    },
+    {
+      "start_ms": 44899,
+      "end_ms": 46299,
+      "speaker": "HOST",
+      "text": "From a spreadsheet."
+    },
+    {
+      "start_ms": 46519,
+      "end_ms": 54211,
+      "speaker": "GUEST",
+      "text": "From a spreadsheet. We scaled it to 2.4 million ARR before we wrote a single line of real backend code."
+    },
+    {
+      "start_ms": 54431,
+      "end_ms": 55831,
+      "speaker": "HOST",
+      "text": "That's genuinely absurd."
+    },
+    {
+      "start_ms": 56051,
+      "end_ms": 62204,
+      "speaker": "GUEST",
+      "text": "It is absurd. And it worked because we were solving something people were already doing manually."
+    },
+    {
+      "start_ms": 62424,
+      "end_ms": 70116,
+      "speaker": "GUEST",
+      "text": "Then in 2021 we raised a Series A. Eighteen million dollars. That was the worst decision I have ever made."
+    },
+    {
+      "start_ms": 70336,
+      "end_ms": 72643,
+      "speaker": "HOST",
+      "text": "Wait, the raise was the mistake?"
+    },
+    {
+      "start_ms": 72863,
+      "end_ms": 81324,
+      "speaker": "GUEST",
+      "text": "The raise was the mistake. We went from twelve people to ninety in seven months and we almost went bankrupt doing it."
+    },
+    {
+      "start_ms": 81544,
+      "end_ms": 92313,
+      "speaker": "GUEST",
+      "text": "I lost everything I'd built. The culture, the speed, all of it. We burned fourteen million dollars in nineteen months and had almost nothing to show for it."
+    },
+    {
+      "start_ms": 92533,
+      "end_ms": 94840,
+      "speaker": "HOST",
+      "text": "How close did you actually get?"
+    },
+    {
+      "start_ms": 95060,
+      "end_ms": 105444,
+      "speaker": "GUEST",
+      "text": "Eleven days of runway. I was terrified. I genuinely thought I was going to have to tell ninety people they were out of a job before Christmas."
+    },
+    {
+      "start_ms": 105664,
+      "end_ms": 112587,
+      "speaker": "GUEST",
+      "text": "Here's what nobody tells you about venture funding. The money isn't the product. The money is a deadline."
+    },
+    {
+      "start_ms": 112807,
+      "end_ms": 127037,
+      "speaker": "GUEST",
+      "text": "I've never said this publicly, but our board pushed us to hire a VP of Sales who cost us about eight months and two million dollars, and I knew it was wrong when I signed the offer."
+    },
+    {
+      "start_ms": 127257,
+      "end_ms": 129564,
+      "speaker": "HOST",
+      "text": "Why did you sign it then?"
+    },
+    {
+      "start_ms": 129784,
+      "end_ms": 137091,
+      "speaker": "GUEST",
+      "text": "Because I was twenty-nine and I thought the adults in the room knew something I didn't. They did not."
+    },
+    {
+      "start_ms": 137311,
+      "end_ms": 141926,
+      "speaker": "GUEST",
+      "text": "Unpopular opinion: most seed-stage startups should never raise institutional money at all."
+    },
+    {
+      "start_ms": 142146,
+      "end_ms": 145607,
+      "speaker": "HOST",
+      "text": "That's going to annoy a lot of your investors."
+    },
+    {
+      "start_ms": 145827,
+      "end_ms": 154673,
+      "speaker": "GUEST",
+      "text": "Probably. But it's true. Venture capital is a specific instrument for a specific shape of business and everyone treats it like it's oxygen."
+    },
+    {
+      "start_ms": 154893,
+      "end_ms": 157200,
+      "speaker": "HOST",
+      "text": "I think that's completely wrong, actually."
+    },
+    {
+      "start_ms": 157420,
+      "end_ms": 158820,
+      "speaker": "GUEST",
+      "text": "Go on."
+    },
+    {
+      "start_ms": 159040,
+      "end_ms": 165963,
+      "speaker": "HOST",
+      "text": "No, that's not what the data says. The companies that get to real scale are overwhelmingly venture backed."
+    },
+    {
+      "start_ms": 166183,
+      "end_ms": 170029,
+      "speaker": "GUEST",
+      "text": "You're missing the point. I'm not saying nobody should raise."
+    },
+    {
+      "start_ms": 170249,
+      "end_ms": 174479,
+      "speaker": "HOST",
+      "text": "That is what you said. You said most startups shouldn't raise."
+    },
+    {
+      "start_ms": 174699,
+      "end_ms": 180468,
+      "speaker": "GUEST",
+      "text": "Let me finish. I said most seed-stage startups. There's a difference and you're flattening it."
+    },
+    {
+      "start_ms": 180688,
+      "end_ms": 185303,
+      "speaker": "HOST",
+      "text": "With all due respect, that's a distinction you invented thirty seconds ago."
+    },
+    {
+      "start_ms": 185523,
+      "end_ms": 192061,
+      "speaker": "GUEST",
+      "text": "It's a distinction that cost me eighteen million dollars to learn, so I'd argue I've earned it."
+    },
+    {
+      "start_ms": 192281,
+      "end_ms": 196511,
+      "speaker": "HOST",
+      "text": "Okay, fair enough. Let me steelman your position for a second."
+    },
+    {
+      "start_ms": 196731,
+      "end_ms": 198131,
+      "speaker": "GUEST",
+      "text": "Please."
+    },
+    {
+      "start_ms": 198351,
+      "end_ms": 207581,
+      "speaker": "HOST",
+      "text": "The counterargument to my point is that survivorship bias makes venture look better than it is. We only ever see the ones that worked."
+    },
+    {
+      "start_ms": 207801,
+      "end_ms": 215493,
+      "speaker": "GUEST",
+      "text": "That's exactly it. On the other hand, I take your point that at a certain scale you genuinely cannot self-fund."
+    },
+    {
+      "start_ms": 215713,
+      "end_ms": 220713,
+      "speaker": "HOST",
+      "text": "Right, so where I'd push back is on the timing, not the principle."
+    },
+    {
+      "start_ms": 220933,
+      "end_ms": 226317,
+      "speaker": "GUEST",
+      "text": "Both things can be true. Raise late, raise less, raise from people who've operated."
+    },
+    {
+      "start_ms": 226537,
+      "end_ms": 230767,
+      "speaker": "GUEST",
+      "text": "You know what the funniest part of the near-death experience was?"
+    },
+    {
+      "start_ms": 230987,
+      "end_ms": 234063,
+      "speaker": "HOST",
+      "text": "I can't imagine anything about that being funny."
+    },
+    {
+      "start_ms": 234283,
+      "end_ms": 241590,
+      "speaker": "GUEST",
+      "text": "We had this all-hands where I was going to tell everyone how bad it was, and the projector broke."
+    },
+    {
+      "start_ms": 241810,
+      "end_ms": 252194,
+      "speaker": "GUEST",
+      "text": "So I'm standing there with a slide deck about our imminent collapse and the IT guy is crawling under the table going, is it plugged in? [laughs]"
+    },
+    {
+      "start_ms": 252414,
+      "end_ms": 253952,
+      "speaker": "HOST",
+      "text": "[laughs] Oh, that's terrible."
+    },
+    {
+      "start_ms": 254172,
+      "end_ms": 258787,
+      "speaker": "GUEST",
+      "text": "It was terrible. It was also the moment I stopped panicking, weirdly."
+    },
+    {
+      "start_ms": 259007,
+      "end_ms": 260930,
+      "speaker": "HOST",
+      "text": "So what actually saved you?"
+    },
+    {
+      "start_ms": 261150,
+      "end_ms": 267303,
+      "speaker": "GUEST",
+      "text": "We cut sixty percent of the team in one day and went back to the spreadsheet."
+    },
+    {
+      "start_ms": 267523,
+      "end_ms": 274061,
+      "speaker": "GUEST",
+      "text": "Not literally, but philosophically. We asked what the twelve of us would build, and we built that."
+    },
+    {
+      "start_ms": 274281,
+      "end_ms": 275681,
+      "speaker": "HOST",
+      "text": "And that worked."
+    },
+    {
+      "start_ms": 275901,
+      "end_ms": 280131,
+      "speaker": "GUEST",
+      "text": "We were profitable fourteen months later and we've never raised again."
+    },
+    {
+      "start_ms": 280351,
+      "end_ms": 289197,
+      "speaker": "GUEST",
+      "text": "The lesson here is that headcount is not progress. I confused the two for about two years and it nearly killed the company."
+    },
+    {
+      "start_ms": 289417,
+      "end_ms": 296340,
+      "speaker": "GUEST",
+      "text": "If I could go back, I'd tell myself to stay small for twice as long as feels comfortable."
+    },
+    {
+      "start_ms": 296560,
+      "end_ms": 297960,
+      "speaker": "HOST",
+      "text": "That's good advice."
+    },
+    {
+      "start_ms": 298180,
+      "end_ms": 306256,
+      "speaker": "GUEST",
+      "text": "My advice would be simpler than that, actually. Before you hire anyone, write down what specifically gets worse if you don't."
+    },
+    {
+      "start_ms": 306476,
+      "end_ms": 313783,
+      "speaker": "GUEST",
+      "text": "If you can't answer that in one sentence, you don't need the hire. You need a decision you're avoiding."
+    },
+    {
+      "start_ms": 314003,
+      "end_ms": 316310,
+      "speaker": "HOST",
+      "text": "Last question. Was it worth it?"
+    },
+    {
+      "start_ms": 316530,
+      "end_ms": 326145,
+      "speaker": "GUEST",
+      "text": "I'll never forget standing in the parking lot after the layoffs. That was the hardest day of my life, and I did it to myself."
+    },
+    {
+      "start_ms": 326365,
+      "end_ms": 336749,
+      "speaker": "GUEST",
+      "text": "So, worth it? The company survived. But I don't think I get to call it worth it. I think I just get to not do it again."
+    },
+    {
+      "start_ms": 336969,
+      "end_ms": 339276,
+      "speaker": "HOST",
+      "text": "Dana, thank you. This was great."
+    },
+    {
+      "start_ms": 339496,
+      "end_ms": 341034,
+      "speaker": "GUEST",
+      "text": "Thanks for having me."
+    }
+  ]
+}
