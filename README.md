@@ -7,22 +7,24 @@ Turn long-form content into short-form vertical clips, automatically.
 
 ## Status
 
-Early implementation. The system design is complete; the first component — the
-viral detection engine — is built and tested. No ingest, render, or publishing
-code yet.
+Early implementation. The system design is complete; two detection engines are
+built and tested. No ingest, render, or publishing code yet.
 
 - [System architecture](docs/ARCHITECTURE.md) — data model, API, workers,
   upload path, processing pipeline, capacity model, delivery phases.
-- **Viral detection engine** (`src/clipforge/viral/`) — stage 4 of the
-  processing pipeline: transcript in, ranked clips out.
+- **Viral detection engine** (`src/clipforge/viral/`) — long-form transcript
+  in, ranked clips out. For podcasts, interviews, uploaded video.
+- **Stream clipper engine** (`src/clipforge/stream/`) — Twitch, Kick and
+  YouTube Live chat in, vertical 15/30/45/60s clips out.
 
 ## Quick start
 
-No dependencies and no credentials needed for the heuristic path:
+No dependencies and no credentials needed:
 
 ```bash
-python demo/run_demo.py            # ranked clips from the sample transcript
-python demo/run_demo.py --json     # machine-readable output
+python demo/run_demo.py            # ranked clips from a sample transcript
+python demo/run_stream_demo.py     # vertical clips from a sample Twitch VOD
+python demo/run_stream_demo.py --all --json
 python -m unittest discover -s tests -t tests
 ```
 
@@ -89,6 +91,60 @@ moment, alongside the full feature vector. That is deliberate: the ranker is
 heuristic today and is meant to be replaced by a model trained on real platform
 performance, which needs to know what the heuristic ranker believed at decision
 time — including about clips it rejected.
+
+## The stream clipper
+
+Twitch, Kick, and YouTube Live. Detects rage, funny moments, wins, fails,
+reactions, donations, arguments, and emotional moments, then cuts each into
+15/30/45/60-second vertical clips.
+
+```
+chat + events + optional transcript + scene regions
+  → classify chat against the emote taxonomy
+  → find chat spikes against a rolling median baseline
+  → LAG-CORRECT the spike onsets into anchors
+  → merge, then cut 15/30/45/60s around each
+  → score every length, suppress overlaps
+  → vertical layout plan per destination
+```
+
+**Chat lag is the whole problem.** Between something happening on screen and a
+message appearing in chat there is broadcast latency, then human reaction, then
+typing — four to five seconds on Twitch, six or more on YouTube Live. A clipper
+that centres on the chat spike starts *after* the moment and captures only the
+aftermath. So the pipeline subtracts a platform-specific lag from the spike
+**onset** (not its peak) before placing any window. On the sample VOD that
+recovers all seven planted moments to within three seconds.
+
+Three other decisions worth knowing:
+
+**Signal strength is a share of chat, not a count.** A 500-message burst
+contains a few of everything, so saturating over raw hits pins every signal at
+1.0 and the engine can no longer tell a rage moment from a donation. Measuring
+the *fraction* of chat carrying each signal restores discrimination and is
+viewer-count independent — the same reason spike detection works on ratios.
+
+**All four lengths are always cut, and the engine says which is best.** A
+headshot needs fifteen seconds; an argument needs a minute, and cutting it to
+fifteen produces a clip where two people are inexplicably annoyed. Fast signals
+(win/fail/funny) prefer short, slow ones (argument/emotional/donation) prefer
+long.
+
+**Vertical is a composition, not a centre crop.** A 16:9 frame cropped to 9:16
+throws away either the gameplay or the streamer's reaction. The planner stacks
+facecam above cropped gameplay and places captions clear of each destination's
+UI chrome — TikTok's right rail, Reels' 20% bottom band. Getting safe zones
+wrong is invisible in preview and wrong on every published clip.
+
+| Module | Responsibility |
+|---|---|
+| `emotes.py` | Emote, emoji, and slang taxonomy → signal weights. Handles multi-signal tokens (OMEGALUL is laughter *at* a fail). |
+| `adapters.py` | Twitch / Kick / YouTube Live normalisation. Kick needs a stream start; its timestamps are wall-clock. |
+| `signals.py` | Chat bucketing, rolling median baseline, spike detection, share-based aggregation. |
+| `anchors.py` | Lag correction, anchor merging, exact-duration window placement. |
+| `layout.py` | 9:16 composition and per-destination safe zones. |
+| `scoring.py` | hype / retention / clarity / virality, plus duration preference. |
+| `engine.py` | Orchestration and configuration. |
 
 ## Reading order
 
