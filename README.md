@@ -7,9 +7,10 @@ Turn long-form content into short-form vertical clips, automatically.
 
 ## Status
 
-Early implementation. The system design is complete; six engines are built
-and tested. No ingest or render code yet — the publishing system builds and
-sequences platform API calls but ships with no live transport.
+Early implementation. The system design is complete; six engines plus the
+channel factory that orchestrates them are built and tested. No ingest or
+render code yet — the publishing system builds and sequences platform API
+calls but ships with no live transport.
 
 - [System architecture](docs/ARCHITECTURE.md) — data model, API, workers,
   upload path, processing pipeline, capacity model, delivery phases.
@@ -26,6 +27,9 @@ sequences platform API calls but ships with no live transport.
 - **Publishing system** (`src/clipforge/publish/`) — OAuth, recurring
   schedules, bulk uploads, a content calendar and a retrying worker loop for
   TikTok, YouTube and Instagram.
+- **Channel factory** (`src/clipforge/factory/`) — create a channel from a
+  niche; it finds content, clips it, hooks it, captions it, composes it and
+  schedules it, independently of every other channel.
 
 ## Quick start
 
@@ -44,6 +48,8 @@ python demo/run_gameplay_demo.py --all    # compare all five gameplay beds
 python demo/run_gameplay_demo.py --camera --ffmpeg
 python demo/run_publish_demo.py           # connect, schedule, publish
 python demo/run_publish_demo.py --calendar --retry --dst
+python demo/run_factory_demo.py           # seven channels, one cycle
+python demo/run_factory_demo.py --niches --rights --quota --isolation
 python -m unittest discover -s tests -t tests
 ```
 
@@ -673,3 +679,161 @@ the process that publishes.
 | `retry.py` | Failure classification into five dispositions; jittered backoff. |
 | `adapters.py` | The three upload state machines, as request builders. |
 | `engine.py` | Scheduling, validation, leases, and the worker loop. |
+
+## The channel factory
+
+Create a channel from a niche; the factory finds content, clips it, writes
+hooks, builds captions, composes the frame and schedules the upload — seven of
+them at once, independently.
+
+```python
+from clipforge.factory import ChannelFactory, Niche
+
+factory = ChannelFactory(publisher=publishing_system, finder=registry)
+cars = factory.create_channel("Redline", Niche.CARS, accounts={...})
+factory.activate(cars.channel_id)
+reports = factory.run_cycle()
+```
+
+```
+Runway (Business)   1 scheduled, 0 blocked, 0 failed   191c
+    ✓ src-business
+        virality 55  24s  12 cues  split
+        hook  “I lost fourteen million learning this”
+              authority, predicted 6.5%
+        → 3 post(s) queued
+```
+
+### A niche is a configuration, not a label
+
+The seven differ in ways that conflict, and getting one wrong is visible in the
+finished video:
+
+| Niche | Bed | Captions | Clip | Cadence |
+|---|---|---|---|---|
+| Cars | **none** | punch | 15–30s | 2/day |
+| Luxury | **none** | minimal | 15–25s | 2/day |
+| Motivation | Subway Surfers | punch | 20–35s | 3/day |
+| Business | Satisfying | karaoke | 25–45s | 2/day |
+| Gaming | **none** | bounce | 15–30s | 4/day |
+| AI | Satisfying | karaoke | 25–45s | 2/day |
+| History | Minecraft parkour | typewriter | 30–50s | 1/day |
+
+**Three niches get no gameplay bed at all.** The split-screen format exists to
+give the eye something to do while someone talks. Cars, Luxury and Gaming
+footage *is* the visual — Subway Surfers under a Lamborghini clip does not add
+retention, it competes with the only thing worth looking at. Business and AI
+get the lowest-salience bed available, because dense speech punishes a busy one.
+
+Gaming is also the one niche routed to the **stream clipper** rather than the
+viral engine: chat spikes find those moments and transcripts do not.
+
+### The viral detectors don't cover every niche, and the factory says so
+
+Running this end to end surfaced a real gap. The viral engine's detectors were
+tuned on founder and podcast material, and a Cars or History clip can be the
+best thirty seconds in an hour while registering **zero signal hits** —
+"horsepower" and "besieged" are not in a taxonomy built around funding rounds.
+
+Widening the general detectors would make every niche noisier to fix three, so
+each niche carries its own vocabulary instead. That drives two things:
+
+- **Re-ranking.** The general engine decides what is a strong moment; the niche
+  decides which strong moment belongs on *this* channel, bounded so the base
+  score still dominates.
+- **A fallback**, when the general detector returns nothing at all. Windows are
+  anchored on the utterance carrying the vocabulary, not swept at a fixed
+  stride — a strided window happily returns one whose domain words are all in
+  its last sentence, and the hook then writes itself about "a longer
+  conversation" because that is what the text it was handed is about. Anything
+  chosen this way is marked in the item's history, because it had no general
+  signal behind it.
+
+### Rights are a state gate, not a disclaimer
+
+This is the part of "finds content" with no technical difficulty and a large
+legal one. Clipping and reuploading someone else's video is infringement unless
+something makes it lawful, and a factory running seven channels unattended does
+it thousands of times before anyone looks. At that volume the exposure is not a
+takedown — it is a pattern of commercial infringement across a portfolio.
+
+So a source carries the basis on which it may be used, an item cannot leave the
+`CLEARED` stage without one the channel accepts, and the default for anything
+discovered rather than supplied is `UNVERIFIED`, which publishes nowhere.
+Accepting unverified material is a named decision that appears in
+`rights_report()`.
+
+Every branch that blocks is a case that would otherwise become a takedown or a
+licence breach:
+
+| Blocked | Why |
+|---|---|
+| No basis recorded | The default, and the only safe one. |
+| Licence expired | A schedule reaching past the expiry publishes without one. |
+| No derivatives permitted | Clipping *is* a derivative work. |
+| CC-NC on a monetised channel | The licence excludes exactly this use. |
+| CC or stock with no attribution | The licence is void without it — and attribution is carried into the caption automatically. |
+
+`expiring_soon()` exists because a factory booking a quarter ahead will publish
+under a licence that lapses next month unless something checks.
+
+`RegistrySourceFinder` serves sources an operator registered and cleared by
+hand. That is not a placeholder: a rights-cleared pipeline genuinely looks like
+this — a licence is signed, the source is entered, the factory works from the
+registry. **An automated crawler is a different product with a different risk
+profile and is deliberately not here.**
+
+### Independence is enforced where it can be, and reported where it cannot
+
+Channels hold their own budgets, breakers, queues and used-source sets, and
+`run_cycle` catches everything a channel can throw. A channel with revoked
+accounts and a channel with no budget both degrade to zero output and say why:
+
+```
+Redline      ran      1 scheduled
+Momentum     skipped  no publishing accounts connected
+Antiquity    ran      0 scheduled — budget: 50c left, item needs ~191c
+```
+
+Two details that matter more than they look. A **blocked** item — rights,
+quality floor, budget — does not count against the circuit breaker, or one
+unlicensed source would take a healthy channel offline; only errors do. And the
+budget is checked *before* an item starts, because a pipeline that dies at the
+render stage has already paid for transcription and detection.
+
+**The one thing channels cannot have to themselves is YouTube's quota.** It is
+per API project — six uploads a day for the entire factory. Seven channels
+asking for two each is fourteen against six, and no amount of process isolation
+changes that arithmetic:
+
+```
+⚠ youtube: the factory wants 14 posts a day against a 6/day project-scoped
+  cap. 8 will not run. Raise the quota, cut cadence, or run fewer channels —
+  adding accounts does not help when the scope is the project.
+```
+
+Allocation is **max-min fair**: equal shares, with whatever a channel does not
+want flowing back to the ones that do, so a channel asking for one post a day is
+not punished for sharing a factory with a channel asking for four. The
+alternative — letting channels race and having the losers fail at post time — is
+what happens by default, and it looks like a flaky product rather than a
+capacity decision.
+
+### What is not built
+
+The pipeline runs on the six engines in this repository, so detection, hooks,
+captions, composition and scheduling all execute for real offline. Two stages
+are protocols with refusing defaults: `Transcriber` (there is no speech
+recognition here, and `NullTranscriber` raises rather than inventing word
+timings that would visibly drift) and the renderer (the gameplay engine emits a
+filtergraph; nothing executes it). Per-stage costs are estimates for budget
+control, not measurements.
+
+| Module | Responsibility |
+|---|---|
+| `niches.py` | The seven profiles — signals, hook types, captions, bed, length, cadence, domain vocabulary. |
+| `sources.py` | Discovery, provenance, and the rights clearance gate. |
+| `channel.py` | Identity, accounts, budget, circuit breaker. |
+| `pipeline.py` | The per-item stage machine over all six engines. |
+| `scheduler.py` | Max-min fair allocation of shared platform quota. |
+| `factory.py` | Orchestration and per-channel isolation. |

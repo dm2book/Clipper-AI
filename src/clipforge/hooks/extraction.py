@@ -91,6 +91,17 @@ _WEAK_TOPICS = frozenset({
     "gotta", "dude", "bro", "man", "mate", "huh", "wow", "damn", "hey",
     "well", "sure", "maybe", "back", "down", "away", "off", "out", "much",
     "many", "even", "still", "let", "lets", "guy", "guys",
+    # Bare adjectives. The `_MODIFIER_SUFFIXES` lookahead only catches
+    # participles and derived forms; a plain adjective has no suffix to spot,
+    # so "I do not have a strong view" hands the determiner bonus to "strong"
+    # and produces "what I have never told anyone about a strong".
+    "strong", "weak", "big", "bigger", "biggest", "small", "hard", "harder",
+    "hardest", "easy", "real", "whole", "entire", "single", "main", "best",
+    "worst", "better", "worse", "good", "bad", "great", "huge", "tiny",
+    "quick", "slow", "simple", "weird", "crazy", "insane", "wild", "first",
+    "last", "next", "right", "wrong", "clear", "full", "empty", "free",
+    "new", "old", "young", "high", "low", "long", "short", "deep", "true",
+    "false", "sad", "happy", "nice", "fine", "cool", "dumb", "smart",
     # time units
     "second", "seconds", "minute", "minutes", "hour", "hours", "day", "days",
     "week", "weeks", "month", "months", "year", "years", "time", "times",
@@ -116,11 +127,10 @@ _DETERMINERS = frozenset({
 })
 
 # Suffixes that mark a token as more likely an adjective or participle than a
-# head noun: in "a guaranteed win" the determiner attaches to the phrase, and
-# the head is the last word, not the first. These are demoted rather than
-# excluded, because plenty of them are nominalisations ("the funding", "the
-# hiring") — a real noun should beat them, but they should still be reachable
-# when nothing else is.
+# head noun. Only a soft demotion now — the head-of-phrase decision is made
+# structurally, by whether a content word follows. These stay because plenty
+# of them are nominalisations ("the funding", "the hiring"): a real noun should
+# beat them, but they should still be reachable when nothing else is.
 _MODIFIER_SUFFIXES = (
     "ed", "ing", "ous", "ful", "ive", "able", "ible", "al", "ic", "ish",
 )
@@ -259,9 +269,11 @@ def extract_topic(text: str, hint: str = "") -> tuple[str, str]:
         if previous in _DETERMINERS:
             # The determiner attaches to the whole noun phrase, so when it is
             # followed by two content words the head is the later one:
-            # "a guaranteed win" is about the win, not the guarantee.
-            modifier = is_content(i + 1) and token.endswith(_MODIFIER_SUFFIXES)
-            if not modifier:
+            # "a guaranteed win" is about the win, "a straight line" about the
+            # line. Gating this on a suffix list only catches participles and
+            # derived forms — a plain adjective has no suffix to spot, and
+            # every one missed becomes a hook reading "about a straight".
+            if not is_content(i + 1):
                 score += 2.5
                 phrases.setdefault(token, f"{previous} {token}")
         elif tokens[i - 2 : i - 1] and tokens[i - 2] in _DETERMINERS:
