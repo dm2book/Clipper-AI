@@ -7,7 +7,7 @@ Turn long-form content into short-form vertical clips, automatically.
 
 ## Status
 
-Early implementation. The system design is complete; four engines are
+Early implementation. The system design is complete; five engines are
 built and tested. No ingest, render, or publishing code yet.
 
 - [System architecture](docs/ARCHITECTURE.md) — data model, API, workers,
@@ -20,6 +20,8 @@ built and tested. No ingest, render, or publishing code yet.
   captions in five languages, exported to ASS / VTT / SRT / JSON.
 - **Hook generator** (`src/clipforge/hooks/`) — twenty ranked hook variations
   per clip across ten types, each with an estimated click-through lift.
+- **Gameplay background engine** (`src/clipforge/gameplay/`) — speaker over a
+  gameplay bed at 1080x1920 60fps, with auto-framing and an ffmpeg filtergraph.
 
 ## Quick start
 
@@ -33,6 +35,9 @@ python demo/run_caption_demo.py           # captions in all five languages
 python demo/run_caption_demo.py --styles  # compare the five presets
 python demo/run_hook_demo.py              # 20 ranked hooks for a sample clip
 python demo/run_hook_demo.py --by-type --clip stream
+python demo/run_gameplay_demo.py          # 1080x1920 60fps composition plan
+python demo/run_gameplay_demo.py --all    # compare all five gameplay beds
+python demo/run_gameplay_demo.py --camera --ffmpeg
 python -m unittest discover -s tests -t tests
 ```
 
@@ -354,3 +359,158 @@ output is worse.
 | `llm.py` | Optional Claude-written hooks, scored by the same estimator. |
 | `engine.py` | Slot fill, dedupe, type diversity, ranking. |
 | `types.py` | `Hook`, `HookSet`, `CtrEstimate`, and the training-table contract. |
+
+## The gameplay background engine
+
+Speaker over a gameplay bed at **1080x1920, 60fps** — Subway Surfers, Minecraft
+parkour, GTA driving, Rocket League, or satisfying loops.
+
+```python
+from clipforge.gameplay import Game, compose
+
+plan = compose(duration_s=28.0, track=face_track, assets=library,
+               game=Game.SUBWAY_SURFERS, word_count=78, speech=spans)
+```
+
+```
+  output      1080x1920 @ 60fps  (28s)
+  speaker     panel 1080x1152 at y=0    source crop 826x882
+  gameplay    panel 1080x768 at y=1152  cover from 1518x1080
+  camera      tracked   93 keyframes  1 cuts  94% held
+```
+
+The engine emits a **render plan** plus the ffmpeg filtergraph and camera
+script that execute it. It decodes no frames and detects no faces: the speaker
+track comes from an upstream detector, exactly as the caption engine takes
+word-level timings rather than inventing them.
+
+### The camera is the hard part
+
+A face tracker gives you boxes that jitter several pixels between frames,
+vanish whenever the speaker turns their head, and arrive at 10fps when the
+output is 60. Cropping straight to them produces video that is unpleasant to
+watch — none of which is visible looking at boxes on a chart, and all of which
+is visible in the first second of playback.
+
+| Mechanism | Without it |
+|---|---|
+| Deadband with hysteresis | The frame chases a head sway, and chatters on and off at the threshold. |
+| Adaptive smoothing (1€ filter) | Fixed smoothing forces a choice between visible jitter when slow and visible lag when fast. |
+| Exponential follower | The camera sprints at its speed ceiling and halts — the exact lurch the deadband exists to prevent. |
+| Slew limit | One detector glitch throws the frame across the shot. |
+| Cut, don't pan, past 42% of frame width | Panning to a second speaker is nauseating; a cut is invisible. |
+| Minimum shot length | Two people in conversation strobe the frame on every "mm-hm". |
+| Cut confirmation over 0.15s | One spurious box becomes a cut, and the minimum shot length then strands the camera on empty background for 1.2s. |
+| Hold through detection gaps | Recentring during a two-frame dropout and coming back — the most obvious artefact an auto-framer can produce. |
+| Eyeline at 40%, not box-centre | A visible slab of dead space above the head. Headroom is a composition rule, not a rounding error. |
+
+**The crop size is constant for the whole clip.** Two independent reasons agree:
+zooming within a shot is amateurish, and ffmpeg cannot change a filter's output
+dimensions mid-stream, so a variable crop could not be executed anyway. The
+camera pans; it never zooms. Size comes from the 90th percentile of observed
+face height — the mean gives a crop that is correct on average and too tight
+exactly when the speaker leans into the camera, which is the moment the clip
+was chosen for.
+
+With no track at all the crop is a centred static one and the plan says
+`tracking: "static"`. That is what an editor does with no information, and it
+never looks broken — but the caller can tell it apart from a solved path.
+
+### Salience is the design axis, not texture
+
+A gameplay bed exists to occupy the attention that would otherwise scroll, not
+to compete with the speaker. When the bed is *more* interesting than the person
+talking, the viewer finishes the clip having absorbed nothing.
+
+So salience is matched **inversely** to speech density — fast talking gets a
+quiet floor — and a high-salience bed is given *less* room, because it does not
+need the space and every pixel comes out of the only panel carrying
+information.
+
+| Bed | Salience | Handling |
+|---|---|---|
+| Satisfying | 0.22 | Lowest salience; the correct default behind information-dense speech. |
+| Minecraft Parkour | 0.40 | Centre-weighted forward motion; crops to 9:16 with little loss. |
+| Subway Surfers | 0.55 | Natively vertical — keeps full width in the band, losing only a vertical slice. |
+| GTA Driving | 0.72 | Wide horizontal action; **fitted**, not cropped, or the road is gone. |
+| Rocket League | 0.85 | Highest salience and worst crop candidate. The ball crosses the full pitch; a fixed crop loses it, and a crop that chases it is a second moving camera fighting the first. |
+
+Footage that cannot survive a crop is scaled whole into the band with a
+blurred, cover-cropped copy of itself behind. Flat bars read as a mistake; a
+blurred fill reads as a choice.
+
+### Timing is three problems, none of them "make the durations equal"
+
+**Frame rate.** Gameplay is usually 60 and survives untouched; the speaker is
+usually 30 and is conformed by frame *duplication*. Motion interpolation is
+available and is never the default — interpolating a talking head smears the
+mouth on every plosive, far more visible than the judder it removes. The engine
+distinguishes an exact ratio from a near one: 29.97 into 60 is 2.001x, about one
+extra duplicated frame every 17 seconds. Invisible, but not clean, and it says
+so rather than claiming "no judder".
+
+**Loop seams.** A bed shorter than the clip repeats, and an arbitrary jump back
+to zero is the clearest tell that a video was machine-assembled. The engine
+cannot find visually continuous loop points without decoding frames, so it uses
+declared ones and marks the seam `visible` when it cannot. Marking it is the
+point.
+
+**Where seams land.** A visible seam belongs *mid-sentence*, not in a pause.
+Attention sits on whichever panel is doing something; during a pause it drifts
+to the bed, which is exactly when a discontinuity gets noticed. Seams are
+nudged **into** speech — the opposite of the intuitive placement.
+
+Start offsets are chosen deterministically from a per-clip seed and steered
+away from recently used ones. The same twenty seconds of Subway Surfers behind
+a creator's entire library is noticed by their audience long before it is
+noticed by them.
+
+### The filtergraph
+
+The camera path is executed by `sendcmd`, not by expressions — `crop` accepts
+runtime commands for `x` and `y`, so a piecewise path becomes a timestamped
+script. That is only practical because of the deadband: a 28-second clip is
+1680 frames and about 90 keyframes.
+
+```
+[0:v]fps=60,sendcmd=f='camera.cmd',crop@spk=w=776:h=882:x=404:y=44,scale=1080:1228[spk];
+[1:v]split=2[s0][s1];
+[s0]trim=start=0.0000:duration=16.5000,setpts=PTS-STARTPTS[g0];
+[s1]trim=start=0.0000:duration=11.5000,setpts=PTS-STARTPTS[g1];
+[g0][g1]concat=n=2:v=1:a=0[gpsrc];
+...
+[spk][gp]vstack=inputs=2[v]
+```
+
+**These graphs are emitted, not executed, by the test suite** — there is no
+ffmpeg in the test environment, and a test that shelled out to one would be an
+integration test wearing a unit test's clothes. What `link_check` does verify is
+the property that actually breaks graphs: every pad produced is consumed exactly
+once, and every pad consumed is produced. That check earned itself immediately
+by catching a looping graph that named `[1:v]` twice — legal-looking, and
+rejected outright by ffmpeg, which needs an explicit `split`.
+
+Gameplay audio is never mapped. It competes with the speech it is there to
+support, and the music on most gameplay beds carries a claim of its own,
+separate from the game's.
+
+### Rights
+
+Recorded gameplay is someone else's copyrighted audiovisual work, and the five
+sources do not sit under one policy: Mojang's guidelines are permissive about
+monetised Minecraft content, Psyonix/Epic publish a fan content policy, and
+Take-Two has historically been the most aggressive rightsholder here. "Everyone
+does it" describes enforcement patterns, not a licence. Ship a per-game rights
+posture and a first-party or licensed asset library before this is a paid
+feature. The engine records the asset id on every plan so an asset can be traced
+and pulled.
+
+| Module | Responsibility |
+|---|---|
+| `catalog.py` | Per-game salience, aspect, action placement, crop viability, rights posture. |
+| `camera.py` | The virtual camera — 1€ filter, deadband, follower, slew limit, cuts, gap handling. |
+| `layout.py` | 1080x1920 panel composition, split ratios, caption band, safe zones. |
+| `timing.py` | fps conform, loop segmentation, seam placement, offset selection. |
+| `render.py` | ffmpeg filtergraph, `sendcmd` camera script, argv, structural link check. |
+| `engine.py` | Orchestration. |
+| `types.py` | The render plan — deterministic and hashable, so it can be a cache key. |
