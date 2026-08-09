@@ -7,8 +7,9 @@ Turn long-form content into short-form vertical clips, automatically.
 
 ## Status
 
-Early implementation. The system design is complete; five engines are
-built and tested. No ingest, render, or publishing code yet.
+Early implementation. The system design is complete; six engines are built
+and tested. No ingest or render code yet — the publishing system builds and
+sequences platform API calls but ships with no live transport.
 
 - [System architecture](docs/ARCHITECTURE.md) — data model, API, workers,
   upload path, processing pipeline, capacity model, delivery phases.
@@ -22,6 +23,9 @@ built and tested. No ingest, render, or publishing code yet.
   per clip across ten types, each with an estimated click-through lift.
 - **Gameplay background engine** (`src/clipforge/gameplay/`) — speaker over a
   gameplay bed at 1080x1920 60fps, with auto-framing and an ffmpeg filtergraph.
+- **Publishing system** (`src/clipforge/publish/`) — OAuth, recurring
+  schedules, bulk uploads, a content calendar and a retrying worker loop for
+  TikTok, YouTube and Instagram.
 
 ## Quick start
 
@@ -38,6 +42,8 @@ python demo/run_hook_demo.py --by-type --clip stream
 python demo/run_gameplay_demo.py          # 1080x1920 60fps composition plan
 python demo/run_gameplay_demo.py --all    # compare all five gameplay beds
 python demo/run_gameplay_demo.py --camera --ffmpeg
+python demo/run_publish_demo.py           # connect, schedule, publish
+python demo/run_publish_demo.py --calendar --retry --dst
 python -m unittest discover -s tests -t tests
 ```
 
@@ -514,3 +520,156 @@ and pulled.
 | `render.py` | ffmpeg filtergraph, `sendcmd` camera script, argv, structural link check. |
 | `engine.py` | Orchestration. |
 | `types.py` | The render plan — deterministic and hashable, so it can be a cache key. |
+
+## The publishing system
+
+TikTok, YouTube and Instagram. OAuth connection, recurring schedules, bulk
+imports, a content calendar, and a worker loop that retries — holding posts
+weeks or months ahead.
+
+```python
+from clipforge.publish import PublishingSystem, weekdays_at
+
+system = PublishingSystem(timezone="Europe/Amsterdam")
+system.connect(account, tokens)
+placed, rejected = system.schedule_bulk(
+    "yt-main", specs, weekdays_at(17, 0, "Europe/Amsterdam")
+)
+```
+
+### Read `automation_report()` before believing the word "automated"
+
+The request was "complete automation". Two of the three platforms put
+something in the way, and the system reports it when an account is connected
+rather than discovering it at 6am three weeks later:
+
+| Platform | What actually happens |
+|---|---|
+| **TikTok** | Direct Post needs TikTok's app audit. Until it clears, uploads land in the creator's **inbox as a draft** a human must finish, and visibility is forced to private. |
+| **YouTube** | 10,000 quota units a day at 1,600 per upload is **six uploads a day per API project** — shared across every connected channel of every customer. Connecting more accounts does not raise it. |
+| **Instagram** | Needs a Business or Creator account linked to a Facebook Page, and **pulls** the file from a public URL rather than accepting bytes. That URL must stay live through the whole transcode. |
+
+A TikTok draft is not a published post, so it gets its own state
+(`AWAITING_CREATOR`) rather than being counted as success. Putting a green tick
+on a calendar next to something nobody can watch is the one lie a publishing
+tool must not tell.
+
+### "Months ahead" is a credentials problem, not a queue problem
+
+Only YouTube offers real server-side scheduling (`status.publishAt`). For the
+other two, "scheduled" means this system holds the job and fires it — which
+puts every long-dated post at the mercy of a token surviving the wait.
+
+| Platform | Credentials survive unattended for |
+|---|---|
+| YouTube | Indefinitely once the app is published — **but 7 days** while the consent screen is still in Testing, which is where most projects sit. |
+| TikTok | 365 days (refresh token lifetime). |
+| Instagram | **60 days.** The shortest, and the one that quietly kills long-dated schedules. |
+
+So a six-month Instagram series does not get silently truncated — it gets
+refused at schedule time, with the date and the reason:
+
+```
+⚠ SIX MONTHS ASKED FOR, 2 MONTHS BOOKED
+  2026-10-31T08:30:00+00:00: instagram credentials for ig-main stop being
+  renewable on 2026-10-31, before this post is due to run. It will fail
+  unless the account is reconnected.
+```
+
+### Recurring schedules are stored in local time, and that is not pedantry
+
+"Every weekday at 5pm" is a claim about wall-clock time. Storing it as a UTC
+cron looks equivalent and is wrong twice a year — the whole schedule shifts by
+an hour and nobody notices until a customer asks why their 5pm posts go out at
+4pm. Rules carry an IANA zone and each occurrence converts individually.
+
+Two transitions need explicit answers, and both are tested against real tzdata:
+
+- **Spring forward.** 02:30 does not exist that day. Python constructs it
+  happily and silently resolves it to 03:30, so a daily 02:30 slot posts an
+  hour late exactly once a year. `NonexistentTime` chooses skip, shift, or
+  next hour, and `dst_report()` names the affected occurrence before a customer
+  commits to a quarter.
+- **Fall back.** 01:30 happens twice. Naive expansion emits both and the same
+  video goes out twice an hour apart. The default takes the first only.
+
+A `31st` that does not exist in February is skipped, not rolled into 1 March —
+posting on a day the customer did not choose is worse than not posting.
+
+### Failure handling is five outcomes, not a backoff curve
+
+**A retry that double-posts is worse than a post that failed.** A failure is a
+notification; a duplicate is a creator's audience seeing the same video twice.
+So the classifier's most important job is the ambiguous case.
+
+| Disposition | When | Why not just retry |
+|---|---|---|
+| `RETRY` | 5xx, timeout *before* anything was sent | — |
+| `RECONCILE` | timeout or 5xx **after** the platform was told to create something; any 409 | The post may already exist. Ask what the account has before sending anything. |
+| `RESCHEDULE` | quota exhausted, 429 | Doubling 30s → 8m against a budget that resets at midnight burns the retry budget and then fails a post whose real answer was "tomorrow". |
+| `REAUTH` | 401, dead refresh token | No amount of waiting reconnects an account. It needs a human. |
+| `FAIL` | caption too long, banned account, unsupported format | Retrying cannot help. |
+
+Backoff jitter is derived from the post's own idempotency key rather than drawn
+randomly: a platform outage fails every queued post at once, and without jitter
+they all retry in lockstep the moment it recovers. Deriving it keeps a replayed
+queue reproducible.
+
+Workers take a **lease**, not a lock, so a worker killed mid-upload frees its
+job within the hour without two workers ever holding it at once.
+
+### The calendar answers questions before the schedule runs
+
+Conflict detection covers spacing (two posts close enough to split their own
+audience), per-account daily caps, and — separately — YouTube's project-scoped
+quota, which no per-account check would catch: four uploads to each of two
+channels is eight against a six-a-day budget while neither channel exceeds its
+own limit.
+
+`capacity_forecast()` is what a bulk-upload button should show before it is
+pressed:
+
+```
+CAPACITY FORECAST for 200 YouTube uploads
+  6/day, project-scoped
+  34 days — finishes 2026-10-04
+  6 a day for the whole API project, shared across 2 account(s) — connecting
+  more does not help
+```
+
+### Requests are built, never performed
+
+Adapters are pure state machines over a `Transport`, so every branch of every
+platform protocol is exercised offline with scripted responses — a publisher
+whose test suite needs live credentials is a publisher whose test suite does
+not run. It also keeps secrets out of the layer that formats logs:
+`Request.redacted()` strips bearer tokens, client secrets and PKCE verifiers.
+
+The three protocols share nothing. YouTube is a Google resumable upload where
+`308` carries the authoritative byte count (trusting the local offset after a
+partial write corrupts the resume). TikTok declares chunk size and count up
+front, and the **last chunk absorbs the remainder** — an exact ceil-division
+split leaves an undersized final chunk that TikTok rejects. Instagram creates a
+container, polls it, and publishes with a second call.
+
+**No live transport ships.** `RecordingTransport` replays scripted responses;
+there is no HTTP client, no credential handling in production form, and the
+endpoint shapes in `limits.py` are third-party facts stamped
+`LIMITS_VERSION = "2026-08-verify-quarterly"` — re-check them before trusting
+any number here.
+
+Token storage is the other unfinished edge. `InMemoryTokenStore` is a
+reference; `SealedTokenStore` takes `seal`/`unseal` callables rather than
+implementing crypto, because refresh tokens are long-lived credentials to other
+people's audiences and that key belongs in a KMS held by something other than
+the process that publishes.
+
+| Module | Responsibility |
+|---|---|
+| `limits.py` | Media, quota, token and automation facts per platform. One file, version-stamped, because they change. |
+| `oauth.py` | PKCE flows, token exchange and refresh, credential horizons. |
+| `schedule.py` | Recurrence in local time, with DST gaps and folds handled explicitly. |
+| `calendar.py` | Occupancy, conflicts, free slots, capacity forecasting, month view. |
+| `retry.py` | Failure classification into five dispositions; jittered backoff. |
+| `adapters.py` | The three upload state machines, as request builders. |
+| `engine.py` | Scheduling, validation, leases, and the worker loop. |
