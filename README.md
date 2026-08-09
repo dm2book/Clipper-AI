@@ -7,10 +7,11 @@ Turn long-form content into short-form vertical clips, automatically.
 
 ## Status
 
-Early implementation. The system design is complete; seven engines plus the
-channel factory that orchestrates them are built and tested. No ingest or
-render code yet — the publishing and analytics systems build and sequence
-platform API calls but ship with no live transport.
+Early implementation. The system design is complete; seven engines, the
+channel factory that orchestrates them, and the multi-tenant Empire layer on
+top are built and tested. No ingest or render code yet — the publishing and
+analytics systems build and sequence platform API calls but ship with no live
+transport.
 
 - [System architecture](docs/ARCHITECTURE.md) — data model, API, workers,
   upload path, processing pipeline, capacity model, delivery phases.
@@ -33,6 +34,9 @@ platform API calls but ship with no live transport.
 - **Analytics intelligence** (`src/clipforge/analytics/`) — tracks the six
   metrics, answers the five "best X" questions with confidence attached, and
   writes weekly reports.
+- **Empire Mode** (`src/clipforge/empire/`) — tenants, brands, users and roles
+  over 50+ channels, with capacity and unit economics computed rather than
+  assumed.
 
 ## Quick start
 
@@ -55,6 +59,8 @@ python demo/run_factory_demo.py           # seven channels, one cycle
 python demo/run_factory_demo.py --niches --rights --quota --isolation
 python demo/run_analytics_demo.py         # a weekly report
 python demo/run_analytics_demo.py --honesty --retention --calibration
+python demo/run_empire_demo.py            # 52 channels, 4 brands, one dashboard
+python demo/run_empire_demo.py --capacity --economics --access --scale
 python -m unittest discover -s tests -t tests
 ```
 
@@ -1007,3 +1013,147 @@ production.
 | `insights.py` | The five questions, plus retention diagnosis and model calibration. |
 | `report.py` | Weekly reports, with week-on-week deltas that can say "flat". |
 | `engine.py` | Ingest, scheduling, readiness. |
+
+## Empire Mode
+
+Fifty-plus channels, multiple brands, multiple users, one scoped dashboard.
+
+```python
+from clipforge.empire import Empire, Plan, Role
+
+empire = Empire(factory, analytics)
+tenant = empire.add_tenant("Northwind Media", Plan.EMPIRE)
+brand = empire.add_brand(tenant.tenant_id, "Redline")
+print(empire.dashboard(user.user_id).render())
+```
+
+This is the first layer that stresses the system rather than extending it, and
+running it at scale produced three findings that are arithmetic rather than
+opinion.
+
+### Scheduling was O(n²), measured and fixed
+
+Every `schedule()` scanned the whole calendar to check spacing:
+
+| Posts | Before | After |
+|---|---|---|
+| 300 | 8ms | 4ms |
+| 3,000 | 469ms | 35ms |
+| 45,000 | ~105s (extrapolated) | **0.95s** |
+
+A per-account index with a bisect lookup made the per-post cost flat at
+0.012ms instead of climbing linearly. `TestScale` pins it, because a quadratic
+insert is fast in every unit test and slow only in production.
+
+### 500 uploads/day is reachable, but not evenly
+
+```
+PLATFORM     ACCOUNTS   CAP     SCOPE   CEILING
+tiktok             52     6   account       312
+youtube            46     6   project         6
+instagram          33    25   account       825
+```
+
+TikTok and Instagram caps are **per account**, so they scale with channels.
+YouTube's is per **API project** — six a day for the whole app, whether one
+channel is connected or fifty. An empire at this volume is a TikTok operation
+with a YouTube trickle.
+
+Getting YouTube to an even 167/day needs 28 API projects. There are two ways
+to have those and only one is legitimate: **per-tenant projects**, where each
+customer connects their own Google Cloud project and spends their own quota on
+their own content. One operator standing up 28 projects to multiply their own
+allowance is quota circumvention, and they are terminated together — every
+channel stops on the same afternoon. `QuotaPool.ownership` models the
+difference and `circumvention_risk()` flags the shape.
+
+### Ad revenue does not pay for this, and the dashboard says so
+
+The cost is already in the repo: `ITEM_COST_CENTS` is 191c per clip. The
+revenue side needs three facts, and the second surprises people:
+
+- YouTube Shorts pays roughly $0.02–0.07 per thousand views.
+- **TikTok's Creator Rewards only pays on videos over one minute.** Every clip
+  this system makes is 15–60s, so it earns nothing. Not a low RPM — zero.
+- Instagram has no general Reels revenue share.
+
+Run 500/day for a month at the forced platform mix:
+
+```
+15,000 uploads → 45,000,000 views
+
+  ad revenue          $22
+  production cost     $28,650
+  net (ads only)      $-28,628
+
+blended RPM      0.0480c per 1,000 views
+break-even       3,979,167 views per clip
+actual           3,000
+short by         1,326x
+```
+
+Forty-five million views generating twenty-two dollars. That is not an
+argument against the product — it is the reason the revenue line has to be
+sponsorship, affiliate, lead generation or the subscription itself, and the
+reason a dashboard reporting ad revenue as "total revenue" is selling a
+fantasy. `required_non_ad_revenue_cents()` states the number a business plan
+should start from.
+
+### Four totals, each with its distribution attached
+
+```
+uploads                  367        channels          52
+views              1,524,334        brands             4
+subscribers            4,716        shares         9,398
+revenue              $21,555        net          $20,854
+
+top channel    18% of views    top 10%    49%    dormant 0
+```
+
+A total hides the distribution, and at fifty channels the distribution is the
+story — "1.2M views" is the same number whether every channel contributed or
+one clip went viral. Growth is reported twice for the same reason: raw, and
+**same-channel**, because a portfolio that grew from 40 to 50 channels shows
+25% growth from arithmetic alone. Both go through the analytics engine's
+significance machinery, so a flat week reads as flat.
+
+### Alerts come before totals
+
+At fifty channels a dead one moves the portfolio total by 2%, which is
+indistinguishable from a slow week. So the dashboard leads with the channels
+that stopped, ran out of budget, lost credentials, or hold a licence expiring
+inside the scheduling horizon — each with what to do about it.
+
+### Isolation is a query concern
+
+Every lookup takes a tenant and filters on it; `require()` raises rather than
+returning a boolean, so the call site that forgets fails closed. Roles are
+ordered by blast radius rather than seniority — an operator can pause a channel
+but not disconnect an account, an editor schedules but cannot see revenue, and
+an agency's client sees one brand:
+
+```
+owner@northwind.test    owner    sees 52 channels
+editor@northwind.test   editor   sees 52 channels
+client@redline.test     viewer   sees 13 channels
+
+✗ analyst@northwind.test is analyst and cannot manage channels
+✗ editor@northwind.test is editor and cannot view revenue
+```
+
+### One more bug worth naming
+
+`round(float("inf"))` raises `OverflowError`, and break-even views is
+legitimately infinite whenever the blended RPM is zero — which is the *normal*
+case for a TikTok-and-Instagram portfolio. The dashboard's JSON endpoint would
+have crashed for most accounts. It now serialises as `null` with
+`break_even_unreachable: true`, which is the honest encoding.
+
+| Module | Responsibility |
+|---|---|
+| `tenancy.py` | Tenants, brands, users, roles, plan limits, isolation. |
+| `capacity.py` | Platform ceilings, quota pools, circumvention detection. |
+| `economics.py` | Revenue, cost, blended RPM, break-even. |
+| `rollup.py` | Totals, concentration, same-channel growth, leaderboard. |
+| `dashboard.py` | The single scoped view, alerts first. |
+| `empire.py` | Orchestration over factory, publisher and analytics. |

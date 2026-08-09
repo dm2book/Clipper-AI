@@ -342,7 +342,8 @@ class PublishingSystem:
             raise KeyError(post_id)
         if post.is_terminal:
             raise ValueError(f"{post_id} is {post.state.value}")
-        post.run_at = ensure_utc(run_at)
+        # Through the calendar, so the per-account index stays ordered.
+        post = self.calendar.move(post_id, run_at)
         post.next_attempt_at = None
         post.state = PostState.SCHEDULED
         return post
@@ -609,9 +610,4 @@ class PublishingSystem:
     def _spacing_clash(
         self, account_id: str, run_at: datetime
     ) -> ScheduledPost | None:
-        for post in self.calendar.posts:
-            if post.account_id != account_id or post.is_terminal:
-                continue
-            if abs((post.run_at - run_at).total_seconds()) < self.config.spacing_s:
-                return post
-        return None
+        return self.calendar.nearest(account_id, run_at, self.config.spacing_s)
