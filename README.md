@@ -7,10 +7,10 @@ Turn long-form content into short-form vertical clips, automatically.
 
 ## Status
 
-Early implementation. The system design is complete; six engines plus the
+Early implementation. The system design is complete; seven engines plus the
 channel factory that orchestrates them are built and tested. No ingest or
-render code yet — the publishing system builds and sequences platform API
-calls but ships with no live transport.
+render code yet — the publishing and analytics systems build and sequence
+platform API calls but ship with no live transport.
 
 - [System architecture](docs/ARCHITECTURE.md) — data model, API, workers,
   upload path, processing pipeline, capacity model, delivery phases.
@@ -30,6 +30,9 @@ calls but ships with no live transport.
 - **Channel factory** (`src/clipforge/factory/`) — create a channel from a
   niche; it finds content, clips it, hooks it, captions it, composes it and
   schedules it, independently of every other channel.
+- **Analytics intelligence** (`src/clipforge/analytics/`) — tracks the six
+  metrics, answers the five "best X" questions with confidence attached, and
+  writes weekly reports.
 
 ## Quick start
 
@@ -50,6 +53,8 @@ python demo/run_publish_demo.py           # connect, schedule, publish
 python demo/run_publish_demo.py --calendar --retry --dst
 python demo/run_factory_demo.py           # seven channels, one cycle
 python demo/run_factory_demo.py --niches --rights --quota --isolation
+python demo/run_analytics_demo.py         # a weekly report
+python demo/run_analytics_demo.py --honesty --retention --calibration
 python -m unittest discover -s tests -t tests
 ```
 
@@ -837,3 +842,168 @@ control, not measurements.
 | `pipeline.py` | The per-item stage machine over all six engines. |
 | `scheduler.py` | Max-min fair allocation of shared platform quota. |
 | `factory.py` | Orchestration and per-channel isolation. |
+
+## The analytics intelligence engine
+
+Tracks views, retention, likes, comments, shares and subscribers. Answers the
+five questions — best posting times, hooks, topics, clip lengths, creators —
+and writes weekly reports on a schedule.
+
+```python
+from clipforge.analytics import AnalyticsEngine
+
+engine = AnalyticsEngine()
+engine.track(record)
+engine.ingest(source)
+print(engine.report(week_end).render())
+```
+
+This is the engine the other six were built for. The viral ranker, the hook
+estimator and the factory have each been persisting a feature vector and a
+weights version with every decision so that outcomes could later be joined back
+to them.
+
+### Its failure mode is confidence, not error
+
+Rank seven posting hours by mean views, bold the top one, and a creator
+reorganises their week around three posts of noise. Four mechanisms stop that,
+and all four are needed:
+
+| Mechanism | Without it |
+|---|---|
+| Minimum sample (8 per group) | Three posts get a rank instead of "not enough data". |
+| Permutation test | Normality assumed on view counts, which are nowhere near normal. |
+| Benjamini-Hochberg FDR | 24 posting hours at p<0.05 yields a "winner" by chance, and the ranking guarantees it lands on top. |
+| **Minimum effect size** | The mirror-image failure: with a tight spread a 3% change is statistically undeniable and operationally meaningless. |
+
+That last one caught a real bug during the build. A synthetic *flat* week was
+being reported as a significant −3% decline in views — genuinely significant,
+completely worthless. A finding now has to clear both bars: distinguishable
+from chance **and** big enough that acting on it could matter.
+
+And when nothing clears them, `minimum_detectable_effect` turns "no significant
+difference" from a dead end into a decision:
+
+```
+· Which topics reach furthest?
+  No difference this data can resolve. Detecting a 50% effect would need
+  about 108 posts per group; the largest group has 21.
+```
+
+The permutation test is validated against its own null: p-values are uniform
+and the false-positive rate lands within a point of nominal at both 5% and 10%.
+
+### Checked against known data
+
+The demo plants exactly two effects and makes everything else noise, then
+checks the engine on both counts:
+
+```
+✓ What hour of day performs best?              → 20:00 (+62%)
+· Which topics reach furthest?                 no claim
+· Whose source material performs best?         no claim
+   ... 8 more: no claim
+
+1 claim from 11 families of comparison over 146 posts.
+```
+
+The near-miss is the interesting one. The second planted effect — a +45%
+creator — is deliberately set right at the detection floor. It ranks first at
++41% and the engine *still* refuses to call it, reporting instead that it would
+need 108 posts per group. A ranking always has a top row; printing that row as
+a finding is the whole failure this module exists to prevent.
+
+A three-week-old account gets zero findings and eleven sample-size
+requirements, which is the correct output.
+
+### "Best hook" is unanswerable without deliberately publishing worse hooks
+
+The factory publishes the top-ranked hook. Every outcome ever observed is
+therefore an outcome for a hook the model already liked, so an analysis of that
+data measures the model's preferences and will confirm the prior whatever the
+prior was. It is the same trap the hook engine warned about: *a model trained
+only on hooks that shipped learns which hooks get chosen, not which hooks work.*
+
+`ExplorationPolicy` pays the cost — roughly one clip in seven publishes a hook
+ranked 2nd to 5th instead of 1st — and in exchange the other six become
+interpretable. `assess()` labels every comparison, and it distinguishes two
+different problems rather than issuing one blanket disclaimer:
+
+- **Confounded** — hook type, which the model chose. Needs exploration.
+- **Observational** — posting time, clip length, creator. Not randomised, but
+  not corrupted by the selection loop either.
+
+Deliberately not a bandit: a bandit allocates on observed performance, which
+reintroduces exactly the confounding and makes the causal question unanswerable
+again. Fixed-rate randomisation is less efficient and gives an answer you can
+trust.
+
+### Retention is the only metric close to a cause
+
+Views are downstream of distribution, distribution is downstream of retention.
+But the *average* watch percentage collapses the useful part — a clip losing
+40% in the first two seconds and one drifting off evenly produce the same
+average and need opposite fixes.
+
+```
+past the hook   63%
+of those, lost  50%
+reach the end   33%
+
+payoff: hooks are working — 63% get past them — but 50% of those who do
+leave before the end. Shorter clips or a faster payoff, not better hooks.
+```
+
+Getting that denominator right was a second bug found during the build. Mid-clip
+drop was measured against *all* viewers, so 63% → 33% read as a mild 31-point
+decline and the engine called it "no dominant failure point". Measured against
+the people who actually got past the hook it is half of them leaving — the same
+error as reporting checkout conversion against total site traffic.
+
+### Three ways to make numbers comparable
+
+**Matched age.** A post published two hours ago has fewer views than one from
+two weeks ago, and that says nothing about either. Metrics are stored as
+append-only snapshots at fixed checkpoints, and a post too young for a
+checkpoint is *excluded* rather than substituted — including it is how "recent
+posts are underperforming" gets reported when they are merely recent. A single
+mutable `views` column makes this reconstruction impossible afterwards.
+
+**Per-platform baselines**, learned from the account's own history as a median
+once there are twelve posts, so one viral clip cannot redefine normal.
+
+**Trimmed means**, because view distributions are heavy-tailed enough that a
+plain mean of ten posts is mostly a report on whether one of them went viral.
+
+### Do the priors actually predict anything?
+
+```
+hook CTR estimator  (hook-heuristic-v1)
+  n=146  no better than chance (rho -0.04). The hand-tuned weights are not
+  carrying information; retrain on the feature rows rather than tuning them.
+```
+
+This is what `predicted_lift` and the weights versions were persisted for.
+`calibration()` distinguishes three outcomes — predictive, useless, and
+*inverted*, where the model's preferred clips do systematically worse, which is
+the one worth an alarm because the weights carry real signal with the wrong
+sign.
+
+### What is not built
+
+No live metric collection. The three platforms expose different reporting APIs
+at different granularities on different delays — only YouTube supplies a real
+retention curve, which is why 80 of 146 posts in the demo have one and the
+absence is visible rather than imputed. `RecordedSource` replays snapshots; a
+stub pretending otherwise would produce analyses whose limits only appeared in
+production.
+
+| Module | Responsibility |
+|---|---|
+| `metrics.py` | Snapshots, retention curves, matched-age lookup, per-platform baselines. |
+| `stats.py` | Permutation tests, bootstrap CIs, FDR control, minimum detectable effect. |
+| `attribution.py` | Joining outcomes to the decisions that produced them. |
+| `experiments.py` | Exploration policy and causal-validity assessment. |
+| `insights.py` | The five questions, plus retention diagnosis and model calibration. |
+| `report.py` | Weekly reports, with week-on-week deltas that can say "flat". |
+| `engine.py` | Ingest, scheduling, readiness. |
