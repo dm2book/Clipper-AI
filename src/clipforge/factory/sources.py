@@ -275,7 +275,10 @@ class RegistrySourceFinder:
         wanted_topics = {t.lower() for t in topics}
 
         scored: list[tuple[float, Source]] = []
-        for source in self._sources.values():
+        # Through `all` rather than the dict directly, so a subclass can put
+        # the library somewhere other than memory without reimplementing the
+        # scoring — see `clipforge.store.durable.DurableSourceRegistry`.
+        for source in self.all:
             if source.kind not in wanted_kinds:
                 continue
 

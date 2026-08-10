@@ -8,10 +8,10 @@ Turn long-form content into short-form vertical clips, automatically.
 ## Status
 
 Early implementation. The system design is complete; seven engines, the
-channel factory that orchestrates them, and the multi-tenant Empire layer on
-top are built and tested. No ingest or render code yet — the publishing and
-analytics systems build and sequence platform API calls but ship with no live
-transport.
+channel factory that orchestrates them, the multi-tenant Empire layer on top,
+and the persistence layer underneath are built and tested. No ingest or render
+code yet — the publishing and analytics systems build and sequence platform API
+calls but ship with no live transport.
 
 - [System architecture](docs/ARCHITECTURE.md) — data model, API, workers,
   upload path, processing pipeline, capacity model, delivery phases.
@@ -37,6 +37,9 @@ transport.
 - **Empire Mode** (`src/clipforge/empire/`) — tenants, brands, users and roles
   over 50+ channels, with capacity and unit economics computed rather than
   assumed.
+- **Persistence** (`src/clipforge/store/`, `db/`) — PostgreSQL, Prisma
+  migrations, row-level security, repositories. The engines' in-memory stores
+  have durable equivalents, so nothing important is lost on restart.
 
 ## Quick start
 
@@ -1157,3 +1160,135 @@ have crashed for most accounts. It now serialises as `null` with
 | `rollup.py` | Totals, concentration, same-channel growth, leaderboard. |
 | `dashboard.py` | The single scoped view, alerts first. |
 | `empire.py` | Orchestration over factory, publisher and analytics. |
+
+## Persistence
+
+Everything above decides. This is where the decisions are kept.
+
+PostgreSQL 16, schema and migrations owned by Prisma, repositories in
+`src/clipforge/store/`. Full detail — roles, migration workflow, the
+conventions a new model has to follow — is in [`db/README.md`](db/README.md).
+
+```python
+from clipforge.store import open_database
+
+db = open_database()                     # DATABASE_URL, or in-memory
+with db.unit_of_work("ten_acme") as uow:
+    uow.channels.save(channel)
+    uow.jobs.enqueue(job)
+# committed on the way out; rolled back if the block raised
+```
+
+Ten entity types persist: users, channels, projects, videos, sources, clips,
+schedules, uploads, metrics and jobs — plus tenants and connected accounts.
+
+### Prisma without the Prisma client
+
+Prisma is two halves. The client is a TypeScript library; this is a Python
+project, so there is no `generator` block and nothing is generated. The
+migration engine is what is used: one declarative schema, a checksummed
+migration history, and plain SQL on disk that a reviewer reads before it
+reaches production. `prisma-client-py` is a third-party port rather than a
+Prisma product, and it is not what to bet a data layer on.
+
+### The stores that used to be dictionaries
+
+The engines take their storage as an argument. Passing nothing gives the
+in-memory version — what the demos and most tests use, and what loses
+everything when the process ends. Passing the durable version gives the same
+engine, backed by Postgres, driven identically.
+
+| Was | Now | Table |
+|---|---|---|
+| `InMemoryTokenStore` | `DurableTokenStore` | `social_accounts` (sealed) |
+| `PublishingSystem.accounts` | `DurableAccountBook` | `social_accounts` |
+| `ContentCalendar` | `PersistentCalendar` | `uploads` |
+| `RegistrySourceFinder` | `DurableSourceRegistry` | `sources` |
+| `ChannelFactory.channels` | `DurableChannelBook` | `channels` |
+| `AnalyticsStore` | `DurableAnalyticsStore` | `metric_snapshots` |
+
+```python
+from clipforge.store import open_database
+from clipforge.store.durable import (
+    DurableAccountBook, DurableTokenStore, PersistentCalendar,
+)
+
+db = open_database()
+system = PublishingSystem(
+    token_store=DurableTokenStore(db, tenant, seal=kms.seal, unseal=kms.unseal),
+    accounts=DurableAccountBook(db, tenant, channel_id=channel_id),
+    calendar=PersistentCalendar.restore(db, tenant, channel_id=channel_id),
+)
+```
+
+Writes go through before the call returns. Batching them would be faster and
+would reintroduce exactly the failure being removed: work that looked saved and
+was not.
+
+The calendar is the one exception to being a pass-through. It keeps its sorted
+in-memory index, because that is what makes the spacing check a binary search
+instead of a query per insert, and Postgres holds the truth. That index is a
+cache of a **window** — `load()` takes a horizon, because 500 uploads a day
+ninety days out is 45,000 rows and a year of them is not a working set. Posts
+beyond the horizon are in the table and still publish; they are simply not in
+this process's view until the window moves.
+
+### Tenant isolation
+
+Every tenant-scoped table has row-level security enabled *and* forced, with
+`tenant_id = app.current_tenant()` as both the read predicate and the write
+check. The tenant is set per transaction with `SET LOCAL`, which is what makes
+it safe behind a connection pool: it dies with the transaction, so a pooled
+connection cannot carry one customer's tenant into the next customer's query.
+
+The application connects as `clipforge_app`, which is neither superuser nor the
+table owner — Postgres lets both bypass row-level security, so an application
+connected as either turns every policy into a no-op while the isolation tests
+keep passing.
+
+`app.current_tenant()` raises when the scope is unset rather than returning
+NULL. NULL would fail every policy closed, which sounds safer and is not: a
+forgotten scope then looks like a tenant with no data, and "the dashboard is
+empty" gets triaged as a product bug for a week.
+
+Two guarantees are database privileges rather than conventions. The app role
+holds no UPDATE or DELETE on `metric_snapshots`, so the append-only rule every
+analytics finding depends on cannot be broken by a future repository method.
+And `FORCE` covers the owner, so an application pointed at the migration role
+by a copy-pasted `DATABASE_URL` fails on its first query instead of quietly
+serving every tenant's rows to everyone.
+
+### Testing it
+
+```bash
+python -m unittest discover -s tests -t tests          # in-memory; Postgres cases skip
+
+createdb clipforge_test -O clipforge_owner
+(cd db && DATABASE_URL=postgresql://clipforge_owner:...@localhost/clipforge_test \
+   npx prisma migrate deploy)
+CLIPFORGE_TEST_DSN=postgresql://clipforge_app:...@localhost/clipforge_test \
+CLIPFORGE_TEST_ADMIN_DSN=postgresql://clipforge_owner:...@localhost/clipforge_test \
+PYTHONPATH=src python -m unittest discover -s tests
+```
+
+- `test_store_contract.py` — one suite, run against both implementations, so
+  the fast in-memory tests are evidence about the Postgres path rather than
+  about themselves.
+- `test_row_level_security.py` — raw SQL with no WHERE clause, as the app role.
+  The contract tests would pass with RLS switched off, since the repositories
+  also check tenancy in Python; these would not.
+- `test_restart_survival.py` — the writer is a child process **SIGKILLed** after
+  it commits, so whatever the reader finds was in Postgres already. Also asserts
+  the other half: a process killed *before* its commit leaves nothing behind.
+- `test_durable_publishing.py`, `test_durable_factory.py` — the engines,
+  restarted.
+
+| Module | Responsibility |
+|---|---|
+| `records.py` | One dataclass per table. |
+| `schema.py` | Table descriptors; column lists derived, never restated. |
+| `protocols.py` | Repository and unit-of-work interfaces. |
+| `memory.py` | In-memory implementation. A test double, not a deployment. |
+| `postgres.py` | psycopg implementation, pooled. |
+| `mappers.py` | Domain objects to rows, losslessly, and back. |
+| `durable.py` | Drop-in durable replacements for the engines' dictionaries. |

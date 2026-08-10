@@ -26,6 +26,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from collections.abc import MutableMapping
 from typing import Any, Sequence
 
 from ..captions.types import TimedWord
@@ -91,12 +92,24 @@ class ChannelFactory:
         publisher: PublishingSystem | None = None,
         finder: SourceFinder | None = None,
         config: FactoryConfig | None = None,
+        channels: MutableMapping[str, Channel] | None = None,
     ) -> None:
+        """The stores are injected; the defaults are the volatile ones.
+
+        Passing nothing gives an entirely in-memory factory, which is what the
+        tests and the demos use. Passing
+        `clipforge.store.durable.DurableChannelBook` and
+        `DurableSourceRegistry` gives the same factory backed by Postgres, with
+        no other change to how it is driven.
+        """
+
         self.config = config or FactoryConfig()
         self.publisher = publisher or PublishingSystem()
         self.finder = finder or RegistrySourceFinder()
         self.pipeline = Pipeline(self.config.pipeline)
-        self.channels: dict[str, Channel] = {}
+        self.channels: MutableMapping[str, Channel] = (
+            {} if channels is None else channels
+        )
 
     # -- channels ---------------------------------------------------------------
 
@@ -137,12 +150,25 @@ class ChannelFactory:
             )
         channel.state = ChannelState.ACTIVE
         channel.health.reset_circuit()
+        self._save(channel)
         return channel
 
     def pause(self, channel_id: str) -> Channel:
         channel = self.channels[channel_id]
         channel.state = ChannelState.PAUSED
+        self._save(channel)
         return channel
+
+    def _save(self, channel: Channel) -> None:
+        """Write a channel's current state back to wherever channels live.
+
+        A no-op against a plain dict, where the object fetched *is* the object
+        stored. Against `DurableChannelBook` the fetch returns a copy, and
+        without this every state change — activation, a tripped breaker, a
+        month's spend — would be discarded when the call returned.
+        """
+
+        self.channels[channel.channel_id] = channel
 
     # -- running -----------------------------------------------------------------
 
@@ -153,9 +179,31 @@ class ChannelFactory:
         now: datetime | None = None,
         quota: QuotaPlan | None = None,
     ) -> CycleReport:
-        """Run one cycle for one channel. Never raises."""
-        now = now or utcnow()
+        """Run one cycle for one channel. Never raises.
+
+        The write-back is a `finally` around the whole cycle rather than a call
+        at each of the dozen places the run mutates the channel — spend, health
+        counters, the breaker, the used-source set, the state. Those are spread
+        over four early returns and a loop with three branches, and a
+        write-back added at eleven of the twelve is a channel that quietly
+        forgets it tripped its breaker.
+        """
+
         channel = self.channels[channel_id]
+        try:
+            return self._run_channel(channel, transcripts, now, quota)
+        finally:
+            self._save(channel)
+
+    def _run_channel(
+        self,
+        channel: Channel,
+        transcripts: dict[str, Sequence[TimedWord]] | None = None,
+        now: datetime | None = None,
+        quota: QuotaPlan | None = None,
+    ) -> CycleReport:
+        now = now or utcnow()
+        channel_id = channel.channel_id
         report = CycleReport(channel_id=channel_id, ran=False)
 
         runnable, reason = channel.runnable(now)
@@ -254,6 +302,7 @@ class ChannelFactory:
                 # need to run.
                 channel = self.channels[channel_id]
                 channel.health.record_failure(f"orchestrator: {error}")
+                self._save(channel)
                 reports[channel_id] = CycleReport(
                     channel_id=channel_id, ran=False,
                     reason=f"isolated failure: {type(error).__name__}: {error}",

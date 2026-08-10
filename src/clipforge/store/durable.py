@@ -35,6 +35,11 @@ from collections.abc import Iterator, MutableMapping
 from datetime import datetime, timedelta
 from typing import Any, Callable
 
+from ..analytics.attribution import AnalyticsStore, PostRecord
+from ..analytics.metrics import PostMetrics, RetentionCurve, Snapshot
+from ..factory.channel import Channel
+from ..factory.sources import RegistrySourceFinder
+from ..factory.sources import Source as FactorySource
 from ..publish.calendar import ContentCalendar
 from ..publish.oauth import TokenSet
 from ..publish.types import Account, Platform, ScheduledPost, ensure_utc, utcnow
@@ -43,16 +48,23 @@ from .mappers import (
     apply_tokens,
     to_account,
     to_account_record,
+    to_channel,
+    to_channel_record,
     to_scheduled_post,
+    to_source,
+    to_source_record,
     to_token_set,
     to_upload_record,
 )
-from .records import SocialAccountRecord
+from .records import MetricSnapshotRecord, SocialAccountRecord
 
 __all__ = [
     "DurableTokenStore",
     "DurableAccountBook",
     "PersistentCalendar",
+    "DurableSourceRegistry",
+    "DurableChannelBook",
+    "DurableAnalyticsStore",
     "DEFAULT_HORIZON_DAYS",
 ]
 
@@ -388,3 +400,409 @@ class PersistentCalendar(ContentCalendar, _TenantBound):
         calendar = cls(database, tenant_id, channel_id=channel_id, tz=tz)
         calendar.load(now, **window)
         return calendar
+
+
+# ---------------------------------------------------------------------------
+# Sources
+# ---------------------------------------------------------------------------
+
+
+class DurableSourceRegistry(RegistrySourceFinder, _TenantBound):
+    """The rights-cleared library, in `sources` rather than a dictionary.
+
+    Inherits `find` unchanged. The scoring — kind, topic overlap, recency, a
+    bonus for material that already has a transcript — is a product decision,
+    not a storage one, and reimplementing it in SQL would give two rankings
+    that drift apart.
+
+    The cost is that `find` reads the whole library per call. That is the right
+    trade at the size this table actually reaches: a rights-cleared library is
+    entered by hand, licence by licence, and it is thousands of rows, not
+    millions. If it ever stops being, the scoring moves into the query and this
+    comment is the reason to look there first.
+    """
+
+    def __init__(self, database: Any, tenant_id: str) -> None:
+        RegistrySourceFinder.__init__(self)
+        _TenantBound.__init__(self, database, tenant_id)
+
+    def register(self, source: FactorySource) -> None:
+        with self._uow() as uow:
+            record = to_source_record(source, tenant_id=self.tenant_id)
+            existing = uow.sources.get(source.source_id)
+            if existing is not None:
+                record.created_at = existing.created_at
+            uow.sources.save(record)
+
+    def remove(self, source_id: str) -> None:
+        with self._uow() as uow:
+            uow.sources.delete(source_id)
+
+    @property
+    def all(self) -> tuple[FactorySource, ...]:
+        with self._uow() as uow:
+            return tuple(to_source(r) for r in uow.sources.all())
+
+    def get(self, source_id: str) -> FactorySource | None:
+        with self._uow() as uow:
+            record = uow.sources.get(source_id)
+        return to_source(record) if record else None
+
+    def by_fingerprint(self, fingerprint: str) -> FactorySource | None:
+        with self._uow() as uow:
+            record = uow.sources.by_fingerprint(fingerprint)
+        return to_source(record) if record else None
+
+    def expiring_before(self, moment: datetime) -> tuple[FactorySource, ...]:
+        """Licences that lapse before `moment`.
+
+        A factory scheduling three months ahead will happily publish under a
+        licence that expired in March unless something checks, and this is the
+        query that checks. Index-backed on `(tenant_id, rights_expires_at)`.
+        """
+
+        with self._uow() as uow:
+            return tuple(
+                to_source(r) for r in uow.sources.rights_expiring_before(moment)
+            )
+
+
+# ---------------------------------------------------------------------------
+# Channels
+# ---------------------------------------------------------------------------
+
+
+class DurableChannelBook(_TenantBound, MutableMapping[str, "Channel"]):
+    """`dict[str, Channel]` backed by the `channels` table.
+
+    Two of a channel's fields are assembled from other tables rather than
+    stored on the row, because storing them twice means storing two answers:
+
+    * `accounts` — the platform-to-account map is rebuilt from the account rows
+      that point at this channel, so disconnecting an account cannot leave a
+      stale entry pointing at it;
+    * `used_fingerprints` — the set of already-clipped material comes from
+      `channel_source_uses` joined to `sources`. An array column on the channel
+      would be rewritten in full on every append, and that set grows for as
+      long as the channel runs.
+
+    Everything else round-trips on the row, including the circuit-breaker
+    state. That one matters: a channel that tripped before a restart must stay
+    tripped, or a deploy quietly retries every failing channel at once.
+    """
+
+    def __init__(self, database: Any, tenant_id: str, *, project_id: str) -> None:
+        super().__init__(database, tenant_id)
+        self.project_id = project_id
+
+    def _fingerprints_by_source(self, uow: Any) -> dict[str, str]:
+        """source id -> fingerprint, read once.
+
+        Fetched up front rather than per use: a channel that has run for a year
+        has thousands of `channel_source_uses` rows, and a lookup each would
+        make loading one channel thousands of queries — the classic N+1, and
+        the reason `values()` reads the sources once and passes the map down.
+        """
+
+        return {s.id: s.fingerprint for s in uow.sources.all()}
+
+    def _hydrate(
+        self, uow: Any, record: Any, fingerprints: dict[str, str] | None = None
+    ) -> Channel:
+        accounts = {
+            Platform(a.platform): a.id for a in uow.accounts.for_channel(record.id)
+        }
+        if fingerprints is None:
+            fingerprints = self._fingerprints_by_source(uow)
+        used = {
+            fingerprints[use.source_id]
+            for use in uow.sources.used_by(record.id)
+            if use.source_id in fingerprints
+        }
+        return to_channel(record, accounts=accounts, used_fingerprints=used)
+
+    def __getitem__(self, channel_id: str) -> Channel:
+        with self._uow() as uow:
+            record = uow.channels.get(channel_id)
+            if record is None:
+                raise KeyError(channel_id)
+            return self._hydrate(uow, record)
+
+    def __setitem__(self, channel_id: str, channel: Channel) -> None:
+        if channel_id != channel.channel_id:
+            raise ValueError(
+                f"key {channel_id!r} does not match channel {channel.channel_id!r}"
+            )
+        with self._uow() as uow:
+            record = to_channel_record(
+                channel, tenant_id=self.tenant_id, project_id=self.project_id
+            )
+            existing = uow.channels.get(channel_id)
+            if existing is not None:
+                record.created_at = existing.created_at
+            uow.channels.save(record)
+
+            # The account rows own the channel link, so writing the channel is
+            # also where that link is kept true.
+            for platform, account_id in channel.accounts.items():
+                account = uow.accounts.get(account_id)
+                if account is None:
+                    account = SocialAccountRecord(
+                        id=account_id,
+                        tenant_id=self.tenant_id,
+                        platform=platform.value,
+                    )
+                account.channel_id = channel_id
+                uow.accounts.save(account)
+
+            # Fingerprints the channel has consumed since it was last written.
+            # Only those matching a known source can be recorded: the join
+            # table is keyed by source, which is what stops it filling with
+            # references to material nobody can look up.
+            if channel.used_fingerprints:
+                known = {s.fingerprint: s.id for s in uow.sources.all()}
+                for fingerprint in channel.used_fingerprints:
+                    source_id = known.get(fingerprint)
+                    if source_id is not None:
+                        uow.sources.mark_used(channel_id, source_id, utcnow())
+
+    def __delitem__(self, channel_id: str) -> None:
+        with self._uow() as uow:
+            if not uow.channels.delete(channel_id):
+                raise KeyError(channel_id)
+
+    def __iter__(self) -> Iterator[str]:
+        with self._uow() as uow:
+            return iter([r.id for r in uow.channels.all()])
+
+    def __len__(self) -> int:
+        with self._uow() as uow:
+            return uow.channels.count()
+
+    def values(self):  # type: ignore[override]
+        """One query for the rows, not one per key."""
+
+        with self._uow() as uow:
+            fingerprints = self._fingerprints_by_source(uow)
+            return [
+                self._hydrate(uow, r, fingerprints) for r in uow.channels.all()
+            ]
+
+    def items(self):  # type: ignore[override]
+        return [(c.channel_id, c) for c in self.values()]
+
+
+# ---------------------------------------------------------------------------
+# Analytics
+# ---------------------------------------------------------------------------
+
+#: Where the analytics fields that have no column of their own ride. Namespaced
+#: so a caller's own `extra` cannot collide with them.
+_ANALYTICS = "_analytics"
+
+
+class DurableAnalyticsStore(AnalyticsStore, _TenantBound):
+    """`AnalyticsStore` whose readings are rows in `metric_snapshots`.
+
+    Inherits `select`, `group` and `coverage` unchanged: those are the
+    statistics, and they are the same statistics whether the records came from
+    a dictionary or a table. What changes is where the records live.
+
+    Snapshots are **append-only**, and not by convention — the application role
+    holds no UPDATE or DELETE on `metric_snapshots`. Every finding the
+    analytics engine reports rests on comparing posts at matched ages, and a
+    reading rewritten after the fact makes those comparisons quietly wrong with
+    no way to recover the original. A double collection at the same age is a
+    constraint violation rather than a silently doubled view count.
+
+    Ids for snapshot rows are derived from the post and the age, so a
+    re-collection is caught by the primary key as well as by the unique index.
+    """
+
+    def __init__(self, database: Any, tenant_id: str) -> None:
+        AnalyticsStore.__init__(self)
+        _TenantBound.__init__(self, database, tenant_id)
+
+    # -- write-through -----------------------------------------------------
+
+    def add(self, record: PostRecord) -> None:
+        super().add(record)
+        self._save(record)
+
+    def _save(self, record: PostRecord) -> None:
+        with self._uow() as uow:
+            upload = uow.uploads.get(record.post_id)
+            if upload is None:
+                # Analytics can legitimately arrive for a post this process did
+                # not schedule — a backfill, or a post published before the
+                # system took the channel over. Recording the reading matters
+                # more than insisting the upload row already exists.
+                return
+            self._save_decisions(uow, upload, record)
+            self._save_snapshots(uow, record)
+
+    def _save_decisions(self, uow: Any, upload: Any, record: PostRecord) -> None:
+        """Persist what the system decided, on the clip that carries it."""
+
+        if not upload.clip_id:
+            return
+        clip = uow.clips.get(upload.clip_id)
+        if clip is None:
+            return
+        clip.hook_text = record.hook_text
+        clip.hook_type = record.hook_type
+        clip.hook_rank = record.hook_rank
+        clip.hook_explored = record.explored
+        clip.predicted_lift = record.predicted_lift
+        clip.virality_score = record.predicted_virality
+        clip.topic = record.topic
+        clip.weights_version = record.hook_weights_version
+        clip.duration_s = record.clip_duration_s
+        features = dict(clip.features or {})
+        features[_ANALYTICS] = {
+            "caption_style": record.caption_style,
+            "gameplay_bed": record.gameplay_bed,
+            "viral_weights_version": record.viral_weights_version,
+            "extra": dict(record.extra),
+        }
+        clip.features = features
+        uow.clips.save(clip)
+
+    def _save_snapshots(self, uow: Any, record: PostRecord) -> None:
+        existing = {s.age_hours for s in uow.metrics.for_upload(record.post_id)}
+        for snapshot in record.metrics.snapshots:
+            if snapshot.age_hours in existing:
+                continue
+            uow.metrics.append(
+                MetricSnapshotRecord(
+                    id=_snapshot_id(record.post_id, snapshot.age_hours),
+                    tenant_id=self.tenant_id,
+                    upload_id=record.post_id,
+                    taken_at=snapshot.taken_at,
+                    age_hours=snapshot.age_hours,
+                    views=snapshot.views,
+                    likes=snapshot.likes,
+                    comments=snapshot.comments,
+                    shares=snapshot.shares,
+                    saves=snapshot.saves,
+                    follows=snapshot.follows,
+                    impressions=snapshot.impressions,
+                    watch_time_s=snapshot.watch_time_s,
+                    avg_watch_pct=snapshot.avg_watch_pct,
+                    # Null, not an empty curve. Only YouTube reports one, and
+                    # an imputed flat curve would be counted as a measured bad
+                    # outcome rather than as a missing measurement.
+                    retention_curve=(
+                        [list(p) for p in snapshot.retention.points]
+                        if snapshot.retention.points
+                        else None
+                    ),
+                )
+            )
+
+    # -- rehydration -------------------------------------------------------
+
+    def load(self, since: datetime | None = None) -> int:
+        """Rebuild the records from the tables. Returns how many came back.
+
+        Joins three tables by hand rather than in SQL: `uploads` for who and
+        when, `clips` for what the system decided, `metric_snapshots` for what
+        came of it. The channel and source lookups are read once into maps
+        first — one query each, not one per post.
+        """
+
+        with self._uow() as uow:
+            channels = {c.id: c for c in uow.channels.all()}
+            sources = {s.id: s for s in uow.sources.all()}
+            uploads = [
+                u
+                for u in uow.uploads.in_state("published", "awaiting_creator")
+                if u.published_at is not None
+                and (since is None or u.published_at >= ensure_utc(since))
+            ]
+            clips = {c.id: c for c in uow.clips.all()}
+            readings: dict[str, list[Any]] = {}
+            for upload in uploads:
+                readings[upload.id] = list(uow.metrics.for_upload(upload.id))
+
+        loaded = 0
+        for upload in uploads:
+            channel = channels.get(upload.channel_id)
+            clip = clips.get(upload.clip_id) if upload.clip_id else None
+            source = sources.get(clip.source_id) if clip and clip.source_id else None
+            AnalyticsStore.add(
+                self,
+                _to_post_record(
+                    upload,
+                    channel=channel,
+                    clip=clip,
+                    source=source,
+                    snapshots=readings.get(upload.id, ()),
+                ),
+            )
+            loaded += 1
+        return loaded
+
+
+def _snapshot_id(post_id: str, age_hours: float) -> str:
+    """Deterministic, so a repeat collection collides instead of duplicating."""
+
+    return f"ms_{post_id}_{age_hours:g}"
+
+
+def _to_post_record(
+    upload: Any, *, channel: Any, clip: Any, source: Any, snapshots
+) -> PostRecord:
+    features = dict((clip.features if clip else None) or {})
+    packed = features.get(_ANALYTICS, {}) or {}
+
+    metrics = PostMetrics(
+        post_id=upload.id,
+        platform=Platform(upload.platform),
+        published_at=upload.published_at,
+        snapshots=[
+            Snapshot(
+                taken_at=row.taken_at,
+                age_hours=row.age_hours,
+                views=row.views,
+                likes=row.likes,
+                comments=row.comments,
+                shares=row.shares,
+                saves=row.saves,
+                follows=row.follows,
+                watch_time_s=row.watch_time_s,
+                avg_watch_pct=row.avg_watch_pct,
+                retention=RetentionCurve(
+                    points=tuple(
+                        (float(p[0]), float(p[1])) for p in (row.retention_curve or ())
+                    )
+                ),
+                impressions=row.impressions,
+            )
+            for row in snapshots
+        ],
+    )
+    return PostRecord(
+        post_id=upload.id,
+        metrics=metrics,
+        channel_id=upload.channel_id,
+        channel_name=channel.name if channel else "",
+        niche=channel.niche if channel else "",
+        account_id=upload.account_id,
+        timezone=channel.timezone if channel else "UTC",
+        hook_text=clip.hook_text if clip else "",
+        hook_type=clip.hook_type if clip else "",
+        predicted_lift=clip.predicted_lift if clip else 0.0,
+        hook_rank=clip.hook_rank if clip else 0,
+        explored=clip.hook_explored if clip else False,
+        topic=clip.topic if clip else "",
+        source_id=(clip.source_id or "") if clip else "",
+        creator=source.creator if source else "",
+        clip_duration_s=clip.duration_s if clip else 0.0,
+        caption_style=packed.get("caption_style", ""),
+        gameplay_bed=packed.get("gameplay_bed", ""),
+        predicted_virality=clip.virality_score if clip else 0.0,
+        hook_weights_version=clip.weights_version if clip else "",
+        viral_weights_version=packed.get("viral_weights_version", ""),
+        extra=dict(packed.get("extra", {})),
+    )

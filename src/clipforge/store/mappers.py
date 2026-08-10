@@ -24,6 +24,10 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
+from ..factory.channel import Budget, Channel, ChannelHealth, ChannelState
+from ..factory.niches import Niche
+from ..factory.sources import RightsBasis, Rights, SourceKind
+from ..factory.sources import Source as FactorySource
 from ..publish.oauth import TokenSet
 from ..publish.types import (
     Account,
@@ -36,7 +40,12 @@ from ..publish.types import (
     Visibility,
     ensure_utc,
 )
-from .records import SocialAccountRecord, UploadRecord
+from .records import (
+    ChannelRecord,
+    SocialAccountRecord,
+    SourceRecord,
+    UploadRecord,
+)
 
 __all__ = [
     "to_upload_record",
@@ -45,6 +54,10 @@ __all__ = [
     "to_account",
     "apply_tokens",
     "to_token_set",
+    "to_source_record",
+    "to_source",
+    "to_channel_record",
+    "to_channel",
 ]
 
 #: Keys `metadata` reserves for things the domain object carries but the table
@@ -295,4 +308,166 @@ def to_token_set(record: SocialAccountRecord, *, unseal) -> TokenSet:
         scopes=tuple(record.scopes),
         refresh_valid_until=record.refresh_valid_until,
         obtained_at=record.token_obtained_at or datetime.now(UTC),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Source <-> SourceRecord
+# ---------------------------------------------------------------------------
+
+
+def to_source_record(source: FactorySource, *, tenant_id: str) -> SourceRecord:
+    """Licensed raw material as a row.
+
+    The rights fields become columns rather than a JSON blob because they are
+    *queried* — the expiry sweep and the clearance gate both filter on them,
+    and a filter over JSON is a sequential scan of every source the tenant has
+    ever registered.
+    """
+
+    rights = source.rights
+    return SourceRecord(
+        id=source.source_id,
+        tenant_id=tenant_id,
+        title=source.title,
+        kind=source.kind.value,
+        url=source.url,
+        creator=source.creator,
+        language=source.language,
+        topics=list(source.topics),
+        duration_s=source.duration_s,
+        has_transcript=source.has_transcript,
+        published_at=source.published_at,
+        # Derived from creator + id, so the same upload reappearing under a new
+        # URL is recognised rather than clipped a second time.
+        fingerprint=source.fingerprint,
+        rights_basis=rights.basis.value,
+        rights_reference=rights.reference,
+        rights_attribution=rights.attribution,
+        commercial_use=rights.commercial_use,
+        derivatives=rights.derivatives,
+        rights_verified_at=rights.verified_at,
+        rights_expires_at=rights.expires_at,
+    )
+
+
+def to_source(record: SourceRecord) -> FactorySource:
+    return FactorySource(
+        source_id=record.id,
+        title=record.title,
+        kind=SourceKind(record.kind),
+        rights=Rights(
+            basis=RightsBasis(record.rights_basis),
+            reference=record.rights_reference,
+            attribution=record.rights_attribution,
+            commercial_use=record.commercial_use,
+            derivatives=record.derivatives,
+            verified_at=record.rights_verified_at,
+            expires_at=record.rights_expires_at,
+        ),
+        url=record.url,
+        creator=record.creator,
+        duration_s=record.duration_s,
+        published_at=record.published_at,
+        language=record.language,
+        topics=tuple(record.topics),
+        has_transcript=record.has_transcript,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Channel <-> ChannelRecord
+# ---------------------------------------------------------------------------
+
+
+def to_channel_record(
+    channel: Channel, *, tenant_id: str, project_id: str
+) -> ChannelRecord:
+    """A channel as a row.
+
+    `accounts` is not written here: it is a platform-to-account map, and the
+    account rows already carry `channel_id`. Storing it twice is storing two
+    answers, and they disagree the first time an account is disconnected.
+
+    `used_fingerprints` is likewise absent. It is the `channel_source_uses`
+    join table — an array column would be rewritten in full on every append,
+    and that set grows for as long as the channel runs.
+    """
+
+    health = channel.health
+    budget = channel.budget
+    return ChannelRecord(
+        id=channel.channel_id,
+        tenant_id=tenant_id,
+        project_id=project_id,
+        name=channel.name,
+        niche=channel.niche.value,
+        state=channel.state.value,
+        timezone=channel.timezone,
+        topics=list(channel.topics),
+        accepted_rights=sorted(r.value for r in channel.accepted_rights),
+        monetised=channel.monetised,
+        cadence_override=channel.cadence_override,
+        quality_floor_override=channel.quality_floor_override,
+        budget_monthly_cents=budget.monthly_cents,
+        budget_spent_cents=budget.spent_cents,
+        budget_period=budget.period,
+        # Circuit-breaker state, persisted rather than recomputed: a channel
+        # that tripped before a restart must stay tripped, or a deploy silently
+        # retries every failing channel at once.
+        consecutive_failures=health.consecutive_failures,
+        circuit_opened_at=health.opened_at,
+        last_error=health.last_error,
+        total_items=health.total_items,
+        total_published=health.total_published,
+        total_blocked=health.total_blocked,
+        total_failed=health.total_failed,
+        created_at=channel.created_at,
+    )
+
+
+def to_channel(
+    record: ChannelRecord,
+    *,
+    accounts: dict[Platform, str] | None = None,
+    used_fingerprints: set[str] | None = None,
+) -> Channel:
+    """A row as a channel.
+
+    `accounts` and `used_fingerprints` come from their own tables, so the
+    caller passes them in rather than this function reaching for a database it
+    was not given.
+    """
+
+    return Channel(
+        channel_id=record.id,
+        name=record.name,
+        niche=Niche(record.niche),
+        org_id=record.tenant_id,
+        accounts=dict(accounts or {}),
+        topics=tuple(record.topics),
+        accepted_rights=frozenset(
+            RightsBasis(value) for value in record.accepted_rights
+        ),
+        monetised=record.monetised,
+        timezone=record.timezone,
+        state=ChannelState(record.state),
+        budget=Budget(
+            monthly_cents=record.budget_monthly_cents,
+            spent_cents=record.budget_spent_cents,
+            period=record.budget_period,
+        ),
+        health=ChannelHealth(
+            consecutive_failures=record.consecutive_failures,
+            total_items=record.total_items,
+            total_published=record.total_published,
+            total_blocked=record.total_blocked,
+            total_failed=record.total_failed,
+            opened_at=record.circuit_opened_at,
+            last_error=record.last_error,
+        ),
+        cadence_override=record.cadence_override,
+        quality_floor_override=record.quality_floor_override,
+        used_fingerprints=set(used_fingerprints or ()),
+        created_at=record.created_at,
     )
