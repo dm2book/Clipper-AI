@@ -37,6 +37,7 @@ from typing import Any, Callable
 
 from ..analytics.attribution import AnalyticsStore, PostRecord
 from ..analytics.metrics import PostMetrics, RetentionCurve, Snapshot
+from ..empire.tenancy import Brand, Directory, Plan, Role, Tenant, User
 from ..factory.channel import Channel
 from ..factory.sources import RegistrySourceFinder
 from ..factory.sources import Source as FactorySource
@@ -56,7 +57,13 @@ from .mappers import (
     to_token_set,
     to_upload_record,
 )
-from .records import MetricSnapshotRecord, SocialAccountRecord
+from .records import (
+    MetricSnapshotRecord,
+    ProjectRecord,
+    SocialAccountRecord,
+    TenantRecord,
+    UserRecord,
+)
 
 __all__ = [
     "DurableTokenStore",
@@ -65,6 +72,7 @@ __all__ = [
     "DurableSourceRegistry",
     "DurableChannelBook",
     "DurableAnalyticsStore",
+    "DurableDirectory",
     "DEFAULT_HORIZON_DAYS",
 ]
 
@@ -806,3 +814,218 @@ def _to_post_record(
         viral_weights_version=packed.get("viral_weights_version", ""),
         extra=dict(packed.get("extra", {})),
     )
+
+
+# ---------------------------------------------------------------------------
+# Tenancy
+# ---------------------------------------------------------------------------
+
+
+class DurableDirectory(Directory, _TenantBound):
+    """`Directory` over `tenants`, `projects` and `users`.
+
+    A brand *is* a project — the schema's name for the same thing, chosen
+    because "project" is what the rest of the data model calls the unit a
+    channel belongs to.
+
+    ## Scoped to one tenant, on purpose
+
+    The in-memory `Directory` holds every tenant at once, because a dictionary
+    has no opinion about who is asking. This one is bound to a single tenant,
+    for the same reason every other durable store is: the application role
+    connects under row-level security and cannot read across the boundary. So
+    `tenants` returns the one tenant this directory speaks for, not a census.
+
+    That is a real change in what the object can answer, and it is the right
+    one. A cross-tenant listing is a control-plane operation — billing,
+    support, provisioning — and it belongs to a role that is allowed to see
+    across tenants, in the way `clipforge_worker` is for the queue. Quietly
+    giving the request path that reach is how one customer's dashboard ends up
+    counting another's channels.
+
+    ## Plan limits and permissions are inherited unchanged
+
+    `add_brand`, `add_user`, `require`, `visible_channels` and `scope_check`
+    come from the base class untouched. They are product rules, not storage,
+    and `require` in particular fails closed by raising rather than returning a
+    bool — reimplementing it here would be a second copy of an authorisation
+    check, which is one copy too many.
+    """
+
+    def __init__(self, database: Any, tenant_id: str) -> None:
+        Directory.__init__(self)
+        _TenantBound.__init__(self, database, tenant_id)
+
+    def _check_scope(self, tenant_id: str) -> None:
+        if tenant_id != self.tenant_id:
+            raise KeyError(
+                f"this directory is scoped to {self.tenant_id!r}, "
+                f"not {tenant_id!r}"
+            )
+
+    # -- tenants -----------------------------------------------------------
+
+    def add_tenant(self, tenant: Tenant) -> Tenant:
+        self._check_scope(tenant.tenant_id)
+        with self._uow() as uow:
+            existing = uow.tenants.get(tenant.tenant_id)
+            record = TenantRecord(
+                id=tenant.tenant_id,
+                name=tenant.name,
+                plan=tenant.plan.value,
+                suspended=tenant.suspended,
+                created_at=tenant.created_at,
+            )
+            if existing is not None:
+                record.created_at = existing.created_at
+            uow.tenants.save(record)
+        return tenant
+
+    def tenant(self, tenant_id: str) -> Tenant:
+        self._check_scope(tenant_id)
+        with self._uow() as uow:
+            record = uow.tenants.get(tenant_id)
+        if record is None:
+            raise KeyError(f"unknown tenant {tenant_id!r}")
+        return Tenant(
+            tenant_id=record.id,
+            name=record.name,
+            plan=Plan(record.plan),
+            created_at=record.created_at,
+            suspended=record.suspended,
+        )
+
+    @property
+    def tenants(self) -> tuple[Tenant, ...]:
+        """This directory's tenant, if it exists. Not a census — see the class
+        docstring for why a cross-tenant listing is not this object's job."""
+
+        try:
+            return (self.tenant(self.tenant_id),)
+        except KeyError:
+            return ()
+
+    # -- brands ------------------------------------------------------------
+
+    def _to_brand(self, uow: Any, record: Any) -> Brand:
+        # `channel_ids` is derived from the channel rows rather than stored on
+        # the project: the channel already knows its project, and a second copy
+        # is a second answer that disagrees the moment a channel is moved.
+        return Brand(
+            brand_id=record.id,
+            tenant_id=record.tenant_id,
+            name=record.name,
+            channel_ids={c.id for c in uow.channels.for_project(record.id)},
+            budget_cents=record.budget_cents,
+            timezone=record.timezone,
+            created_at=record.created_at,
+            archived=record.archived,
+        )
+
+    def _save_brand(self, brand: Brand) -> None:
+        with self._uow() as uow:
+            existing = uow.projects.get(brand.brand_id)
+            record = ProjectRecord(
+                id=brand.brand_id,
+                tenant_id=brand.tenant_id,
+                name=brand.name,
+                timezone=brand.timezone,
+                budget_cents=brand.budget_cents,
+                archived=brand.archived,
+                created_at=brand.created_at,
+            )
+            if existing is not None:
+                record.created_at = existing.created_at
+            uow.projects.save(record)
+
+    def add_brand(self, brand: Brand) -> Brand:
+        self._check_scope(brand.tenant_id)
+        # Through the base class, so the plan-limit check is the same one.
+        super().add_brand(brand)
+        self._save_brand(brand)
+        return brand
+
+    def brand(self, brand_id: str, tenant_id: str = "") -> Brand:
+        if tenant_id:
+            self._check_scope(tenant_id)
+        with self._uow() as uow:
+            record = uow.projects.get(brand_id)
+            if record is None:
+                raise KeyError(f"unknown brand {brand_id!r}")
+            return self._to_brand(uow, record)
+
+    def brands(self, tenant_id: str) -> tuple[Brand, ...]:
+        self._check_scope(tenant_id)
+        with self._uow() as uow:
+            return tuple(
+                self._to_brand(uow, r) for r in uow.projects.live()
+            )
+
+    def attach_channel(self, brand_id: str, channel_id: str) -> None:
+        # The limit check is the base class's; the edge itself is the channel
+        # row's `project_id`, which is where it already belonged.
+        super().attach_channel(brand_id, channel_id)
+        with self._uow() as uow:
+            channel = uow.channels.get(channel_id)
+            if channel is None:
+                raise KeyError(f"unknown channel {channel_id!r}")
+            channel.project_id = brand_id
+            uow.channels.save(channel)
+
+    def brand_of(self, channel_id: str) -> str:
+        with self._uow() as uow:
+            channel = uow.channels.get(channel_id)
+        return channel.project_id if channel else ""
+
+    # -- users -------------------------------------------------------------
+
+    def add_user(self, user: User) -> User:
+        self._check_scope(user.tenant_id)
+        super().add_user(user)
+        with self._uow() as uow:
+            existing = uow.users.get(user.user_id)
+            record = UserRecord(
+                id=user.user_id,
+                tenant_id=user.tenant_id,
+                email=user.email,
+                name=user.name,
+                role=user.role.value,
+                active=user.active,
+                project_ids=sorted(user.brand_ids),
+            )
+            if existing is not None:
+                record.created_at = existing.created_at
+            uow.users.save(record)
+        return user
+
+    def _to_user(self, record: Any) -> User:
+        return User(
+            user_id=record.id,
+            tenant_id=record.tenant_id,
+            email=record.email,
+            role=Role(record.role),
+            brand_ids=frozenset(record.project_ids),
+            name=record.name,
+            active=record.active,
+        )
+
+    def user(self, user_id: str) -> User:
+        with self._uow() as uow:
+            record = uow.users.get(user_id)
+        if record is None:
+            raise KeyError(f"unknown user {user_id!r}")
+        return self._to_user(record)
+
+    def users(self, tenant_id: str) -> tuple[User, ...]:
+        self._check_scope(tenant_id)
+        with self._uow() as uow:
+            return tuple(self._to_user(r) for r in uow.users.all())
+
+    def to_dict(self) -> dict[str, Any]:
+        with self._uow() as uow:
+            return {
+                "tenants": uow.tenants.count(),
+                "brands": uow.projects.count(),
+                "users": uow.users.count(),
+                "channels": uow.channels.count(),
+            }

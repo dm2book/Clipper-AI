@@ -1206,6 +1206,7 @@ engine, backed by Postgres, driven identically.
 | `RegistrySourceFinder` | `DurableSourceRegistry` | `sources` |
 | `ChannelFactory.channels` | `DurableChannelBook` | `channels` |
 | `AnalyticsStore` | `DurableAnalyticsStore` | `metric_snapshots` |
+| `empire.Directory` | `DurableDirectory` | `tenants`, `projects`, `users` |
 
 ```python
 from clipforge.store import open_database
@@ -1292,3 +1293,17 @@ PYTHONPATH=src python -m unittest discover -s tests
 | `postgres.py` | psycopg implementation, pooled. |
 | `mappers.py` | Domain objects to rows, losslessly, and back. |
 | `durable.py` | Drop-in durable replacements for the engines' dictionaries. |
+
+`DurableDirectory` is scoped to one tenant, where the in-memory one held every
+tenant at once. That is a real change in what the object can answer and the
+right one: the application role connects under row-level security and cannot
+read across the boundary. A cross-tenant listing is a control-plane operation —
+billing, support, provisioning — and belongs to a role allowed to see across
+tenants, in the way `clipforge_worker` is for the queue. Giving the request path
+that reach is how one customer's dashboard ends up counting another's channels.
+
+Product rules stay in the base classes throughout: source ranking, the
+analytics statistics, plan limits, and the permission model (which raises
+rather than returning a bool, so a forgotten branch fails closed). Two
+implementations of the same rule drift apart, and the one nobody reads is the
+one that ships.

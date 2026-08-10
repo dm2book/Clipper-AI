@@ -19,6 +19,16 @@ from datetime import UTC, datetime, timedelta
 
 from clipforge.analytics.attribution import PostRecord
 from clipforge.analytics.metrics import PostMetrics, RetentionCurve, Snapshot
+from clipforge.empire.tenancy import (
+    AccessDenied,
+    Brand,
+    Permission,
+    Plan,
+    PlanLimitExceeded,
+    Role,
+    Tenant,
+    User,
+)
 from clipforge.factory.channel import ChannelState
 from clipforge.factory.factory import ChannelFactory
 from clipforge.factory.niches import Niche
@@ -35,6 +45,7 @@ from clipforge.store import (
 )
 from clipforge.store.durable import (
     DurableAnalyticsStore,
+    DurableDirectory,
     DurableChannelBook,
     DurableSourceRegistry,
 )
@@ -422,3 +433,132 @@ class DurableAnalyticsTest(_Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DurableDirectoryTest(_Base):
+    """Tenants, brands and users, persisted.
+
+    A brand is a project: the schema's name for the same thing. What these
+    check is that the plan limits and the permission model still come from the
+    base class — a second copy of an authorisation check is one copy too many —
+    while the records themselves outlive the process.
+    """
+
+    def _directory(self) -> DurableDirectory:
+        return DurableDirectory(self.db, TENANT)
+
+    def _seeded(self) -> DurableDirectory:
+        directory = self._directory()
+        directory.add_tenant(Tenant(tenant_id=TENANT, name="Factory Co",
+                                    plan=Plan.AGENCY))
+        return directory
+
+    def test_a_tenant_survives(self) -> None:
+        self._seeded()
+        tenant = self._directory().tenant(TENANT)
+        self.assertEqual(tenant.name, "Factory Co")
+        self.assertEqual(tenant.plan, Plan.AGENCY)
+        self.assertFalse(tenant.suspended)
+
+    def test_suspension_survives(self) -> None:
+        """A suspended tenant that comes back running after a deploy is a
+        customer publishing on an account that stopped paying."""
+
+        directory = self._seeded()
+        directory.add_tenant(Tenant(tenant_id=TENANT, name="Factory Co",
+                                    plan=Plan.AGENCY, suspended=True))
+        self.assertTrue(self._directory().tenant(TENANT).suspended)
+
+    def test_brands_and_their_channels_survive(self) -> None:
+        directory = self._seeded()
+        directory.add_brand(Brand(brand_id="brand_1", tenant_id=TENANT,
+                                  name="Motors", budget_cents=120_000,
+                                  timezone="Europe/Berlin"))
+        factory = ChannelFactory(finder=self._sources(), channels=self._channels())
+        channel = factory.create_channel("Fast Cars", Niche.CARS)
+        directory.attach_channel("brand_1", channel.channel_id)
+
+        reopened = self._directory()
+        brand = reopened.brand("brand_1")
+        self.assertEqual(brand.name, "Motors")
+        self.assertEqual(brand.budget_cents, 120_000)
+        self.assertEqual(brand.timezone, "Europe/Berlin")
+        self.assertEqual(brand.channel_ids, {channel.channel_id})
+        self.assertEqual(reopened.brand_of(channel.channel_id), "brand_1")
+
+    def test_users_and_their_brand_restrictions_survive(self) -> None:
+        """How an agency gives a client their own portfolio and nothing else.
+        A restriction lost on restart is one client seeing another's numbers."""
+
+        directory = self._seeded()
+        directory.add_brand(Brand(brand_id="brand_1", tenant_id=TENANT, name="A"))
+        directory.add_brand(Brand(brand_id="brand_2", tenant_id=TENANT, name="B"))
+        directory.add_user(User(user_id="u_1", tenant_id=TENANT,
+                                email="client@example.com", role=Role.VIEWER,
+                                brand_ids=frozenset({"brand_1"}), name="Client"))
+
+        user = self._directory().user("u_1")
+        self.assertEqual(user.role, Role.VIEWER)
+        self.assertEqual(user.brand_ids, frozenset({"brand_1"}))
+        self.assertTrue(user.sees_brand("brand_1"))
+        self.assertFalse(user.sees_brand("brand_2"))
+
+    def test_permissions_are_the_inherited_ones_and_still_fail_closed(self) -> None:
+        directory = self._seeded()
+        directory.add_user(User(user_id="u_view", tenant_id=TENANT,
+                                email="v@example.com", role=Role.VIEWER))
+        directory.add_user(User(user_id="u_own", tenant_id=TENANT,
+                                email="o@example.com", role=Role.OWNER))
+
+        reopened = self._directory()
+        reopened.require("u_own", Permission.MANAGE_BILLING)
+        with self.assertRaises(AccessDenied):
+            reopened.require("u_view", Permission.MANAGE_BILLING)
+
+    def test_a_deactivated_user_is_refused_after_a_restart(self) -> None:
+        directory = self._seeded()
+        directory.add_user(User(user_id="u_gone", tenant_id=TENANT,
+                                email="gone@example.com", role=Role.OWNER,
+                                active=False))
+        with self.assertRaises(AccessDenied):
+            self._directory().require("u_gone", Permission.VIEW_ANALYTICS)
+
+    def test_plan_limits_are_enforced_against_what_is_stored(self) -> None:
+        """The check counts rows, not what this process happens to remember.
+        A limit enforced against in-process state resets every deploy, and the
+        cap stops being a cap."""
+
+        directory = self._directory()
+        directory.add_tenant(Tenant(tenant_id=TENANT, name="Studio",
+                                    plan=Plan.STUDIO))
+        # `setUp` already created one project, and it counts — which is the
+        # point: the limit is measured against the rows, not against what this
+        # process happens to have added.
+        headroom = (
+            directory.tenant(TENANT).limits.max_brands
+            - len(directory.brands(TENANT))
+        )
+        self.assertGreater(headroom, 0)
+        for index in range(headroom):
+            directory.add_brand(Brand(brand_id=f"brand_{index}",
+                                      tenant_id=TENANT, name=f"B{index}"))
+
+        # A brand-new directory object, with nothing carried over.
+        with self.assertRaises(PlanLimitExceeded):
+            self._directory().add_brand(
+                Brand(brand_id="brand_over", tenant_id=TENANT, name="Over")
+            )
+
+    def test_the_directory_refuses_to_speak_for_another_tenant(self) -> None:
+        """It is scoped to one tenant because the application role is. A
+        cross-tenant listing is a control-plane operation and belongs to a role
+        allowed to see across the boundary — not to the request path."""
+
+        directory = self._seeded()
+        with self.assertRaises(KeyError):
+            directory.add_tenant(Tenant(tenant_id="ten_other", name="Someone else"))
+        with self.assertRaises(KeyError):
+            directory.tenant("ten_other")
+        with self.assertRaises(KeyError):
+            directory.brands("ten_other")
+        self.assertEqual([t.tenant_id for t in directory.tenants], [TENANT])
