@@ -1,0 +1,652 @@
+// ClipForge AI — persistence schema.
+//
+// ## Why Prisma here, and what it is not doing
+//
+// Prisma's client is a TypeScript library; this application is Python. What is
+// first-class and used here is the other half of Prisma: the schema DSL and the
+// migration engine, which emit plain, reviewable SQL and keep a versioned,
+// checksummed migration history. That is a legitimate way to run Prisma against
+// a non-Node service and it is what `db/` is for — `prisma migrate` owns the
+// schema, and the Python side talks to Postgres through psycopg.
+//
+// The alternative, `prisma-client-py`, is a third-party port rather than a
+// Prisma product. Betting the data layer of a system that must not lose
+// anything on an unofficial client is not a trade worth making.
+//
+// ## Row-level security
+//
+// Prisma has no RLS support, so every policy lives in a hand-written migration
+// (`002_row_level_security`). The schema's job is to make those policies
+// possible, which imposes two rules on every model below:
+//
+//   1. Every tenant-scoped table carries `tenantId` directly. Not reachable via
+//      a join — *on the row*. A policy has to be a predicate over the row it is
+//      protecting, and a policy that needs a join is a policy that will be
+//      written wrong.
+//   2. Every index that will be used under RLS leads with `tenantId`. The
+//      policy predicate is ANDed into every query, so an index that does not
+//      start with the tenant is an index the planner will not use.
+//
+// ## Identifiers
+//
+// Application-generated strings (`ch_a1b2c3`, `post_9f8e7d`) rather than
+// database UUIDs. They are already stable and unique, they survive being
+// carried through the domain layer untouched, and a prefixed id in a log line
+// says what it is. The cost is four bytes an index entry against a uuid, which
+// is not the constraint here.
+
+// No `generator` block. A generator would emit the TypeScript client this
+// project does not use; leaving it out keeps `prisma migrate` as the only thing
+// this schema produces, which is the whole point of it being here.
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+
+  // `migrate dev` diffs the schema against a throwaway database. Prisma will
+  // create one itself if the migration role holds CREATEDB — this one
+  // deliberately does not, for the same reason the app role is not superuser,
+  // so the shadow database is provisioned once out of band and pointed at here.
+  // Unused by `migrate deploy`, which is what runs in production.
+  shadowDatabaseUrl = env("SHADOW_DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Tenancy
+// ---------------------------------------------------------------------------
+
+enum PlanTier {
+  starter
+  studio
+  agency
+  empire
+}
+
+model Tenant {
+  id        String   @id
+  name      String
+  plan      PlanTier @default(starter)
+  suspended Boolean  @default(false)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  users     User[]
+  projects  Project[]
+  channels  Channel[]
+  accounts  SocialAccount[]
+  sources   Source[]
+  videos    Video[]
+  clips     Clip[]
+  schedules Schedule[]
+  uploads   Upload[]
+  metrics   MetricSnapshot[]
+  jobs      Job[]
+  sourceUse ChannelSourceUse[]
+
+  @@map("tenants")
+}
+
+enum UserRole {
+  owner
+  admin
+  operator
+  editor
+  analyst
+  viewer
+}
+
+model User {
+  id       String   @id
+  tenantId String   @map("tenant_id")
+  email    String
+  name     String   @default("")
+  role     UserRole
+  active   Boolean  @default(true)
+
+  // Empty means every project in the tenant. Populated restricts the user,
+  // which is how an agency gives a client their own portfolio and nothing else.
+  projectIds String[] @default([]) @map("project_ids")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  // Scoped to the tenant, not global: two tenants may legitimately have a user
+  // with the same work address, and a global unique would leak the existence
+  // of one customer's users to another's signup form.
+  @@unique([tenantId, email])
+  @@index([tenantId, active])
+  @@map("users")
+}
+
+/// A brand or portfolio. The domain layer calls this a Brand; it is the unit
+/// that carries its own budget, its own P&L and often its own staff.
+model Project {
+  id          String   @id
+  tenantId    String   @map("tenant_id")
+  name        String
+  timezone    String   @default("UTC")
+  budgetCents Int      @default(0) @map("budget_cents")
+  archived    Boolean  @default(false)
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  tenant   Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  channels Channel[]
+
+  @@index([tenantId, archived])
+  @@map("projects")
+}
+
+// ---------------------------------------------------------------------------
+// Channels and connected accounts
+// ---------------------------------------------------------------------------
+
+enum ChannelState {
+  draft
+  active
+  paused
+  budget_exhausted
+  circuit_open
+}
+
+model Channel {
+  id        String       @id
+  tenantId  String       @map("tenant_id")
+  projectId String       @map("project_id")
+  name      String
+  niche     String
+  state     ChannelState @default(draft)
+  timezone  String       @default("UTC")
+
+  topics               String[] @default([])
+  acceptedRights       String[] @default([]) @map("accepted_rights")
+  monetised            Boolean  @default(true)
+  cadenceOverride      Int      @default(0) @map("cadence_override")
+  qualityFloorOverride Float    @default(0) @map("quality_floor_override")
+
+  budgetMonthlyCents Int    @default(20000) @map("budget_monthly_cents")
+  budgetSpentCents   Int    @default(0) @map("budget_spent_cents")
+  budgetPeriod       String @default("") @map("budget_period")
+
+  // Circuit-breaker state. Persisted rather than recomputed: a channel that
+  // tripped before a restart must stay tripped, or a deploy silently retries
+  // every failing channel at once.
+  consecutiveFailures Int       @default(0) @map("consecutive_failures")
+  circuitOpenedAt     DateTime? @map("circuit_opened_at") @db.Timestamptz(6)
+  lastError           String    @default("") @map("last_error")
+  totalItems          Int       @default(0) @map("total_items")
+  totalPublished      Int       @default(0) @map("total_published")
+  totalBlocked        Int       @default(0) @map("total_blocked")
+  totalFailed         Int       @default(0) @map("total_failed")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  tenant  Tenant  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  accounts    SocialAccount[]
+  clips       Clip[]
+  schedules   Schedule[]
+  uploads     Upload[]
+  jobs        Job[]
+  usedSources ChannelSourceUse[]
+
+  @@index([tenantId, state])
+  @@index([tenantId, projectId])
+  @@map("channels")
+}
+
+enum PlatformKind {
+  tiktok
+  youtube
+  instagram
+}
+
+model SocialAccount {
+  id         String       @id
+  tenantId   String       @map("tenant_id")
+  channelId  String?      @map("channel_id")
+  platform   PlatformKind
+  handle     String       @default("")
+  externalId String       @default("") @map("external_id")
+  timezone   String       @default("UTC")
+
+  directPostApproved Boolean @default(false) @map("direct_post_approved")
+  businessAccount    Boolean @default(false) @map("business_account")
+  enabled            Boolean @default(true)
+
+  // Ciphertext only. The application seals these before they arrive and the
+  // key lives in a KMS, so a database dump is not a set of working credentials
+  // to other people's audiences.
+  accessTokenSealed  String    @default("") @map("access_token_sealed")
+  refreshTokenSealed String    @default("") @map("refresh_token_sealed")
+  tokenExpiresAt     DateTime? @map("token_expires_at") @db.Timestamptz(6)
+  refreshValidUntil  DateTime? @map("refresh_valid_until") @db.Timestamptz(6)
+  tokenObtainedAt    DateTime? @map("token_obtained_at") @db.Timestamptz(6)
+  scopes             String[]  @default([])
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  tenant  Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  channel Channel? @relation(fields: [channelId], references: [id], onDelete: SetNull)
+  uploads Upload[]
+
+  @@index([tenantId, platform])
+  @@index([tenantId, channelId])
+  // Drives the credential-expiry alert without scanning the table.
+  @@index([refreshValidUntil])
+  @@map("social_accounts")
+}
+
+// ---------------------------------------------------------------------------
+// Content
+// ---------------------------------------------------------------------------
+
+enum RightsBasisKind {
+  owned
+  licensed
+  creator_permission
+  public_domain
+  creative_commons
+  stock
+  unverified
+}
+
+/// Licensed raw material. The rights columns are first-class rather than a
+/// JSON blob because they are queried — the expiry sweep and the clearance
+/// gate both filter on them, and a filter over JSON is a sequential scan.
+model Source {
+  id       String   @id
+  tenantId String   @map("tenant_id")
+  title    String
+  kind     String
+  url      String   @default("")
+  creator  String   @default("")
+  language String   @default("en")
+  topics   String[] @default([])
+
+  durationS     Float     @default(0) @map("duration_s")
+  hasTranscript Boolean   @default(false) @map("has_transcript")
+  publishedAt   DateTime? @map("published_at") @db.Timestamptz(6)
+
+  // Content fingerprint, so the same material is not clipped twice.
+  fingerprint String
+
+  rightsBasis       RightsBasisKind @default(unverified) @map("rights_basis")
+  rightsReference   String          @default("") @map("rights_reference")
+  rightsAttribution String          @default("") @map("rights_attribution")
+  commercialUse     Boolean         @default(true) @map("commercial_use")
+  derivatives       Boolean         @default(true)
+  rightsVerifiedAt  DateTime?       @map("rights_verified_at") @db.Timestamptz(6)
+  rightsExpiresAt   DateTime?       @map("rights_expires_at") @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  tenant Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  clips  Clip[]
+  videos Video[]
+  usedBy ChannelSourceUse[]
+
+  @@unique([tenantId, fingerprint])
+  @@index([tenantId, rightsBasis])
+  // The licence-expiry sweep, which must not table-scan at fifty channels.
+  @@index([tenantId, rightsExpiresAt])
+  @@map("sources")
+}
+
+/// Which channels have already used which sources. A join table rather than an
+/// array on Channel: the set grows without bound over a channel's life, and an
+/// array column would be rewritten in full on every append.
+model ChannelSourceUse {
+  tenantId  String   @map("tenant_id")
+  channelId String   @map("channel_id")
+  sourceId  String   @map("source_id")
+  usedAt    DateTime @default(now()) @map("used_at") @db.Timestamptz(6)
+
+  // The tenant is carried on the row for RLS, but it also gets a real foreign
+  // key: an RLS column that can hold a tenant id no tenant row matches is a
+  // column the policy silently mis-files rows under.
+  tenant  Tenant  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  channel Channel @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  source  Source  @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+
+  @@id([channelId, sourceId])
+  @@index([tenantId])
+  @@map("channel_source_uses")
+}
+
+enum VideoState {
+  pending
+  rendering
+  ready
+  failed
+}
+
+/// A rendered media asset. Separate from Clip because one clip can be rendered
+/// more than once — a re-render after a caption fix, or a per-platform variant
+/// — and the upload has to reference the exact file that was sent.
+model Video {
+  id       String     @id
+  tenantId String     @map("tenant_id")
+  clipId   String?    @map("clip_id")
+  sourceId String?    @map("source_id")
+  state    VideoState @default(pending)
+
+  storageKey String @default("") @map("storage_key")
+  publicUrl  String @default("") @map("public_url")
+  checksum   String @default("")
+  sizeBytes  BigInt @default(0) @map("size_bytes")
+  durationS  Float  @default(0) @map("duration_s")
+  width      Int    @default(1080)
+  height     Int    @default(1920)
+  fps        Int    @default(60)
+
+  // The gameplay engine's composition plan and the ffmpeg filtergraph, kept so
+  // a render is reproducible and a bad output can be traced to the plan that
+  // produced it.
+  renderPlan  Json?     @map("render_plan")
+  renderError String    @default("") @map("render_error")
+  renderedAt  DateTime? @map("rendered_at") @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  tenant  Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  clip    Clip?    @relation(fields: [clipId], references: [id], onDelete: SetNull)
+  source  Source?  @relation(fields: [sourceId], references: [id], onDelete: SetNull)
+  uploads Upload[]
+
+  @@index([tenantId, state])
+  @@index([tenantId, clipId])
+  @@map("videos")
+}
+
+/// A detected moment with its hook and captions — the output of the decision
+/// layer, before rendering.
+model Clip {
+  id        String  @id
+  tenantId  String  @map("tenant_id")
+  channelId String  @map("channel_id")
+  sourceId  String? @map("source_id")
+
+  startMs    Int    @map("start_ms")
+  endMs      Int    @map("end_ms")
+  durationS  Float  @map("duration_s")
+  title      String @default("")
+  transcript String @default("")
+
+  // Scores and the feature vector that produced them. Persisted with the
+  // weights version so a retrained ranker can be evaluated against what the
+  // heuristic one believed at decision time — including about clips it
+  // rejected. Analytics joins on these.
+  viralityScore  Float    @default(0) @map("virality_score")
+  scores         Json?
+  features       Json?
+  signals        String[] @default([])
+  weightsVersion String   @default("") @map("weights_version")
+
+  hookText       String  @default("") @map("hook_text")
+  hookType       String  @default("") @map("hook_type")
+  hookRank       Int     @default(0) @map("hook_rank")
+  hookExplored   Boolean @default(false) @map("hook_explored")
+  predictedLift  Float   @default(0) @map("predicted_lift")
+  // Every generated hook, not only the published one. A model trained on
+  // winners learns which hooks get chosen, not which hooks work.
+  hookCandidates Json?   @map("hook_candidates")
+
+  captionTrack Json?  @map("caption_track")
+  topic        String @default("")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  tenant  Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  channel Channel  @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  source  Source?  @relation(fields: [sourceId], references: [id], onDelete: SetNull)
+  videos  Video[]
+  uploads Upload[]
+
+  @@index([tenantId, channelId])
+  @@index([tenantId, createdAt])
+  @@map("clips")
+}
+
+// ---------------------------------------------------------------------------
+// Scheduling and publishing
+// ---------------------------------------------------------------------------
+
+enum ScheduleFrequency {
+  daily
+  weekly
+  monthly
+}
+
+/// A recurrence rule. Stored as local time plus an IANA zone, never as a UTC
+/// cron: "every weekday at 17:00" is a claim about wall-clock time, and a UTC
+/// cron silently shifts the whole schedule by an hour at each DST transition.
+model Schedule {
+  id        String            @id
+  tenantId  String            @map("tenant_id")
+  channelId String            @map("channel_id")
+  frequency ScheduleFrequency
+  timezone  String            @default("UTC")
+
+  // "17:00" strings in `timezone`.
+  timesLocal String[] @default([]) @map("times_local")
+  weekdays   Int[]    @default([])
+  monthDays  Int[]    @default([]) @map("month_days")
+  interval   Int      @default(1)
+
+  startsOn              DateTime? @map("starts_on") @db.Timestamptz(6)
+  endsOn                DateTime? @map("ends_on") @db.Timestamptz(6)
+  maxOccurrences        Int       @default(0) @map("max_occurrences")
+  nonexistentTimePolicy String    @default("shift") @map("nonexistent_time_policy")
+  ambiguousTimePolicy   String    @default("first") @map("ambiguous_time_policy")
+
+  enabled   Boolean  @default(true)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  tenant  Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  channel Channel  @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  uploads Upload[]
+
+  @@index([tenantId, channelId, enabled])
+  @@map("schedules")
+}
+
+enum UploadState {
+  draft
+  scheduled
+  claimed
+  uploading
+  processing
+  published
+  awaiting_creator
+  retrying
+  failed
+  needs_attention
+  cancelled
+}
+
+/// One post to one account at one time. The busiest table in the system: an
+/// empire holds tens of thousands of rows here at any moment and the worker
+/// polls it continuously.
+model Upload {
+  id         String  @id
+  tenantId   String  @map("tenant_id")
+  channelId  String  @map("channel_id")
+  accountId  String  @map("account_id")
+  clipId     String? @map("clip_id")
+  videoId    String? @map("video_id")
+  scheduleId String? @map("schedule_id")
+
+  platform PlatformKind
+  state    UploadState  @default(scheduled)
+
+  // Always UTC. Local time is a presentation concern, and storing it is how a
+  // system ends up posting at the wrong hour twice a year.
+  runAt         DateTime  @map("run_at") @db.Timestamptz(6)
+  nextAttemptAt DateTime? @map("next_attempt_at") @db.Timestamptz(6)
+  leaseUntil    DateTime? @map("lease_until") @db.Timestamptz(6)
+  leaseOwner    String    @default("") @map("lease_owner")
+
+  title      String @default("")
+  caption    String @default("")
+  visibility String @default("public")
+  metadata   Json?
+
+  // Derived from account + asset + slot, so a post recreated after a crash
+  // produces the same key and can be recognised as one that may already have
+  // landed. Unique per tenant, which is what makes double-publishing a
+  // constraint violation rather than a silent duplicate on someone's feed.
+  idempotencyKey String @map("idempotency_key")
+
+  remotePostId String @default("") @map("remote_post_id")
+  attemptCount Int    @default(0) @map("attempt_count")
+  attempts     Json?
+  lastError    String @default("") @map("last_error")
+
+  publishedAt DateTime? @map("published_at") @db.Timestamptz(6)
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  tenant   Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  channel  Channel          @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  account  SocialAccount    @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  clip     Clip?            @relation(fields: [clipId], references: [id], onDelete: SetNull)
+  video    Video?           @relation(fields: [videoId], references: [id], onDelete: SetNull)
+  schedule Schedule?        @relation(fields: [scheduleId], references: [id], onDelete: SetNull)
+  metrics  MetricSnapshot[]
+
+  @@unique([tenantId, idempotencyKey])
+  // The worker's poll: due posts, in time order, for this tenant.
+  @@index([tenantId, state, runAt])
+  // The calendar's spacing check, which was O(n) in memory before it had an
+  // index to lean on.
+  @@index([tenantId, accountId, runAt])
+  @@index([tenantId, channelId, runAt])
+  @@map("uploads")
+}
+
+// ---------------------------------------------------------------------------
+// Analytics
+// ---------------------------------------------------------------------------
+
+/// One reading of a post's counters at a known age.
+///
+/// Append-only, and never updated in place. A single mutable `views` column
+/// makes matched-age comparison impossible after the fact, and that history
+/// cannot be reconstructed once it is gone — every comparison the analytics
+/// engine makes depends on this table staying immutable.
+model MetricSnapshot {
+  id       String @id
+  tenantId String @map("tenant_id")
+  uploadId String @map("upload_id")
+
+  takenAt  DateTime @map("taken_at") @db.Timestamptz(6)
+  ageHours Float    @map("age_hours")
+
+  views       Int   @default(0)
+  likes       Int   @default(0)
+  comments    Int   @default(0)
+  shares      Int   @default(0)
+  saves       Int   @default(0)
+  follows     Int   @default(0)
+  impressions Int   @default(0)
+  watchTimeS  Float @default(0) @map("watch_time_s")
+  avgWatchPct Float @default(0) @map("avg_watch_pct")
+
+  // Only YouTube reports one. Null rather than an imputed curve, so the
+  // analysis can exclude the post instead of counting a missing measurement
+  // as a bad outcome.
+  retentionCurve Json? @map("retention_curve")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  upload Upload @relation(fields: [uploadId], references: [id], onDelete: Cascade)
+
+  // One reading per checkpoint per post. Makes a double-collection a
+  // constraint violation rather than a silently doubled view count.
+  @@unique([uploadId, ageHours])
+  @@index([tenantId, takenAt])
+  @@index([tenantId, uploadId])
+  @@map("metric_snapshots")
+}
+
+// ---------------------------------------------------------------------------
+// Work queue
+// ---------------------------------------------------------------------------
+
+enum JobKind {
+  discover_sources
+  transcribe
+  detect_clips
+  generate_hooks
+  build_captions
+  render_video
+  publish_upload
+  collect_metrics
+  refresh_token
+  weekly_report
+}
+
+enum JobState {
+  queued
+  leased
+  running
+  succeeded
+  failed
+  dead
+}
+
+/// Durable work queue.
+///
+/// In the database rather than in Redis because these jobs are the record of
+/// what the system owes its customers. A render that vanishes on restart is a
+/// clip that silently never posts, and the difference is invisible until a
+/// creator asks why their Tuesday is empty. Leases rather than locks, so a
+/// worker killed mid-job frees it without two workers ever holding it.
+model Job {
+  id        String   @id
+  tenantId  String   @map("tenant_id")
+  channelId String?  @map("channel_id")
+  kind      JobKind
+  state     JobState @default(queued)
+  priority  Int      @default(100)
+
+  payload Json?
+  result  Json?
+
+  runAfter   DateTime  @default(now()) @map("run_after") @db.Timestamptz(6)
+  leaseUntil DateTime? @map("lease_until") @db.Timestamptz(6)
+  leaseOwner String    @default("") @map("lease_owner")
+
+  attempts    Int    @default(0)
+  maxAttempts Int    @default(8) @map("max_attempts")
+  lastError   String @default("") @map("last_error")
+
+  // Set by the producer so re-enqueueing the same logical work is a no-op
+  // rather than a second render of the same clip.
+  dedupeKey String? @map("dedupe_key")
+
+  startedAt  DateTime? @map("started_at") @db.Timestamptz(6)
+  finishedAt DateTime? @map("finished_at") @db.Timestamptz(6)
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt  DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  tenant  Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  channel Channel? @relation(fields: [channelId], references: [id], onDelete: SetNull)
+
+  @@unique([tenantId, dedupeKey])
+  // The claim query: queued work whose time has come, best first.
+  @@index([state, runAfter, priority])
+  @@index([tenantId, kind, state])
+  @@map("jobs")
+}

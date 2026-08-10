@@ -1,0 +1,13 @@
+{
+  "name": "clipforge-db",
+  "private": true,
+  "description": "Prisma schema and migrations for ClipForge AI.",
+  "scripts": {
+    "migrate:dev": "prisma migrate dev",
+    "migrate:deploy": "prisma migrate deploy",
+    "migrate:status": "prisma migrate status",
+    "format": "prisma format",
+    "validate": "prisma validate"
+  },
+  "devDependencies": { "prisma": "^6.1.0" }
+}
