@@ -21,7 +21,7 @@ Two rules hold throughout:
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, time
 from typing import Any
 
 from ..factory.channel import Budget, Channel, ChannelHealth, ChannelState
@@ -29,6 +29,12 @@ from ..factory.niches import Niche
 from ..factory.sources import RightsBasis, Rights, SourceKind
 from ..factory.sources import Source as FactorySource
 from ..publish.oauth import TokenSet
+from ..publish.schedule import (
+    AmbiguousTime,
+    Frequency,
+    NonexistentTime,
+    Recurrence,
+)
 from ..publish.types import (
     Account,
     Attempt,
@@ -42,6 +48,7 @@ from ..publish.types import (
 )
 from .records import (
     ChannelRecord,
+    ScheduleRecord,
     SocialAccountRecord,
     SourceRecord,
     UploadRecord,
@@ -58,6 +65,8 @@ __all__ = [
     "to_source",
     "to_channel_record",
     "to_channel",
+    "to_schedule_record",
+    "to_recurrence",
 ]
 
 #: Keys `metadata` reserves for things the domain object carries but the table
@@ -471,3 +480,64 @@ def to_channel(
         used_fingerprints=set(used_fingerprints or ()),
         created_at=record.created_at,
     )
+
+
+# ---------------------------------------------------------------------------
+# Recurrence <-> ScheduleRecord
+# ---------------------------------------------------------------------------
+
+
+def to_schedule_record(
+    rule: Recurrence, *, schedule_id: str, tenant_id: str, channel_id: str
+) -> ScheduleRecord:
+    """A recurrence as a row.
+
+    Local times plus an IANA zone, never a UTC cron. "Every weekday at 17:00"
+    is a claim about wall-clock time; stored as UTC it silently shifts the
+    whole schedule by an hour at each DST transition, in opposite directions
+    for northern and southern zones.
+
+    `starts_on` and `ends_on` are calendar dates, stored at midnight UTC. They
+    bound the series rather than name a moment, so the time of day is not
+    meaningful and is not read back.
+    """
+
+    return ScheduleRecord(
+        id=schedule_id,
+        tenant_id=tenant_id,
+        channel_id=channel_id,
+        frequency=rule.frequency.value,
+        timezone=rule.timezone,
+        times_local=[t.strftime("%H:%M") for t in rule.times],
+        weekdays=list(rule.weekdays),
+        month_days=list(rule.month_days),
+        interval=rule.interval,
+        starts_on=_midnight(rule.starts_on),
+        ends_on=_midnight(rule.ends_on),
+        max_occurrences=rule.max_occurrences,
+        nonexistent_time_policy=rule.nonexistent.value,
+        ambiguous_time_policy=rule.ambiguous.value,
+    )
+
+
+def to_recurrence(record: ScheduleRecord) -> Recurrence:
+    return Recurrence(
+        frequency=Frequency(record.frequency),
+        times=tuple(
+            time(int(value[:2]), int(value[3:5])) for value in record.times_local
+        ),
+        timezone=record.timezone,
+        weekdays=tuple(record.weekdays),
+        month_days=tuple(record.month_days),
+        interval=record.interval,
+        starts_on=record.starts_on.date() if record.starts_on else None,
+        ends_on=record.ends_on.date() if record.ends_on else None,
+        max_occurrences=record.max_occurrences,
+        nonexistent=NonexistentTime(record.nonexistent_time_policy),
+        ambiguous=AmbiguousTime(record.ambiguous_time_policy),
+        series_id=record.id,
+    )
+
+
+def _midnight(day: date | None) -> datetime | None:
+    return datetime(day.year, day.month, day.day, tzinfo=UTC) if day else None

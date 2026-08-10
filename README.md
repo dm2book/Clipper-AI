@@ -1206,6 +1206,7 @@ engine, backed by Postgres, driven identically.
 | `RegistrySourceFinder` | `DurableSourceRegistry` | `sources` |
 | `ChannelFactory.channels` | `DurableChannelBook` | `channels` |
 | `AnalyticsStore` | `DurableAnalyticsStore` | `metric_snapshots` |
+| `PublishingSystem.series` | `DurableSeriesBook` | `schedules` |
 | `empire.Directory` | `DurableDirectory` | `tenants`, `projects`, `users` |
 
 ```python

@@ -43,6 +43,7 @@ from ..factory.sources import RegistrySourceFinder
 from ..factory.sources import Source as FactorySource
 from ..publish.calendar import ContentCalendar
 from ..publish.oauth import TokenSet
+from ..publish.schedule import Recurrence
 from ..publish.types import Account, Platform, ScheduledPost, ensure_utc, utcnow
 from .errors import NotFound
 from .mappers import (
@@ -51,6 +52,8 @@ from .mappers import (
     to_account_record,
     to_channel,
     to_channel_record,
+    to_recurrence,
+    to_schedule_record,
     to_scheduled_post,
     to_source,
     to_source_record,
@@ -73,6 +76,7 @@ __all__ = [
     "DurableChannelBook",
     "DurableAnalyticsStore",
     "DurableDirectory",
+    "DurableSeriesBook",
     "DEFAULT_HORIZON_DAYS",
 ]
 
@@ -1029,3 +1033,68 @@ class DurableDirectory(Directory, _TenantBound):
                 "users": uow.users.count(),
                 "channels": uow.channels.count(),
             }
+
+
+# ---------------------------------------------------------------------------
+# Recurring schedules
+# ---------------------------------------------------------------------------
+
+
+class DurableSeriesBook(_TenantBound, MutableMapping[str, "Recurrence"]):
+    """`dict[str, Recurrence]` backed by the `schedules` table.
+
+    The recurrence rules are what "post every weekday at 17:00, for the next
+    six months" actually *is*. Lose them and the posts already placed still go
+    out, but nothing extends the series when the horizon runs down — a channel
+    that quietly stops after ninety days, with no error anywhere to explain it.
+
+    Rules are stored as local times plus an IANA zone, never as a UTC cron.
+    "17:00 every weekday" is a claim about wall-clock time; a UTC cron shifts
+    the whole schedule by an hour at each DST transition.
+    """
+
+    def __init__(self, database: Any, tenant_id: str, *, channel_id: str) -> None:
+        super().__init__(database, tenant_id)
+        self.channel_id = channel_id
+
+    def __getitem__(self, series_id: str) -> Recurrence:
+        with self._uow() as uow:
+            record = uow.schedules.get(series_id)
+        if record is None:
+            raise KeyError(series_id)
+        return to_recurrence(record)
+
+    def __setitem__(self, series_id: str, rule: Recurrence) -> None:
+        with self._uow() as uow:
+            record = to_schedule_record(
+                rule,
+                schedule_id=series_id,
+                tenant_id=self.tenant_id,
+                channel_id=self.channel_id,
+            )
+            existing = uow.schedules.get(series_id)
+            if existing is not None:
+                record.created_at = existing.created_at
+                record.enabled = existing.enabled
+            uow.schedules.save(record)
+
+    def __delitem__(self, series_id: str) -> None:
+        with self._uow() as uow:
+            if not uow.schedules.delete(series_id):
+                raise KeyError(series_id)
+
+    def __iter__(self) -> Iterator[str]:
+        with self._uow() as uow:
+            return iter([r.id for r in uow.schedules.all()])
+
+    def __len__(self) -> int:
+        with self._uow() as uow:
+            return uow.schedules.count()
+
+    def values(self):  # type: ignore[override]
+        with self._uow() as uow:
+            return [to_recurrence(r) for r in uow.schedules.all()]
+
+    def items(self):  # type: ignore[override]
+        with self._uow() as uow:
+            return [(r.id, to_recurrence(r)) for r in uow.schedules.all()]

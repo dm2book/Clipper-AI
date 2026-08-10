@@ -126,6 +126,7 @@ class PublishingSystem:
         timezone: str = "UTC",
         accounts: MutableMapping[str, Account] | None = None,
         calendar: ContentCalendar | None = None,
+        series: MutableMapping[str, Recurrence] | None = None,
     ) -> None:
         """Everything durable is injected; the defaults are the volatile ones.
 
@@ -148,7 +149,13 @@ class PublishingSystem:
         self.calendar = calendar if calendar is not None else ContentCalendar(
             tz=timezone
         )
-        self.series: dict[str, Recurrence] = {}
+        # The recurrence rules. Lose these and the posts already placed still
+        # go out, but nothing extends the series when the horizon runs down —
+        # a channel that quietly stops after ninety days with no error to
+        # explain it.
+        self.series: MutableMapping[str, Recurrence] = (
+            {} if series is None else series
+        )
 
     # -- accounts --------------------------------------------------------------
 

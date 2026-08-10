@@ -19,10 +19,11 @@ from __future__ import annotations
 
 import os
 import unittest
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
 
 from clipforge.publish.engine import PublishConfig, PublishingSystem
 from clipforge.publish.oauth import TokenSet
+from clipforge.publish.schedule import Frequency, Recurrence
 from clipforge.publish.types import (
     Account,
     MediaAsset,
@@ -38,6 +39,7 @@ from clipforge.store import (
 )
 from clipforge.store.durable import (
     DurableAccountBook,
+    DurableSeriesBook,
     DurableTokenStore,
     PersistentCalendar,
 )
@@ -120,6 +122,7 @@ class DurablePublishingTest(unittest.TestCase):
                                           unseal=_unseal),
             accounts=DurableAccountBook(self.db, TENANT, channel_id=CHANNEL),
             calendar=calendar,
+            series=DurableSeriesBook(self.db, TENANT, channel_id=CHANNEL),
         )
 
     def _connect(self, system: PublishingSystem) -> None:
@@ -280,6 +283,59 @@ class DurablePublishingTest(unittest.TestCase):
         self.assertEqual(len(second.calendar), 1)
         self.assertEqual(second.calendar.get(post.post_id).run_at,
                          NOW + timedelta(hours=30))
+
+    # -- recurring schedules -----------------------------------------------
+
+    def test_a_recurrence_rule_survives_so_the_series_can_be_extended(self) -> None:
+        """The posts already placed would go out either way. What is lost with
+        the rule is the ability to extend the series when the horizon runs
+        down — a channel that quietly stops after ninety days, with nothing
+        anywhere to explain why."""
+
+        first = self._system()
+        self._connect(first)
+        rule = Recurrence(
+            frequency=Frequency.WEEKLY,
+            times=(time(17, 0), time(20, 30)),
+            timezone="Europe/Berlin",
+            weekdays=(0, 2, 4),
+            interval=2,
+            starts_on=NOW.date(),
+            ends_on=(NOW + timedelta(days=180)).date(),
+            max_occurrences=40,
+            series_id="weekly-business",
+        )
+        placed, _ = first.schedule_series("acc_tt", _spec(), rule,
+                                          start=NOW, horizon_days=30)
+        self.assertGreater(len(placed), 0)
+
+        restored = self._system(load=True).series["weekly-business"]
+        self.assertEqual(restored.frequency, Frequency.WEEKLY)
+        self.assertEqual(restored.times, (time(17, 0), time(20, 30)))
+        self.assertEqual(restored.timezone, "Europe/Berlin")
+        self.assertEqual(restored.weekdays, (0, 2, 4))
+        self.assertEqual(restored.interval, 2)
+        self.assertEqual(restored.starts_on, NOW.date())
+        self.assertEqual(restored.ends_on, (NOW + timedelta(days=180)).date())
+        self.assertEqual(restored.max_occurrences, 40)
+
+    def test_the_rule_is_stored_as_local_time_not_as_a_utc_cron(self) -> None:
+        """17:00 in Berlin is a claim about wall-clock time. Stored as UTC it
+        would shift by an hour at each DST transition, which is how a schedule
+        silently moves twice a year."""
+
+        system = self._system()
+        self._connect(system)
+        system.schedule_series(
+            "acc_tt", _spec(),
+            Recurrence(frequency=Frequency.DAILY, times=(time(17, 0),),
+                       timezone="Europe/Berlin", series_id="daily-berlin"),
+            start=NOW, horizon_days=7,
+        )
+        with self.db.unit_of_work(TENANT) as uow:
+            record = uow.schedules.require("daily-berlin")
+        self.assertEqual(record.times_local, ["17:00"])
+        self.assertEqual(record.timezone, "Europe/Berlin")
 
     # -- credentials -------------------------------------------------------
 
