@@ -24,6 +24,7 @@ later at 6am when the job fires into a queue nobody is watching.
 from __future__ import annotations
 
 import uuid
+from collections.abc import MutableMapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Iterable, Sequence
@@ -123,11 +124,30 @@ class PublishingSystem:
         config: PublishConfig | None = None,
         token_store: TokenStore | None = None,
         timezone: str = "UTC",
+        accounts: MutableMapping[str, Account] | None = None,
+        calendar: ContentCalendar | None = None,
     ) -> None:
+        """Everything durable is injected; the defaults are the volatile ones.
+
+        Passing nothing gives an entirely in-memory system, which is what the
+        tests and the demos use and what loses everything on restart. Passing
+        `clipforge.store.durable.DurableTokenStore`, `DurableAccountBook` and
+        `PersistentCalendar` gives the same object backed by Postgres, with no
+        other change to how it is driven.
+
+        The defaults are deliberately the volatile ones rather than a database
+        the constructor conjures up: a persistence layer that appears by magic
+        is one nobody notices is missing until the DSN is wrong in production.
+        """
+
         self.config = config or PublishConfig()
         self.tokens: TokenStore = token_store or InMemoryTokenStore()
-        self.accounts: dict[str, Account] = {}
-        self.calendar = ContentCalendar(tz=timezone)
+        self.accounts: MutableMapping[str, Account] = (
+            {} if accounts is None else accounts
+        )
+        self.calendar = calendar if calendar is not None else ContentCalendar(
+            tz=timezone
+        )
         self.series: dict[str, Recurrence] = {}
 
     # -- accounts --------------------------------------------------------------
@@ -326,14 +346,18 @@ class PublishingSystem:
         if post is None or post.is_terminal:
             return False
         post.state = PostState.CANCELLED
+        self.calendar.persist(post)
         return True
 
     def cancel_series(self, series_id: str) -> int:
         cancelled = 0
+        touched: list[ScheduledPost] = []
         for post in self.calendar.posts:
             if post.series_id == series_id and not post.is_terminal:
                 post.state = PostState.CANCELLED
+                touched.append(post)
                 cancelled += 1
+        self.calendar.persist(*touched)
         return cancelled
 
     def reschedule(self, post_id: str, run_at: datetime) -> ScheduledPost:
@@ -346,6 +370,7 @@ class PublishingSystem:
         post = self.calendar.move(post_id, run_at)
         post.next_attempt_at = None
         post.state = PostState.SCHEDULED
+        self.calendar.persist(post)
         return post
 
     # -- the worker loop ---------------------------------------------------------
@@ -369,10 +394,15 @@ class PublishingSystem:
             claimed.append(post)
             if len(claimed) >= limit:
                 break
+        # The lease is only a lease once it is durable. A worker that claimed
+        # in memory and then died would leave the post looking unclaimed, and a
+        # second worker would publish it again.
+        self.calendar.persist(*claimed)
         return claimed
 
     def release(self, post: ScheduledPost) -> None:
         post.lease_until = None
+        self.calendar.persist(post)
 
     def run_post(
         self,
@@ -381,7 +411,33 @@ class PublishingSystem:
         now: datetime | None = None,
         max_requests: int = 400,
     ) -> PublishResult:
-        """Drive one post through its platform's state machine."""
+        """Drive one post through its platform's state machine, durably.
+
+        The write-through is here, in a `finally` around the whole run, rather
+        than at each of the twenty-odd places `_run_post` and its helpers
+        mutate the post. Those are spread across four methods and a dozen early
+        returns, and a persistence call added at nineteen of them is a bug
+        nobody finds until a crash lands the twentieth — a post recorded as
+        `uploading` for ever, or worse, one published and recorded as
+        `scheduled`, which is how the same video goes out twice.
+
+        The `finally` also covers the exception path. A transport that raises
+        something unexpected still leaves the attempt on disk, which is the
+        only record of what the system believed it was doing.
+        """
+
+        try:
+            return self._run_post(post, transport, now, max_requests)
+        finally:
+            self.calendar.persist(post)
+
+    def _run_post(
+        self,
+        post: ScheduledPost,
+        transport: Transport,
+        now: datetime | None = None,
+        max_requests: int = 400,
+    ) -> PublishResult:
         now = ensure_utc(now or utcnow())
         account = self._account(post.account_id)
         tokens = self.tokens.get(post.account_id)

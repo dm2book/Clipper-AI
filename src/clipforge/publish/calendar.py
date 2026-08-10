@@ -148,6 +148,18 @@ class ContentCalendar:
     def get(self, post_id: str) -> ScheduledPost | None:
         return self._posts.get(post_id)
 
+    def persist(self, *posts: ScheduledPost) -> None:
+        """Write posts' current state through to durable storage.
+
+        A no-op here — this calendar is memory and nothing else. It exists as a
+        hook because the engine mutates posts in place all through the worker
+        loop, and `clipforge.store.durable.PersistentCalendar` needs to know
+        when. Calling it costs nothing on a plain calendar, which is what lets
+        the engine call it unconditionally instead of branching on whether
+        persistence happens to be configured — and a branch nobody takes in
+        tests is a branch that is wrong in production.
+        """
+
     @property
     def posts(self) -> tuple[ScheduledPost, ...]:
         if self._sorted is None:
@@ -203,10 +215,31 @@ class ContentCalendar:
         )
 
     def due(self, now: datetime) -> tuple[ScheduledPost, ...]:
-        """Posts whose moment has arrived and which are ready to run."""
+        """Posts whose moment has arrived and which are ready to run.
+
+        `CLAIMED` counts as ready once its lease has lapsed. That is the whole
+        reason a lease is a lease: a worker killed between claiming a post and
+        sending anything cannot release it, so something has to notice the
+        lease expired and offer the post again.
+
+        This was invisible while leases lived in memory — a crash took the
+        `CLAIMED` state with it and the post came back looking `SCHEDULED`.
+        Once the calendar is durable, the state survives the crash, and without
+        this branch the post stays `CLAIMED` for ever and silently never posts.
+
+        `UPLOADING` and `PROCESSING` are deliberately *not* reclaimed here. In
+        those states the platform has already been told to create something, so
+        the post has to be reconciled against it rather than run again —
+        see `retry.Disposition.RECONCILE`. Re-claiming them would be how the
+        same video reaches the same audience twice.
+        """
         now = ensure_utc(now)
         ready: list[ScheduledPost] = []
         for post in self.posts:
+            if post.state is PostState.CLAIMED:
+                if post.lease_until is not None and post.lease_until <= now:
+                    ready.append(post)
+                continue
             if post.state not in (PostState.SCHEDULED, PostState.RETRYING):
                 continue
             when = post.next_attempt_at or post.run_at
