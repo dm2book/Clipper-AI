@@ -378,6 +378,21 @@ class _PgMetrics(_PgRepository):
         return rows[0] if rows else None
 
 
+class _PgRevenue(_PgRepository):
+    def for_period(self, period: str) -> tuple[Any, ...]:
+        return self._where("period = %s", [period], order="project_id")
+
+    def for_project(self, project_id: str, period: str) -> Any:
+        return self._one_where(
+            "project_id = %s AND period = %s", [project_id, period]
+        )
+
+
+class _PgPools(_PgRepository):
+    def on_platform(self, platform: str) -> tuple[Any, ...]:
+        return self._where("platform = %s", [platform], order="id")
+
+
 class _PgJobs(_PgRepository):
     def enqueue(self, record: Any) -> Any:
         if not record.dedupe_key:
@@ -572,6 +587,8 @@ class PostgresUnitOfWork:
         self.uploads = _PgUploads(self, TABLES["uploads"])
         self.metrics = _PgMetrics(self, TABLES["metric_snapshots"])
         self.jobs = _PgJobs(self, TABLES["jobs"])
+        self.revenue = _PgRevenue(self, TABLES["revenue_entries"])
+        self.pools = _PgPools(self, TABLES["quota_pools"])
 
     # -- plumbing ----------------------------------------------------------
 

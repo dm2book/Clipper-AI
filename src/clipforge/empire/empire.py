@@ -28,6 +28,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from collections.abc import MutableMapping, MutableSequence
 from typing import Any, Sequence
 
 from ..analytics import AnalyticsEngine
@@ -74,13 +75,22 @@ class Empire:
         analytics: AnalyticsEngine,
         directory: Directory | None = None,
         config: EmpireConfig | None = None,
+        pools: MutableSequence[QuotaPool] | None = None,
+        revenue: MutableMapping[str, RevenueStreams] | None = None,
     ) -> None:
         self.factory = factory
         self.analytics = analytics
         self.directory = directory or Directory()
         self.config = config or EmpireConfig()
-        self.pools: list[QuotaPool] = []
-        self.revenue: dict[str, RevenueStreams] = {}
+        # Injected like every other store: pass nothing for the in-memory
+        # versions the demos use, or `DurablePoolList` and `DurableRevenueBook`
+        # to keep them. Revenue in particular is typed in by a person, and a
+        # dashboard whose revenue silently returns to zero after a deploy reads
+        # as a bad month rather than as missing data.
+        self.pools: MutableSequence[QuotaPool] = [] if pools is None else pools
+        self.revenue: MutableMapping[str, RevenueStreams] = (
+            {} if revenue is None else revenue
+        )
 
     # -- setup -------------------------------------------------------------------
 

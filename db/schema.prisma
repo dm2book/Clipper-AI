@@ -82,6 +82,8 @@ model Tenant {
   metrics   MetricSnapshot[]
   jobs      Job[]
   sourceUse ChannelSourceUse[]
+  revenue   RevenueEntry[]
+  pools     QuotaPool[]
 
   @@map("tenants")
 }
@@ -132,8 +134,9 @@ model Project {
   createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt   DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
 
-  tenant   Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  tenant   Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   channels Channel[]
+  revenue  RevenueEntry[]
 
   @@index([tenantId, archived])
   @@map("projects")
@@ -649,4 +652,73 @@ model Job {
   @@index([state, runAfter, priority])
   @@index([tenantId, kind, state])
   @@map("jobs")
+}
+
+// ---------------------------------------------------------------------------
+// Empire: revenue and API allowance
+// ---------------------------------------------------------------------------
+
+/// Non-ad revenue for a brand, in cents per month.
+///
+/// Supplied by the operator rather than measured: sponsorship and affiliate
+/// income arrives through channels this system has no visibility into, and
+/// inventing a number would be worse than showing zero. Which is exactly why
+/// it has to be persisted — it is typed in by a person, and a dashboard whose
+/// revenue silently drops to zero after a deploy is worse than one that never
+/// showed it.
+model RevenueEntry {
+  id        String @id
+  tenantId  String @map("tenant_id")
+  projectId String @map("project_id")
+
+  /// The month this covers, as "2026-04". Not a date: the figures are monthly
+  /// totals, and a date invites a reader to believe there is day-level detail.
+  period String
+
+  sponsorshipCents Int @default(0) @map("sponsorship_cents")
+  affiliateCents   Int @default(0) @map("affiliate_cents")
+  ownProductCents  Int @default(0) @map("own_product_cents")
+  servicesCents    Int @default(0) @map("services_cents")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  tenant  Tenant  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  /// One figure per brand per month. A second entry for the same month is a
+  /// correction, not an addition, and an upsert says so.
+  @@unique([tenantId, projectId, period])
+  @@index([tenantId, period])
+  @@map("revenue_entries")
+}
+
+enum PoolOwnershipKind {
+  shared_app
+  per_tenant
+}
+
+/// One source of API allowance for one platform.
+///
+/// YouTube's quota is scoped to the API *project*, not the account, so the
+/// whole installation shares one ceiling however many channels it runs. That
+/// ceiling is configuration an operator applied for and was granted, and
+/// losing it on restart silently reverts every channel to the default
+/// allowance.
+model QuotaPool {
+  id        String            @id
+  tenantId  String            @map("tenant_id")
+  platform  PlatformKind
+  ownership PoolOwnershipKind
+
+  /// Daily unit budget. Zero means the platform's standard allowance.
+  dailyUnits Int @default(0) @map("daily_units")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, platform])
+  @@map("quota_pools")
 }

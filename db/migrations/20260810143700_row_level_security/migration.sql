@@ -143,7 +143,22 @@ GRANT SELECT, INSERT, UPDATE, DELETE
   ON ALL TABLES IN SCHEMA public TO clipforge_app;
 
 -- The migration ledger is Prisma's, and the application has no business in it.
-REVOKE ALL ON TABLE public._prisma_migrations FROM clipforge_app;
+--
+-- Guarded because this migration also runs against the throwaway "shadow"
+-- database `migrate dev` builds to diff the schema, and Prisma does not create
+-- its ledger there. An unguarded REVOKE fails the whole shadow run, which
+-- makes every future `migrate dev` impossible — a migration has to apply to an
+-- empty database as well as to a live one.
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT FROM pg_tables
+    WHERE schemaname = 'public' AND tablename = '_prisma_migrations'
+  ) THEN
+    REVOKE ALL ON TABLE public._prisma_migrations FROM clipforge_app;
+  END IF;
+END
+$$;
 
 -- metric_snapshots is append-only. The analytics engine compares posts at
 -- matched ages; a snapshot rewritten after the fact makes every such

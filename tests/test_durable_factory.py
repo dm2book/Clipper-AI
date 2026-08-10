@@ -19,6 +19,8 @@ from datetime import UTC, datetime, timedelta
 
 from clipforge.analytics.attribution import PostRecord
 from clipforge.analytics.metrics import PostMetrics, RetentionCurve, Snapshot
+from clipforge.empire.capacity import PoolOwnership, QuotaPool
+from clipforge.empire.economics import RevenueStreams
 from clipforge.empire.tenancy import (
     AccessDenied,
     Brand,
@@ -46,6 +48,8 @@ from clipforge.store import (
 from clipforge.store.durable import (
     DurableAnalyticsStore,
     DurableDirectory,
+    DurablePoolList,
+    DurableRevenueBook,
     DurableChannelBook,
     DurableSourceRegistry,
 )
@@ -562,3 +566,88 @@ class DurableDirectoryTest(_Base):
         with self.assertRaises(KeyError):
             directory.brands("ten_other")
         self.assertEqual([t.tenant_id for t in directory.tenants], [TENANT])
+
+
+class DurableEmpireStateTest(_Base):
+    """Revenue and API allowance — the two pieces of Empire state that are
+    configuration rather than derived, and therefore the two that a restart
+    would silently erase."""
+
+    def _revenue(self, period: str = "2026-03") -> DurableRevenueBook:
+        return DurableRevenueBook(self.db, TENANT, period=period)
+
+    def _pools(self) -> DurablePoolList:
+        return DurablePoolList(self.db, TENANT)
+
+    def test_operator_entered_revenue_survives(self) -> None:
+        """The least dramatic loss and one of the most damaging: nothing
+        breaks, the dashboard just shows less revenue than the business made,
+        and that reads as a bad month rather than as missing data."""
+
+        self._revenue()[PROJECT] = RevenueStreams(
+            sponsorship_cents=450_000, affiliate_cents=82_000,
+            own_product_cents=120_000, services_cents=900_000,
+        )
+        streams = self._revenue()[PROJECT]
+        self.assertEqual(streams.sponsorship_cents, 450_000)
+        self.assertEqual(streams.affiliate_cents, 82_000)
+        self.assertEqual(streams.own_product_cents, 120_000)
+        self.assertEqual(streams.services_cents, 900_000)
+        self.assertEqual(streams.non_ad_total, 1_552_000)
+
+    def test_a_second_entry_for_the_same_month_is_a_correction(self) -> None:
+        """Monthly totals typed in by a person. A second figure for March is
+        someone fixing March, not March happening twice."""
+
+        book = self._revenue()
+        book[PROJECT] = RevenueStreams(sponsorship_cents=100_000)
+        book[PROJECT] = RevenueStreams(sponsorship_cents=250_000)
+        self.assertEqual(len(self._revenue()), 1)
+        self.assertEqual(self._revenue()[PROJECT].sponsorship_cents, 250_000)
+
+    def test_months_are_kept_apart(self) -> None:
+        self._revenue("2026-03")[PROJECT] = RevenueStreams(sponsorship_cents=100)
+        self._revenue("2026-04")[PROJECT] = RevenueStreams(sponsorship_cents=200)
+        self.assertEqual(self._revenue("2026-03")[PROJECT].sponsorship_cents, 100)
+        self.assertEqual(self._revenue("2026-04")[PROJECT].sponsorship_cents, 200)
+
+    def test_missing_revenue_reads_as_zero_rather_than_raising(self) -> None:
+        """`revenue.get(brand, RevenueStreams())` is how the economics module
+        asks. A brand with nothing recorded has no revenue, not an error."""
+
+        self.assertEqual(
+            self._revenue().get("proj_unknown", RevenueStreams()).non_ad_total, 0
+        )
+
+    def test_quota_pools_survive(self) -> None:
+        """A granted YouTube quota is configuration an operator applied for.
+        Losing it silently reverts every channel to the default allowance,
+        which shows up as unexplained under-posting."""
+
+        pools = self._pools()
+        pools.append(QuotaPool(pool_id="pool_yt", platform=Platform.YOUTUBE,
+                               ownership=PoolOwnership.SHARED_APP,
+                               daily_units=1_000_000))
+        pools.append(QuotaPool(pool_id="pool_tt", platform=Platform.TIKTOK,
+                               ownership=PoolOwnership.PER_TENANT))
+
+        reopened = self._pools()
+        self.assertEqual(len(reopened), 2)
+        granted = next(p for p in reopened if p.pool_id == "pool_yt")
+        self.assertEqual(granted.platform, Platform.YOUTUBE)
+        self.assertEqual(granted.ownership, PoolOwnership.SHARED_APP)
+        self.assertEqual(granted.daily_units, 1_000_000)
+        # The derived ceiling is computed from the stored allowance, not from
+        # the platform default.
+        self.assertGreater(granted.uploads_per_day, 0)
+
+    def test_a_pool_appended_twice_is_updated_not_duplicated(self) -> None:
+        pools = self._pools()
+        pools.append(QuotaPool(pool_id="pool_yt", platform=Platform.YOUTUBE,
+                               ownership=PoolOwnership.SHARED_APP,
+                               daily_units=10_000))
+        pools.append(QuotaPool(pool_id="pool_yt", platform=Platform.YOUTUBE,
+                               ownership=PoolOwnership.SHARED_APP,
+                               daily_units=1_000_000))
+        self.assertEqual(len(self._pools()), 1)
+        self.assertEqual(self._pools()[0].daily_units, 1_000_000)

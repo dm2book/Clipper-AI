@@ -20,6 +20,8 @@ from .records import (
     JobRecord,
     MetricSnapshotRecord,
     ProjectRecord,
+    QuotaPoolRecord,
+    RevenueEntryRecord,
     ScheduleRecord,
     SocialAccountRecord,
     SourceRecord,
@@ -105,6 +107,8 @@ TABLES: dict[str, Table] = {
         absent=frozenset({"updated_at"}),
     ),
     "jobs": Table("jobs", JobRecord, json_columns=frozenset({"payload", "result"})),
+    "revenue_entries": Table("revenue_entries", RevenueEntryRecord),
+    "quota_pools": Table("quota_pools", QuotaPoolRecord),
 }
 
 

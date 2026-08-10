@@ -42,6 +42,8 @@ __all__ = [
     "UploadRecord",
     "MetricSnapshotRecord",
     "JobRecord",
+    "RevenueEntryRecord",
+    "QuotaPoolRecord",
 ]
 
 
@@ -342,3 +344,46 @@ class JobRecord(Record):
     dedupe_key: str | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None
+
+
+# ---------------------------------------------------------------------------
+# Empire: revenue and API allowance
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class RevenueEntryRecord(Record):
+    """Non-ad revenue for a brand, in cents, for one month.
+
+    Supplied by an operator rather than measured — sponsorship and affiliate
+    income arrives through channels this system cannot see, and inventing a
+    number would be worse than showing zero. Which is precisely why it must
+    survive a restart: it was typed in by a person, and a dashboard whose
+    revenue silently returns to zero after a deploy is worse than one that
+    never claimed to know.
+    """
+
+    project_id: str = ""
+    #: "2026-04". Not a date — these are monthly totals, and a date would
+    #: invite a reader to believe there is day-level detail behind them.
+    period: str = ""
+    sponsorship_cents: int = 0
+    affiliate_cents: int = 0
+    own_product_cents: int = 0
+    services_cents: int = 0
+
+
+@dataclass
+class QuotaPoolRecord(Record):
+    """One source of API allowance for one platform.
+
+    YouTube's quota is scoped to the API *project*, not the account, so the
+    whole installation shares one ceiling however many channels it runs. That
+    ceiling is configuration an operator applied for and was granted; losing it
+    on restart silently reverts every channel to the default allowance.
+    """
+
+    platform: str = "youtube"
+    ownership: str = "shared_app"
+    #: Zero means the platform's standard allowance.
+    daily_units: int = 0

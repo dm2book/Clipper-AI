@@ -164,3 +164,39 @@ Without `CLIPFORGE_TEST_DSN` the Postgres cases skip and say so. The in-memory
 contract tests still run — but they are only evidence about the Postgres path
 because the same assertions pass against it, so a green suite full of skips is
 not a green suite.
+
+## The cost of FORCE, and where you will meet it
+
+`ADD CONSTRAINT ... FOREIGN KEY` makes Postgres run a validation query against
+the *referenced* table. If that table is FORCEd, the read goes through
+`tenant_isolation`, which calls `app.current_tenant()`, which raises — because a
+migration has no tenant scope. The migration then dies, on an empty table it was
+about to create.
+
+Setting a sentinel scope instead would be worse: the validation would run
+against one tenant's rows and quietly conclude the constraint holds. Lift FORCE
+for the length of the statement and put it back:
+
+```sql
+ALTER TABLE public.tenants NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE public.projects NO FORCE ROW LEVEL SECURITY;
+
+-- ... Prisma's AddForeignKey statements ...
+
+ALTER TABLE public.tenants FORCE ROW LEVEL SECURITY;
+ALTER TABLE public.projects FORCE ROW LEVEL SECURITY;
+```
+
+`20260810205229_empire_revenue_and_quota_pools` is the worked example. The
+failure is loud rather than silent, and
+`test_every_tenant_scoped_table_has_a_policy` catches a migration that lifts
+FORCE and forgets to restore it — so this is an annoyance rather than a hazard.
+It is still the main ongoing cost of the FORCE decision, and worth knowing
+before the first FK migration rather than during it.
+
+One related trap: a migration must apply to an **empty** database as well as to
+a live one, because `migrate dev` replays the whole history into a throwaway
+shadow database. Migration 002 originally revoked privileges on
+`_prisma_migrations`, which the shadow database does not have; that one
+unguarded statement made every subsequent `migrate dev` impossible. Anything
+touching a table Prisma itself manages needs an existence check.

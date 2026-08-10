@@ -15,15 +15,17 @@ on restart, which is the one thing that must not happen.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Protocol, TypeVar, runtime_checkable
+from typing import Any, Protocol, TypeVar, runtime_checkable
 
-from .records import (
+from .records import (  # noqa: F401 - referenced in Protocol annotations
     ChannelRecord,
     ChannelSourceUseRecord,
     ClipRecord,
     JobRecord,
     MetricSnapshotRecord,
     ProjectRecord,
+    QuotaPoolRecord,
+    RevenueEntryRecord,
     ScheduleRecord,
     SocialAccountRecord,
     SourceRecord,
@@ -47,6 +49,8 @@ __all__ = [
     "UploadRepository",
     "MetricRepository",
     "JobRepository",
+    "RevenueRepository",
+    "QuotaPoolRepository",
     "UnitOfWork",
     "Database",
 ]
@@ -247,6 +251,18 @@ class JobRepository(Protocol):
     def in_state(self, *states: str) -> tuple[JobRecord, ...]: ...
 
 
+class RevenueRepository(Repository["RevenueEntryRecord"], Protocol):
+    def for_period(self, period: str) -> tuple[Any, ...]:
+        """Every brand's entry for one month."""
+
+    def for_project(self, project_id: str, period: str) -> Any:
+        """One brand's entry for one month, or None."""
+
+
+class QuotaPoolRepository(Repository["QuotaPoolRecord"], Protocol):
+    def on_platform(self, platform: str) -> tuple[Any, ...]: ...
+
+
 class UnitOfWork(Protocol):
     """One transaction, one tenant.
 
@@ -274,6 +290,8 @@ class UnitOfWork(Protocol):
     uploads: UploadRepository
     metrics: MetricRepository
     jobs: JobRepository
+    revenue: RevenueRepository
+    pools: QuotaPoolRepository
 
     def __enter__(self) -> UnitOfWork: ...
     def __exit__(self, *exc: object) -> bool: ...

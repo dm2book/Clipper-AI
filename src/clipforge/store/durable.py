@@ -31,12 +31,14 @@ publish — they are simply not in this process's view until the window moves.
 
 from __future__ import annotations
 
-from collections.abc import Iterator, MutableMapping
+from collections.abc import Iterator, MutableMapping, MutableSequence
 from datetime import datetime, timedelta
 from typing import Any, Callable
 
 from ..analytics.attribution import AnalyticsStore, PostRecord
 from ..analytics.metrics import PostMetrics, RetentionCurve, Snapshot
+from ..empire.capacity import PoolOwnership, QuotaPool
+from ..empire.economics import RevenueStreams
 from ..empire.tenancy import Brand, Directory, Plan, Role, Tenant, User
 from ..factory.channel import Channel
 from ..factory.sources import RegistrySourceFinder
@@ -63,6 +65,8 @@ from .mappers import (
 from .records import (
     MetricSnapshotRecord,
     ProjectRecord,
+    QuotaPoolRecord,
+    RevenueEntryRecord,
     SocialAccountRecord,
     TenantRecord,
     UserRecord,
@@ -77,6 +81,8 @@ __all__ = [
     "DurableAnalyticsStore",
     "DurableDirectory",
     "DurableSeriesBook",
+    "DurableRevenueBook",
+    "DurablePoolList",
     "DEFAULT_HORIZON_DAYS",
 ]
 
@@ -1098,3 +1104,162 @@ class DurableSeriesBook(_TenantBound, MutableMapping[str, "Recurrence"]):
     def items(self):  # type: ignore[override]
         with self._uow() as uow:
             return [(r.id, to_recurrence(r)) for r in uow.schedules.all()]
+
+
+# ---------------------------------------------------------------------------
+# Empire: revenue and API allowance
+# ---------------------------------------------------------------------------
+
+
+class DurableRevenueBook(_TenantBound, MutableMapping[str, "RevenueStreams"]):
+    """`dict[brand_id, RevenueStreams]` backed by `revenue_entries`.
+
+    Keyed by brand, for one month at a time — the period this book is opened
+    on. Figures are monthly totals an operator typed in, so a second entry for
+    the same brand and month is a correction rather than an addition, and the
+    unique index says so.
+
+    This is the store whose loss is least dramatic and most damaging. Nothing
+    breaks when it goes: the dashboard simply shows less revenue than the
+    business made, which reads as a bad month rather than as missing data.
+    """
+
+    def __init__(
+        self, database: Any, tenant_id: str, *, period: str = ""
+    ) -> None:
+        super().__init__(database, tenant_id)
+        self.period = period or utcnow().strftime("%Y-%m")
+
+    def _to_streams(self, record: Any) -> RevenueStreams:
+        return RevenueStreams(
+            sponsorship_cents=record.sponsorship_cents,
+            affiliate_cents=record.affiliate_cents,
+            own_product_cents=record.own_product_cents,
+            services_cents=record.services_cents,
+        )
+
+    def __getitem__(self, brand_id: str) -> RevenueStreams:
+        with self._uow() as uow:
+            record = uow.revenue.for_project(brand_id, self.period)
+        if record is None:
+            raise KeyError(brand_id)
+        return self._to_streams(record)
+
+    def __setitem__(self, brand_id: str, streams: RevenueStreams) -> None:
+        with self._uow() as uow:
+            existing = uow.revenue.for_project(brand_id, self.period)
+            record = RevenueEntryRecord(
+                id=existing.id if existing else f"rev_{brand_id}_{self.period}",
+                tenant_id=self.tenant_id,
+                project_id=brand_id,
+                period=self.period,
+                sponsorship_cents=streams.sponsorship_cents,
+                affiliate_cents=streams.affiliate_cents,
+                own_product_cents=streams.own_product_cents,
+                services_cents=streams.services_cents,
+            )
+            uow.revenue.save(record)
+
+    def __delitem__(self, brand_id: str) -> None:
+        with self._uow() as uow:
+            record = uow.revenue.for_project(brand_id, self.period)
+            if record is None:
+                raise KeyError(brand_id)
+            uow.revenue.delete(record.id)
+
+    def __iter__(self) -> Iterator[str]:
+        with self._uow() as uow:
+            return iter([r.project_id for r in uow.revenue.for_period(self.period)])
+
+    def __len__(self) -> int:
+        with self._uow() as uow:
+            return len(uow.revenue.for_period(self.period))
+
+    def get(self, brand_id: str, default: Any = None) -> Any:
+        """Overridden so the common `revenue.get(b, RevenueStreams())` is one
+        query rather than a lookup, a KeyError and an exception unwind."""
+
+        with self._uow() as uow:
+            record = uow.revenue.for_project(brand_id, self.period)
+        return self._to_streams(record) if record else default
+
+    def items(self):  # type: ignore[override]
+        with self._uow() as uow:
+            return [
+                (r.project_id, self._to_streams(r))
+                for r in uow.revenue.for_period(self.period)
+            ]
+
+    def values(self):  # type: ignore[override]
+        return [streams for _, streams in self.items()]
+
+
+class DurablePoolList(_TenantBound, MutableSequence["QuotaPool"]):
+    """`list[QuotaPool]` backed by `quota_pools`.
+
+    A sequence rather than a mapping because that is what `Empire.pools` is,
+    and the capacity model iterates it. Order is by id, which is stable — the
+    allocation is max-min fair over the whole set, so nothing depends on the
+    order they were added in.
+    """
+
+    def __init__(self, database: Any, tenant_id: str) -> None:
+        super().__init__(database, tenant_id)
+
+    def _to_pool(self, record: Any) -> QuotaPool:
+        return QuotaPool(
+            pool_id=record.id,
+            platform=Platform(record.platform),
+            ownership=PoolOwnership(record.ownership),
+            daily_units=record.daily_units,
+            tenant_id=record.tenant_id,
+        )
+
+    def _records(self) -> list[Any]:
+        with self._uow() as uow:
+            return sorted(uow.pools.all(), key=lambda r: r.id)
+
+    def _save(self, pool: QuotaPool) -> None:
+        with self._uow() as uow:
+            existing = uow.pools.get(pool.pool_id)
+            record = QuotaPoolRecord(
+                id=pool.pool_id,
+                tenant_id=self.tenant_id,
+                platform=pool.platform.value,
+                ownership=pool.ownership.value,
+                daily_units=pool.daily_units,
+            )
+            if existing is not None:
+                record.created_at = existing.created_at
+            uow.pools.save(record)
+
+    def __getitem__(self, index):
+        records = self._records()
+        if isinstance(index, slice):
+            return [self._to_pool(r) for r in records[index]]
+        return self._to_pool(records[index])
+
+    def __setitem__(self, index, pool: QuotaPool) -> None:
+        # Positional replacement would mean deleting whichever pool currently
+        # sorts into that slot, which is not what any caller means. Saving by
+        # id is, and it is what `append` does too.
+        self._save(pool)
+
+    def __delitem__(self, index) -> None:
+        record = self._records()[index]
+        with self._uow() as uow:
+            uow.pools.delete(record.id)
+
+    def __len__(self) -> int:
+        with self._uow() as uow:
+            return uow.pools.count()
+
+    def insert(self, index: int, pool: QuotaPool) -> None:
+        """Position is ignored — the list is ordered by id.
+
+        `MutableSequence` requires this method and `append` is built on it. A
+        pool's position carries no meaning: allocation is max-min fair across
+        the whole set.
+        """
+
+        self._save(pool)

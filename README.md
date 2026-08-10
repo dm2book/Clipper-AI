@@ -1180,7 +1180,8 @@ with db.unit_of_work("ten_acme") as uow:
 ```
 
 Ten entity types persist: users, channels, projects, videos, sources, clips,
-schedules, uploads, metrics and jobs — plus tenants and connected accounts.
+schedules, uploads, metrics and jobs — plus tenants, connected accounts,
+operator-entered revenue and API quota pools.
 
 ### Prisma without the Prisma client
 
@@ -1208,6 +1209,8 @@ engine, backed by Postgres, driven identically.
 | `AnalyticsStore` | `DurableAnalyticsStore` | `metric_snapshots` |
 | `PublishingSystem.series` | `DurableSeriesBook` | `schedules` |
 | `empire.Directory` | `DurableDirectory` | `tenants`, `projects`, `users` |
+| `Empire.revenue` | `DurableRevenueBook` | `revenue_entries` |
+| `Empire.pools` | `DurablePoolList` | `quota_pools` |
 
 ```python
 from clipforge.store import open_database

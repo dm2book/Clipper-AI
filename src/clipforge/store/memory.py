@@ -388,6 +388,26 @@ class _MemoryMetrics(_MemoryRepository):
         return tuple(copy.deepcopy(r) for r in rows)
 
 
+class _MemoryRevenue(_MemoryRepository):
+    def for_period(self, period: str) -> tuple[Any, ...]:
+        rows = [r for r in self._scoped() if r.period == period]
+        rows.sort(key=lambda r: r.project_id)
+        return tuple(copy.deepcopy(r) for r in rows)
+
+    def for_project(self, project_id: str, period: str) -> Any:
+        for row in self._scoped():
+            if row.project_id == project_id and row.period == period:
+                return copy.deepcopy(row)
+        return None
+
+
+class _MemoryPools(_MemoryRepository):
+    def on_platform(self, platform: str) -> tuple[Any, ...]:
+        rows = [r for r in self._scoped() if r.platform == platform]
+        rows.sort(key=lambda r: r.id)
+        return tuple(copy.deepcopy(r) for r in rows)
+
+
 class _MemoryJobs(_MemoryRepository):
     def enqueue(self, record: JobRecord) -> JobRecord:
         if record.dedupe_key:
@@ -540,6 +560,8 @@ class MemoryUnitOfWork:
         self.uploads = _MemoryUploads(self, TABLES["uploads"])
         self.metrics = _MemoryMetrics(self, TABLES["metric_snapshots"])
         self.jobs = _MemoryJobs(self, TABLES["jobs"])
+        self.revenue = _MemoryRevenue(self, TABLES["revenue_entries"])
+        self.pools = _MemoryPools(self, TABLES["quota_pools"])
 
     # -- plumbing ----------------------------------------------------------
 
