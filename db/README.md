@@ -26,6 +26,9 @@ db/
     20260810143555_init/            tables, indexes, foreign keys
     20260810143700_row_level_security/
                                     policies, grants, updated_at triggers
+    20260810205229_empire_revenue_and_quota_pools/
+                                    two tables, and the hand-written half a
+                                    new model always needs
 ```
 
 ## Setting one up
