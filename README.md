@@ -40,6 +40,9 @@ calls but ship with no live transport.
 - **Persistence** (`src/clipforge/store/`, `db/`) — PostgreSQL, Prisma
   migrations, row-level security, repositories. The engines' in-memory stores
   have durable equivalents, so nothing important is lost on restart.
+- **Source acquisition** (`src/clipforge/acquire/`) — YouTube videos and
+  channels, podcast RSS feeds and uploaded files in; resumable downloads,
+  measured media and thumbnails out.
 
 ## Quick start
 
@@ -1311,3 +1314,177 @@ analytics statistics, plan limits, and the permission model (which raises
 rather than returning a bool, so a forgotten branch fails closed). Two
 implementations of the same rule drift apart, and the one nobody reads is the
 one that ships.
+
+## Source acquisition
+
+Where material comes from. Four inputs behind one resolver, one queue and one
+persistence path.
+
+```python
+from clipforge.acquire import AcquisitionEngine, AcquisitionConfig
+
+engine = AcquisitionEngine(db, "ten_acme",
+                           config=AcquisitionConfig(workspace="/var/lib/clipforge/media"))
+engine.submit("https://youtu.be/dQw4w9WgXcQ")        # one video
+engine.submit("https://www.youtube.com/@studionine") # a channel, expanded
+engine.submit("https://feeds.example.com/show.xml")  # a feed, expanded
+engine.submit("/uploads/interview.mp4")              # a file
+engine.run(limit=10)                                 # a worker turn
+```
+
+`submit` resolves and queues; `run` drains. They are separate because
+acquisition is slow and the caller submitting is usually a web request that
+must not wait for a two-gigabyte podcast.
+
+### Normalisation is the point of the resolver
+
+The same YouTube video has at least six URL forms. A system that treats them
+as different videos downloads it six times and posts the same clip to the same
+channel six times, so `resolve` reduces all of them to the bare id — and
+strips tracking parameters, notes a playlist id without following it, and
+refuses a path that does not exist rather than treating it as a URL.
+
+Feed items are keyed on their **GUID**, not their enclosure URL. Enclosure
+URLs change whenever a podcast host moves CDN or rewrites a tracking prefix,
+and deduplicating on URL re-downloads an entire back catalogue when they do.
+
+### Resumable downloads
+
+`http.py` speaks `Range` and needs three things to resume safely, all of which
+it keeps:
+
+1. **Bytes on disk** — in `<path>.part`, whose length *is* the resume offset. A
+   counter kept anywhere else disagrees with the file after a crash.
+2. **A validator** — `If-Range` with the original `ETag` or `Last-Modified`, so
+   a file that changed on the server restarts instead of splicing the tail of a
+   new encode onto the head of an old one. That splice is exactly the right
+   size, passes every size check, and fails to decode hours later in the
+   renderer.
+3. **Proof the server honoured it** — a `206`. A server that ignores `Range`
+   and answers `200` gets the partial file truncated, because appending a whole
+   file to a partial one yields the first bytes twice.
+
+Retries are classified by what a caller should do, not by where the error came
+from: timeouts, resets and 5xx back off with full jitter; 4xx do not, except
+408, 425 and 429, which are the server asking for patience. Retrying a 404
+eight times is a queue spending its afternoon on a video deleted last week.
+
+### Measuring media without ffprobe
+
+`mp4.py` is an ISO base media file format reader — duration, geometry, codecs,
+cover art — straight from the container boxes. It is used before ffmpeg for
+three reasons: it answers on a **partially downloaded** file, so "is this worth
+finishing?" is answerable before the bandwidth is spent; it cannot be absent,
+where ffprobe ships separately and plenty of static ffmpeg builds omit it; and
+`mvhd` carries duration and timescale as integers, so the answer is exact
+rather than rounded through a text formatter.
+
+ffmpeg handles what the box reader does not — WebM, Matroska, MP3 — and
+cross-checks it where both can answer. When the two disagree by more than half
+a second the ffmpeg number wins and the disagreement is recorded, because a
+container header that lies is how a clip gets cut past the real end.
+
+A duration that could not be measured is `None`, never `0`. Zero is a number
+the clip detector divides by.
+
+### Thumbnails, cheapest origin first
+
+1. **Embedded** — cover art already in the container. A read, no decoding, and
+   how a podcast episode gets artwork on a machine with no ffmpeg.
+2. **Remote** — the platform's own thumbnail, already written by yt-dlp.
+3. **Frame grab** — ffmpeg seeks in and writes one frame.
+
+Only the third needs ffmpeg, so thumbnail extraction degrades to "no frame
+grabs" rather than "no thumbnails". A grab does not take frame zero: the first
+frame of a talking-head video is usually a black fade-in, and a wall of black
+thumbnails looks like a broken product. When none of the three work the result
+is `None` — never a placeholder, which is indistinguishable downstream from a
+real thumbnail until a hundred of them reach a feed.
+
+### Acquisition does not grant rights
+
+Everything this layer creates is `RightsBasis.UNVERIFIED`, which the channel
+gate refuses by default. Downloading something and being allowed to republish
+it are different questions, and a layer that answered both would turn a
+licensing decision into a technical one. A re-crawl never resets a basis an
+operator has recorded — that would silently take a cleared show off the air.
+
+The single exception is `mark_owned`, for a customer's own uploads: the
+customer supplying the footage is the rights holder.
+
+**YouTube's Terms of Service prohibit downloading except through features
+YouTube provides.** Material a customer owns, material under a Creative
+Commons licence, and material a creator has given written permission for are
+the defensible cases; a general crawler over other people's uploads is not,
+whatever the code is capable of. `AcquiringSourceFinder.clearable()` is the
+operator's work queue of material waiting on that decision, which is why a
+channel wired to it can look busy and publish nothing.
+
+### Replacing hand-entry
+
+`RegistrySourceFinder` — an operator entering cleared sources by hand — stays,
+because that is what a rights-cleared pipeline genuinely looks like. What it
+cannot do is *get* anything. `AcquiringSourceFinder` watches a set of inputs,
+sweeps them, and answers the factory's `find` from what actually landed:
+
+```python
+finder = AcquiringSourceFinder(db, tenant, engine)
+finder.watch("https://feeds.example.com/show.xml", topics=("business",))
+finder.watch("/uploads/", owned=True)
+finder.sweep()                       # submit, drain, stamp topics
+factory = ChannelFactory(finder=finder, channels=DurableChannelBook(...))
+```
+
+`find` never blocks on acquisition; `sweep` is a separate call a scheduler
+makes. A cycle that waited for a two-gigabyte podcast before deciding what to
+clip would be a cycle that times out.
+
+### What is persisted
+
+`sources` is the library — material a channel may clip. `acquisition_runs` is
+the record of the *work*: what was asked for, how far it got, what it turned
+out to be, what went wrong. Keeping them apart is what stops a half-downloaded
+file appearing as something to clip, and stops a failure vanishing.
+
+| Module | Responsibility |
+|---|---|
+| `resolve.py` | What did the operator paste? Normalisation and dedupe keys. |
+| `http.py` | Resumable downloads; retry classification and backoff. |
+| `mp4.py` | ISO container reader: duration, geometry, codecs, cover art. |
+| `probe.py` | Measuring and thumbnails; ffmpeg where boxes cannot answer. |
+| `rss.py` | Podcast feeds, RSS 2.0 + iTunes + Atom, standard library only. |
+| `youtube.py` | yt-dlp: metadata, downloads, channel listings. |
+| `engine.py` | Resolve, queue, download, probe, thumbnail, persist. |
+| `finder.py` | The `SourceFinder` that acquires instead of waiting. |
+
+### Running the tests
+
+The download, feed, probe and thumbnail paths are tested against **real
+bytes**: a real HTTP server on a real socket serving real MP4 files, with the
+server made to misbehave on purpose — dropping connections mid-body, ignoring
+`Range`, changing its `ETag` between attempts. Those are the cases that corrupt
+files and they are hard to provoke against a well-behaved origin.
+
+Fixtures are generated with ffmpeg:
+
+```sh
+mkdir -p /tmp/mp4test && cd /tmp/mp4test
+ffmpeg -f lavfi -i "testsrc=size=640x360:rate=25:duration=7" \
+       -f lavfi -i "sine=frequency=440:duration=7" \
+       -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest \
+       -movflags +faststart real.mp4
+ffmpeg -f lavfi -i "sine=frequency=220:duration=12" -c:a aac audio.m4a
+ffmpeg -f lavfi -i "color=c=red:size=320x320:duration=1" -frames:v 1 cover.png
+ffmpeg -i audio.m4a -i cover.png -map 0:a -map 1:v -c:a copy -c:v mjpeg \
+       -disposition:v attached_pic podcast.m4a
+
+CLIPFORGE_FFMPEG=$(command -v ffmpeg) PYTHONPATH=src \
+  python -m unittest discover -s tests
+```
+
+Without the fixtures those cases skip and say so.
+
+**The YouTube adapter's network leg is not covered by tests.** It is driven
+through recorded `info_dict` payloads, which exercises the mapping, the error
+classification and the channel walk — where this adapter's own bugs live — but
+not that yt-dlp can reach YouTube.

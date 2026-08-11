@@ -70,20 +70,21 @@ model Tenant {
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
 
-  users     User[]
-  projects  Project[]
-  channels  Channel[]
-  accounts  SocialAccount[]
-  sources   Source[]
-  videos    Video[]
-  clips     Clip[]
-  schedules Schedule[]
-  uploads   Upload[]
-  metrics   MetricSnapshot[]
-  jobs      Job[]
-  sourceUse ChannelSourceUse[]
-  revenue   RevenueEntry[]
-  pools     QuotaPool[]
+  users        User[]
+  projects     Project[]
+  channels     Channel[]
+  accounts     SocialAccount[]
+  sources      Source[]
+  videos       Video[]
+  clips        Clip[]
+  schedules    Schedule[]
+  uploads      Upload[]
+  metrics      MetricSnapshot[]
+  jobs         Job[]
+  sourceUse    ChannelSourceUse[]
+  revenue      RevenueEntry[]
+  pools        QuotaPool[]
+  acquisitions AcquisitionRun[]
 
   @@map("tenants")
 }
@@ -290,10 +291,11 @@ model Source {
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
 
-  tenant Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  clips  Clip[]
-  videos Video[]
-  usedBy ChannelSourceUse[]
+  tenant       Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  clips        Clip[]
+  videos       Video[]
+  usedBy       ChannelSourceUse[]
+  acquisitions AcquisitionRun[]
 
   @@unique([tenantId, fingerprint])
   @@index([tenantId, rightsBasis])
@@ -721,4 +723,110 @@ model QuotaPool {
 
   @@index([tenantId, platform])
   @@map("quota_pools")
+}
+
+// ---------------------------------------------------------------------------
+// Source acquisition
+// ---------------------------------------------------------------------------
+
+enum AcquisitionState {
+  queued
+  fetching_metadata
+  downloading
+  probing
+  ready
+  failed
+  cancelled
+}
+
+enum AcquisitionInputKind {
+  youtube_video
+  youtube_channel
+  podcast_feed
+  local_file
+  media_url
+}
+
+/// One attempt to turn something an operator pasted into usable material.
+///
+/// Separate from `sources` because the two answer different questions. A
+/// source is material the factory may clip; an acquisition is the *process*
+/// of getting it, including the ones that failed and the ones still running.
+/// Folding them together would mean either a half-downloaded row in the
+/// library or losing the record of what went wrong.
+///
+/// This is also what makes a download resumable across a restart. The bytes
+/// live in `<path>.part` and the file's length is the resume offset, but the
+/// validator that proves the remote file has not changed is here — and
+/// resuming without it splices the tail of a new encode onto the head of an
+/// old one.
+model AcquisitionRun {
+  id        String  @id
+  tenantId  String  @map("tenant_id")
+  /// Set once the material lands in the library. Null while in flight, and
+  /// null for ever on the ones that failed.
+  sourceId  String? @map("source_id")
+  channelId String? @map("channel_id")
+
+  kind  AcquisitionInputKind
+  state AcquisitionState     @default(queued)
+
+  /// The normalised reference — a bare video id, a feed item GUID, an
+  /// absolute path. What deduplication runs on.
+  refKey String @map("ref_key")
+  /// What the operator actually typed, for the audit trail.
+  refRaw String @default("") @map("ref_raw")
+  url    String @default("")
+
+  title       String    @default("")
+  creator     String    @default("")
+  externalId  String    @default("") @map("external_id")
+  publishedAt DateTime? @map("published_at") @db.Timestamptz(6)
+
+  // -- the download ---------------------------------------------------------
+  mediaPath   String  @default("") @map("media_path")
+  bytesDone   BigInt  @default(0) @map("bytes_done")
+  /// Null when the server sent no Content-Length. Unknowable, not zero.
+  bytesTotal  BigInt? @map("bytes_total")
+  /// `ETag` or `Last-Modified`. Without it a resumed download can splice two
+  /// different encodes into one file that is exactly the right size.
+  validator   String  @default("")
+  contentType String  @default("") @map("content_type")
+  checksum    String  @default("")
+  resumable   Boolean @default(false)
+
+  // -- what it turned out to be ---------------------------------------------
+  /// Null until measured. Zero would be a duration the clip detector divides
+  /// by; null is the honest answer.
+  durationS       Float?  @map("duration_s")
+  width           Int?
+  height          Int?
+  hasAudio        Boolean @default(false) @map("has_audio")
+  hasVideo        Boolean @default(false) @map("has_video")
+  prober          String  @default("")
+  thumbnailPath   String  @default("") @map("thumbnail_path")
+  thumbnailOrigin String  @default("") @map("thumbnail_origin")
+
+  /// Everything the adapter reported that has no column. Kept whole: the
+  /// crawl is expensive to repeat and the field nobody needed yet is the one
+  /// the next feature needs.
+  metadata Json?
+
+  attempts  Int    @default(0)
+  lastError String @default("") @map("last_error")
+
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt  DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  finishedAt DateTime? @map("finished_at") @db.Timestamptz(6)
+
+  tenant Tenant  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  source Source? @relation(fields: [sourceId], references: [id], onDelete: SetNull)
+
+  /// One live acquisition per reference per channel. Two channels may
+  /// legitimately want the same video; the same channel asking twice is one
+  /// piece of work.
+  @@unique([tenantId, channelId, kind, refKey])
+  @@index([tenantId, state])
+  @@index([tenantId, sourceId])
+  @@map("acquisition_runs")
 }

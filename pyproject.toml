@@ -13,6 +13,17 @@ dependencies = []
 # The engine runs on heuristics alone with no dependencies. The LLM tier is
 # opt-in, which is what keeps the test suite offline and hermetic.
 llm = ["anthropic>=0.60"]
+# Persistence. psycopg is the only client the store needs; the pool is
+# separate because a single-worker deployment does not need one.
+db = ["psycopg[binary]>=3.2", "psycopg_pool>=3.2"]
+# Source acquisition. The HTTP downloader, the ISO container reader and the
+# feed parser are all standard library on purpose — this is only for YouTube,
+# which needs an extractor nobody sensible writes themselves.
+#
+# ffmpeg is *not* a Python dependency. It is optional and found on PATH (or
+# via CLIPFORGE_FFMPEG); without it, thumbnails degrade to embedded artwork
+# only and non-ISO containers cannot be measured.
+acquire = ["yt-dlp>=2024.1"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -43,6 +43,7 @@ from .protocols import (
     VideoRepository,
 )
 from .records import (
+    AcquisitionRunRecord,
     ChannelRecord,
     ChannelSourceUseRecord,
     ClipRecord,
@@ -97,6 +98,7 @@ __all__ = [
     "JobRecord",
     "RevenueEntryRecord",
     "QuotaPoolRecord",
+    "AcquisitionRunRecord",
     "StoreError",
     "NotFound",
     "Conflict",

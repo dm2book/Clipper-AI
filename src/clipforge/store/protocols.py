@@ -18,6 +18,7 @@ from datetime import datetime
 from typing import Any, Protocol, TypeVar, runtime_checkable
 
 from .records import (  # noqa: F401 - referenced in Protocol annotations
+    AcquisitionRunRecord,
     ChannelRecord,
     ChannelSourceUseRecord,
     ClipRecord,
@@ -51,6 +52,7 @@ __all__ = [
     "JobRepository",
     "RevenueRepository",
     "QuotaPoolRepository",
+    "AcquisitionRepository",
     "UnitOfWork",
     "Database",
 ]
@@ -251,6 +253,16 @@ class JobRepository(Protocol):
     def in_state(self, *states: str) -> tuple[JobRecord, ...]: ...
 
 
+class AcquisitionRepository(Repository["AcquisitionRunRecord"], Protocol):
+    """The record of acquisitions: running, finished and failed."""
+
+    def for_ref(self, kind: str, ref_key: str, channel_id: str | None) -> Any:
+        """The existing run for this reference on this channel, or None."""
+
+    def in_state(self, *states: str) -> tuple[Any, ...]: ...
+    def for_source(self, source_id: str) -> tuple[Any, ...]: ...
+
+
 class RevenueRepository(Repository["RevenueEntryRecord"], Protocol):
     def for_period(self, period: str) -> tuple[Any, ...]:
         """Every brand's entry for one month."""
@@ -292,6 +304,7 @@ class UnitOfWork(Protocol):
     jobs: JobRepository
     revenue: RevenueRepository
     pools: QuotaPoolRepository
+    acquisitions: AcquisitionRepository
 
     def __enter__(self) -> UnitOfWork: ...
     def __exit__(self, *exc: object) -> bool: ...

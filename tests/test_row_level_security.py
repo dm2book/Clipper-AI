@@ -232,7 +232,7 @@ class RowLevelSecurityTest(unittest.TestCase):
             "tenants", "users", "projects", "channels", "social_accounts",
             "sources", "channel_source_uses", "videos", "clips", "schedules",
             "uploads", "metric_snapshots", "jobs", "revenue_entries",
-            "quota_pools",
+            "quota_pools", "acquisition_runs",
         }
         with self.psycopg.connect(_ADMIN_DSN) as connection:
             rows = connection.execute(

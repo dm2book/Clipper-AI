@@ -14,6 +14,7 @@ from dataclasses import dataclass, fields
 from typing import Any
 
 from .records import (
+    AcquisitionRunRecord,
     ChannelRecord,
     ChannelSourceUseRecord,
     ClipRecord,
@@ -109,6 +110,11 @@ TABLES: dict[str, Table] = {
     "jobs": Table("jobs", JobRecord, json_columns=frozenset({"payload", "result"})),
     "revenue_entries": Table("revenue_entries", RevenueEntryRecord),
     "quota_pools": Table("quota_pools", QuotaPoolRecord),
+    "acquisition_runs": Table(
+        "acquisition_runs",
+        AcquisitionRunRecord,
+        json_columns=frozenset({"metadata"}),
+    ),
 }
 
 

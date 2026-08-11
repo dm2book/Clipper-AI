@@ -44,6 +44,7 @@ __all__ = [
     "JobRecord",
     "RevenueEntryRecord",
     "QuotaPoolRecord",
+    "AcquisitionRunRecord",
 ]
 
 
@@ -387,3 +388,59 @@ class QuotaPoolRecord(Record):
     ownership: str = "shared_app"
     #: Zero means the platform's standard allowance.
     daily_units: int = 0
+
+
+# ---------------------------------------------------------------------------
+# Source acquisition
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class AcquisitionRunRecord(Record):
+    """One attempt to turn something an operator pasted into material.
+
+    Separate from `SourceRecord` because the two answer different questions.
+    A source is material the factory may clip; an acquisition is the *process*
+    of getting it — including the ones that failed and the ones still running.
+    Folding them together would put half-downloaded rows in the library.
+
+    This row is also what makes a download resumable across a restart. The
+    bytes live in `<media_path>.part` and that file's length is the resume
+    offset, but `validator` — the `ETag` or `Last-Modified` — lives here, and
+    resuming without it splices the tail of a new encode onto the head of an
+    old one.
+    """
+
+    source_id: str | None = None
+    channel_id: str | None = None
+    kind: str = "media_url"
+    state: str = "queued"
+    #: The normalised reference: a bare video id, a feed item GUID, a path.
+    ref_key: str = ""
+    ref_raw: str = ""
+    url: str = ""
+    title: str = ""
+    creator: str = ""
+    external_id: str = ""
+    published_at: datetime | None = None
+    media_path: str = ""
+    bytes_done: int = 0
+    #: None when the server sent no Content-Length. Unknowable, not zero.
+    bytes_total: int | None = None
+    validator: str = ""
+    content_type: str = ""
+    checksum: str = ""
+    resumable: bool = False
+    #: None until measured. Zero is a number the clip detector divides by.
+    duration_s: float | None = None
+    width: int | None = None
+    height: int | None = None
+    has_audio: bool = False
+    has_video: bool = False
+    prober: str = ""
+    thumbnail_path: str = ""
+    thumbnail_origin: str = ""
+    metadata: dict[str, Any] | None = None
+    attempts: int = 0
+    last_error: str = ""
+    finished_at: datetime | None = None

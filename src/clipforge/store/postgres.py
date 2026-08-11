@@ -378,6 +378,23 @@ class _PgMetrics(_PgRepository):
         return rows[0] if rows else None
 
 
+class _PgAcquisitions(_PgRepository):
+    def for_ref(self, kind: str, ref_key: str, channel_id: str | None) -> Any:
+        # `IS NOT DISTINCT FROM` rather than `=`: channel_id is nullable, and
+        # `= NULL` is never true, so an unattached acquisition would never be
+        # found and every pass would insert another one.
+        return self._one_where(
+            "kind = %s AND ref_key = %s AND channel_id IS NOT DISTINCT FROM %s",
+            [kind, ref_key, channel_id],
+        )
+
+    def in_state(self, *states: str) -> tuple[Any, ...]:
+        return self._where("state = ANY(%s)", [list(states)], order="created_at")
+
+    def for_source(self, source_id: str) -> tuple[Any, ...]:
+        return self._where("source_id = %s", [source_id], order="created_at")
+
+
 class _PgRevenue(_PgRepository):
     def for_period(self, period: str) -> tuple[Any, ...]:
         return self._where("period = %s", [period], order="project_id")
@@ -589,6 +606,7 @@ class PostgresUnitOfWork:
         self.jobs = _PgJobs(self, TABLES["jobs"])
         self.revenue = _PgRevenue(self, TABLES["revenue_entries"])
         self.pools = _PgPools(self, TABLES["quota_pools"])
+        self.acquisitions = _PgAcquisitions(self, TABLES["acquisition_runs"])
 
     # -- plumbing ----------------------------------------------------------
 

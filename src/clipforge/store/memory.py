@@ -388,6 +388,24 @@ class _MemoryMetrics(_MemoryRepository):
         return tuple(copy.deepcopy(r) for r in rows)
 
 
+class _MemoryAcquisitions(_MemoryRepository):
+    def for_ref(self, kind: str, ref_key: str, channel_id: str | None) -> Any:
+        for row in self._scoped():
+            if (row.kind, row.ref_key, row.channel_id) == (kind, ref_key, channel_id):
+                return copy.deepcopy(row)
+        return None
+
+    def in_state(self, *states: str) -> tuple[Any, ...]:
+        wanted = set(states)
+        rows = [r for r in self._scoped() if r.state in wanted]
+        rows.sort(key=lambda r: r.created_at)
+        return tuple(copy.deepcopy(r) for r in rows)
+
+    def for_source(self, source_id: str) -> tuple[Any, ...]:
+        rows = [r for r in self._scoped() if r.source_id == source_id]
+        return tuple(copy.deepcopy(r) for r in rows)
+
+
 class _MemoryRevenue(_MemoryRepository):
     def for_period(self, period: str) -> tuple[Any, ...]:
         rows = [r for r in self._scoped() if r.period == period]
@@ -562,6 +580,7 @@ class MemoryUnitOfWork:
         self.jobs = _MemoryJobs(self, TABLES["jobs"])
         self.revenue = _MemoryRevenue(self, TABLES["revenue_entries"])
         self.pools = _MemoryPools(self, TABLES["quota_pools"])
+        self.acquisitions = _MemoryAcquisitions(self, TABLES["acquisition_runs"])
 
     # -- plumbing ----------------------------------------------------------
 

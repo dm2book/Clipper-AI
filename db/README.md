@@ -29,6 +29,8 @@ db/
     20260810205229_empire_revenue_and_quota_pools/
                                     two tables, and the hand-written half a
                                     new model always needs
+    20260811010500_source_acquisition/
+                                    acquisition_runs
 ```
 
 ## Setting one up
