@@ -43,6 +43,9 @@ calls but ship with no live transport.
 - **Source acquisition** (`src/clipforge/acquire/`) — YouTube videos and
   channels, podcast RSS feeds and uploaded files in; resumable downloads,
   measured media and thumbnails out.
+- **Rendering** (`src/clipforge/render/`) — executes the gameplay engine's
+  filtergraph, burns captions in, and checks the output is what the plan
+  asked for. Real 1080x1920 60fps MP4s.
 
 ## Quick start
 
@@ -67,6 +70,8 @@ python demo/run_analytics_demo.py         # a weekly report
 python demo/run_analytics_demo.py --honesty --retention --calibration
 python demo/run_empire_demo.py            # 52 channels, 4 brands, one dashboard
 python demo/run_empire_demo.py --capacity --economics --access --scale
+python demo/run_render_demo.py --plan-only   # the filtergraph, no ffmpeg needed
+python demo/run_render_demo.py --captions    # a real 1080x1920 60fps MP4
 python -m unittest discover -s tests -t tests
 ```
 
@@ -1488,3 +1493,89 @@ Without the fixtures those cases skip and say so.
 through recorded `info_dict` payloads, which exercises the mapping, the error
 classification and the channel walk — where this adapter's own bugs live — but
 not that yt-dlp can reach YouTube.
+
+## Rendering
+
+The gameplay engine decides the composition and builds an ffmpeg filtergraph.
+This is the part that runs it.
+
+```python
+from clipforge.render import RenderEngine, RenderConfig
+
+engine = RenderEngine(db, "ten_acme",
+                      config=RenderConfig(workspace="/var/lib/clipforge/renders"))
+engine.enqueue(clip_id, plan, speaker_path,
+               gameplay_path=bed, subtitles=to_ass(track, style))
+engine.run(limit=2)
+```
+
+Output is 1080x1920 at 60fps, H.264 high profile, CRF 18, faststart, with AAC
+audio at 192k — and the demo renders one at roughly realtime on a single core.
+
+### ffmpeg exiting zero is not a successful render
+
+It exits zero on plenty of files that are not what was asked for: a truncated
+encode, a stream silently dropped because a `-map` matched nothing, a height
+rounded odd by a `scale`. Every one passes a "did the process succeed?" check
+and none is publishable. So the output is probed and compared against the plan
+before it counts.
+
+The comparison is tolerant about duration — encoders land a frame either side
+and failing over 16ms would fail most correct renders — and exact about
+geometry, frame rate and the presence of audio. **A missing audio track is the
+one that matters most:** `-map 0:a?` is optional by design so a broken audio
+chain does not fail the render, which means the failure mode is a perfectly
+valid silent video that nobody notices until it is on someone's feed.
+
+### The camera crop is in source pixels
+
+`SpeakerTrack` defaults to 1920x1080, so a plan composed without a real track
+and applied to a 1280x720 file asks ffmpeg to crop a 1080-pixel-tall window
+out of a 720-pixel-tall frame. ffmpeg's answer is:
+
+```
+Invalid too big or non positive size for width '996' or height '1080'
+Error reinitializing filters!
+Conversion failed!
+```
+
+which names neither the plan, the source, nor the mismatch. A pre-flight probe
+turns that into a sentence saying what to fix, and marks it permanent — the
+same plan against the same file fails identically for ever.
+
+### Captions are burned, not muxed
+
+TikTok, Reels and Shorts all play with soft subtitles off by default, so a soft
+track is a caption nobody sees — and captions are load-bearing for retention on
+muted autoplay. The ASS file the caption engine already exports is composited
+over the finished frame, after the camera and panel chains, so burning cannot
+disturb the composition.
+
+### Atomic outputs
+
+ffmpeg writes to `<output>.tmp.mp4`, and the file is renamed into place only
+after it has been measured. A worker killed mid-encode leaves a `.tmp` nobody
+reads rather than a short file the publisher uploads.
+
+### Testing it
+
+Every render test spawns real ffmpeg and measures the result with the container
+reader from `acquire.mp4` — the filtergraph is built by string concatenation
+and the only way to know a graph is valid is to hand it to ffmpeg.
+
+Clips are short (1.2s) and encoded at `ultrafast`, keeping the suite around
+thirteen seconds. The geometry is the real 1080x1920 60fps throughout: shrinking
+the canvas would desync the camera path, whose coordinates are in source pixels.
+`CLIPFORGE_SLOW_TESTS=1` adds a render at the shipping `medium`/CRF 18 settings.
+
+```sh
+CLIPFORGE_FFMPEG=$(command -v ffmpeg) PYTHONPATH=src \
+  python -m unittest tests.test_render_engine
+```
+
+Without ffmpeg the render tests skip and say so.
+
+| Module | Responsibility |
+|---|---|
+| `types.py` | Requests, results, and errors split by what a caller should do. |
+| `engine.py` | Execute, verify, persist; the queue, retries and pre-flight. |
