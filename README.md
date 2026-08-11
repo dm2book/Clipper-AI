@@ -9,9 +9,10 @@ Turn long-form content into short-form vertical clips, automatically.
 
 Early implementation. The system design is complete; seven engines, the
 channel factory that orchestrates them, the multi-tenant Empire layer on top,
-and the persistence layer underneath are built and tested. No ingest or render
-code yet — the publishing and analytics systems build and sequence platform API
-calls but ship with no live transport.
+and the persistence layer underneath are built and tested. Acquisition,
+transcription and rendering now run end to end on a real file. The publishing
+and analytics systems build and sequence platform API calls but still ship
+with no live transport.
 
 - [System architecture](docs/ARCHITECTURE.md) — data model, API, workers,
   upload path, processing pipeline, capacity model, delivery phases.
@@ -46,6 +47,10 @@ calls but ship with no live transport.
 - **Rendering** (`src/clipforge/render/`) — executes the gameplay engine's
   filtergraph, burns captions in, and checks the output is what the plan
   asked for. Real 1080x1920 60fps MP4s.
+- **Transcription** (`src/clipforge/transcribe/`) — media in, word-level
+  timings out. Local Whisper or any OpenAI-compatible endpoint, chosen by
+  environment variable; chunked so long media never lands in memory. The
+  Whisper providers themselves are unverified here — see below.
 
 ## Quick start
 
@@ -72,7 +77,9 @@ python demo/run_empire_demo.py            # 52 channels, 4 brands, one dashboard
 python demo/run_empire_demo.py --capacity --economics --access --scale
 python demo/run_render_demo.py --plan-only   # the filtergraph, no ffmpeg needed
 python demo/run_render_demo.py --captions    # a real 1080x1920 60fps MP4
-python -m unittest discover -s tests -t tests
+python demo/run_transcribe_demo.py --check   # configured providers, and which run
+python demo/run_transcribe_demo.py --synthesise   # speech in, word timings out
+PYTHONPATH=src python -m unittest discover -s tests -t tests
 ```
 
 ```python
@@ -1274,7 +1281,7 @@ serving every tenant's rows to everyone.
 ### Testing it
 
 ```bash
-python -m unittest discover -s tests -t tests          # in-memory; Postgres cases skip
+PYTHONPATH=src python -m unittest discover -s tests -t tests   # in-memory; Postgres cases skip
 
 createdb clipforge_test -O clipforge_owner
 (cd db && DATABASE_URL=postgresql://clipforge_owner:...@localhost/clipforge_test \
@@ -1579,3 +1586,144 @@ Without ffmpeg the render tests skip and say so.
 |---|---|
 | `types.py` | Requests, results, and errors split by what a caller should do. |
 | `engine.py` | Execute, verify, persist; the queue, retries and pre-flight. |
+
+## Transcription
+
+Media in, words with timings out. The stage everything downstream depends on:
+the detection engine reads a transcript, the caption engine reads word-level
+timings, and neither has anything to do without this.
+
+```python
+from clipforge.transcribe import TranscriptionEngine, provider_from_env
+
+engine = TranscriptionEngine(db, "ten_acme", provider_from_env())
+engine.enqueue(source_id, media_path)
+engine.run(limit=2)
+transcript = engine.transcript_for(source_id)
+```
+
+Every provider returns the same `Transcript`: full text, segments, word-level
+timings, per-word confidence where the provider reports it, and the detected
+language with its own confidence. `confidence` is `None` rather than `1.0`
+when a provider does not report one — a fabricated certainty is worse than an
+absent one, because something downstream will filter on it.
+
+```sh
+python demo/run_transcribe_demo.py --check          # what is configured
+python demo/run_transcribe_demo.py --input talk.mp4 --out words.json
+```
+
+### Choosing a provider
+
+| `CLIPFORGE_TRANSCRIBE_PROVIDER` | What it is |
+|---|---|
+| `local_whisper` | faster-whisper on this machine. No per-minute cost, no audio leaves the box. |
+| `openai` | Any OpenAI-compatible `/audio/transcriptions` endpoint. |
+| `pocketsphinx` | A bundled offline recogniser. Smoke tests only — see below. |
+
+There is no default. An unset variable raises `ProviderUnavailable` rather
+than falling back to whatever happens to be installed: a pipeline that quietly
+picks a different transcriber than the operator configured is a pipeline
+producing captions from a model nobody chose.
+
+Everything else is a variable under the same prefix — model, device, compute
+type, beam size, base URL, chunk length. **No key is ever read from a flag, a
+config file or a constant.** The OpenAI-compatible provider is told the *name*
+of the variable holding its key (`CLIPFORGE_TRANSCRIBE_API_KEY_ENV`, default
+`OPENAI_API_KEY`) and reads it at request time, so the key is never stored on
+an object, never written to a run record, and never appears in
+`describe_environment()` — which reports the variable's name and whether it is
+set, and never its value.
+
+### Long media, bounded memory
+
+A three-hour podcast is not loaded into memory, and neither is a thirty-second
+one. ffmpeg extracts 16 kHz mono PCM to disk, anything over fifteen minutes is
+cut into ten-minute chunks with three seconds of overlap, and each chunk is
+deleted the moment it has been transcribed — so peak disk is one chunk, not the
+whole recording. The scratch directory is removed in a `finally`, which is the
+path that matters: a failure halfway through a long file has hundreds of
+megabytes to answer for.
+
+Overlapping chunks are stitched on the **midpoint of each word**, not on the
+chunk boundary. A word that straddles a boundary is decoded twice, once badly
+at the edge of each window, and taking whichever copy has its centre inside
+the keep-range picks the one the recogniser had context for.
+
+Upload never buffers either: the OpenAI-compatible provider streams the file
+into a multipart body straight off disk, computing the content length
+arithmetically rather than by building the payload.
+
+### Job states
+
+`queued`, `processing`, `succeeded`, `failed_retryable`, `failed_permanent`.
+The split matters because the two failures want opposite handling: a 429 or a
+socket timeout should be tried again, and a missing model, a rejected key or a
+file with no audio track will fail identically for ever. Retryable failures
+back off exponentially; the queue decides when attempts are exhausted, and the
+run's state follows the job's rather than guessing — a retryable error on the
+final attempt is permanently failed.
+
+One source has one run row, not one per attempt. Re-queueing after a permanent
+failure — a bad key since replaced, a provider since installed — lands on the
+existing row, because `unique(tenant_id, source_id)` means a fresh id would be
+a constraint error raised from inside the queue.
+
+### Read before transcribe
+
+`EngineTranscriber` implements the factory's `Transcriber` protocol and looks
+for a stored transcript before producing one. Transcription is the most
+expensive stage in the pipeline and the only one whose output never changes for
+a given input; a second pass is a second invoice on a paid provider and a
+second transcript that disagrees at the margins with captions somebody already
+reviewed. The inline path stores its result for the same reason — a transcript
+that is returned but not written is one the next cycle pays for again.
+
+### What is verified here, and what is not
+
+The suite runs the audio path, the chunking, the merge, the states, the
+retries, the persistence and the pipeline handover against real media, with
+real ffmpeg, and with a real speech recogniser producing real word timings.
+
+**Whisper itself is unverified in this environment.** The model host is
+unreachable from the machine this was built on, so `local_whisper` has never
+produced a transcript here, and no request has ever reached OpenAI. What is
+tested for those two is everything up to the network: the OpenAI-compatible
+client against a local HTTP server implementing the documented protocol —
+multipart upload, `verbose_json`, `timestamp_granularities[]`, and the status
+codes that decide retryable from permanent — and the faster-whisper result
+mapping against its documented result shape.
+
+`availability()` says so rather than leaving it to this file: a provider that
+is installed and configured but has never run reports `unverified=True`, and
+`--check` prints it.
+
+The recogniser the tests actually run is **pocketsphinx**, which is a real
+speech recogniser with real timings and accuracy well below Whisper. So the
+tests assert on plumbing — units, ordering, geometry, persistence, whether the
+next stage accepted the input — and never on which words came back. An
+assertion on transcript content would be an assertion about pocketsphinx, and
+it would fail the day the provider is swapped for the one that belongs there.
+
+### Testing it
+
+```sh
+CLIPFORGE_FFMPEG=$(command -v ffmpeg) PYTHONPATH=src \
+  python -m unittest tests.test_transcribe tests.test_end_to_end
+```
+
+`tests/test_end_to_end.py` is the one that runs the whole chain — acquisition,
+transcription, clip intelligence, rendering — on one synthesised spoken file,
+and ends with a measured 1080x1920 MP4 that still has its audio.
+
+| Module | Responsibility |
+|---|---|
+| `types.py` | `Transcript`, `Segment`, `Word`, states, and errors split by what a caller should do. |
+| `audio.py` | ffmpeg extraction, chunk planning, cleanup. |
+| `provider.py` | The provider protocol, availability, and the overlap merge. |
+| `whisper_local.py` | faster-whisper, with the hallucination filter. |
+| `openai_api.py` | Streaming multipart upload and `verbose_json` parsing. |
+| `sphinx.py` | The offline smoke-test recogniser. Never a default. |
+| `config.py` | Everything the environment decides, and what it reports. |
+| `engine.py` | Queue, states, retries, persistence. |
+| `pipeline.py` | The factory's `Transcriber`, backed by all of the above. |

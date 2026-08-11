@@ -45,6 +45,7 @@ __all__ = [
     "RevenueEntryRecord",
     "QuotaPoolRecord",
     "AcquisitionRunRecord",
+    "TranscriptionRunRecord",
 ]
 
 
@@ -443,4 +444,49 @@ class AcquisitionRunRecord(Record):
     metadata: dict[str, Any] | None = None
     attempts: int = 0
     last_error: str = ""
+    finished_at: datetime | None = None
+
+
+# ---------------------------------------------------------------------------
+# Transcription
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TranscriptionRunRecord(Record):
+    """One attempt to turn media into words with timings.
+
+    The transcript lives here as jsonb rather than in a words table. It is
+    read as a whole transcript every time and never queried into, and a words
+    table for a three-hour podcast is thirty thousand rows nothing filters.
+
+    Stored at all because transcription is the most expensive stage in the
+    pipeline and the only one whose output never changes for a given input.
+    Re-running costs money on a paid provider, and produces a transcript that
+    disagrees at the margins with captions somebody already reviewed.
+    """
+
+    source_id: str | None = None
+    state: str = "queued"
+    provider: str = ""
+    model: str = ""
+    media_path: str = ""
+    #: The flat text, as its own column, because it is searched.
+    text: str = ""
+    #: Words, segments and timings.
+    transcript: dict[str, Any] | None = None
+    language: str = ""
+    language_confidence: float | None = None
+    word_count: int = 0
+    segment_count: int = 0
+    #: Null where the provider reports no confidence — which is the case for
+    #: OpenAI, and is not the same as zero.
+    mean_confidence: float | None = None
+    duration_s: float | None = None
+    #: Wall-clock. The number that decides how many workers an hour of audio
+    #: a day needs.
+    elapsed_s: float | None = None
+    attempts: int = 0
+    last_error: str = ""
+    started_at: datetime | None = None
     finished_at: datetime | None = None

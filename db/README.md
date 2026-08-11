@@ -31,6 +31,7 @@ db/
                                     new model always needs
     20260811010500_source_acquisition/
                                     acquisition_runs
+    20260811193000_transcription/   transcription_runs, and the state enum
 ```
 
 ## Setting one up

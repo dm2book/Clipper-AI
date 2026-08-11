@@ -70,21 +70,22 @@ model Tenant {
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
 
-  users        User[]
-  projects     Project[]
-  channels     Channel[]
-  accounts     SocialAccount[]
-  sources      Source[]
-  videos       Video[]
-  clips        Clip[]
-  schedules    Schedule[]
-  uploads      Upload[]
-  metrics      MetricSnapshot[]
-  jobs         Job[]
-  sourceUse    ChannelSourceUse[]
-  revenue      RevenueEntry[]
-  pools        QuotaPool[]
-  acquisitions AcquisitionRun[]
+  users          User[]
+  projects       Project[]
+  channels       Channel[]
+  accounts       SocialAccount[]
+  sources        Source[]
+  videos         Video[]
+  clips          Clip[]
+  schedules      Schedule[]
+  uploads        Upload[]
+  metrics        MetricSnapshot[]
+  jobs           Job[]
+  sourceUse      ChannelSourceUse[]
+  revenue        RevenueEntry[]
+  pools          QuotaPool[]
+  acquisitions   AcquisitionRun[]
+  transcriptions TranscriptionRun[]
 
   @@map("tenants")
 }
@@ -291,11 +292,12 @@ model Source {
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
 
-  tenant       Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  clips        Clip[]
-  videos       Video[]
-  usedBy       ChannelSourceUse[]
-  acquisitions AcquisitionRun[]
+  tenant         Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  clips          Clip[]
+  videos         Video[]
+  usedBy         ChannelSourceUse[]
+  acquisitions   AcquisitionRun[]
+  transcriptions TranscriptionRun[]
 
   @@unique([tenantId, fingerprint])
   @@index([tenantId, rightsBasis])
@@ -829,4 +831,75 @@ model AcquisitionRun {
   @@index([tenantId, state])
   @@index([tenantId, sourceId])
   @@map("acquisition_runs")
+}
+
+// ---------------------------------------------------------------------------
+// Transcription
+// ---------------------------------------------------------------------------
+
+enum TranscriptionState {
+  queued
+  processing
+  succeeded
+  /// Worth another pass: a timeout, a rate limit, a busy GPU.
+  failed_retryable
+  /// Not worth another pass: a bad key, no audio track, an unusable model.
+  failed_permanent
+}
+
+/// One attempt to turn media into words with timings.
+///
+/// Transcription is the most expensive stage in the pipeline and the only one
+/// whose output never changes for a given input, which is why the transcript
+/// is stored rather than recomputed. Paying a provider twice for the same
+/// podcast is the direct cost; the indirect one is two transcripts that
+/// disagree at the margins, so a re-run silently changes captions that were
+/// already reviewed.
+model TranscriptionRun {
+  id       String  @id
+  tenantId String  @map("tenant_id")
+  sourceId String? @map("source_id")
+
+  state    TranscriptionState @default(queued)
+  provider String             @default("")
+  model    String             @default("")
+
+  mediaPath String @default("") @map("media_path")
+
+  /// The flat text, as a column, because it is searched.
+  text       String @default("")
+  /// Words, segments and their timings. jsonb rather than two more tables:
+  /// this is read as a whole transcript every time and never queried into,
+  /// and a words table for a three-hour podcast is thirty thousand rows
+  /// nothing ever filters.
+  transcript Json?
+
+  language           String @default("")
+  languageConfidence Float? @map("language_confidence")
+  wordCount          Int    @default(0) @map("word_count")
+  segmentCount       Int    @default(0) @map("segment_count")
+  /// Mean over words that reported one. Null where the provider reports none
+  /// — which is the case for OpenAI, and is not the same as zero.
+  meanConfidence     Float? @map("mean_confidence")
+  durationS          Float? @map("duration_s")
+  /// Wall-clock for the run. The number that decides how many workers an
+  /// hour of audio a day needs.
+  elapsedS           Float? @map("elapsed_s")
+
+  attempts  Int    @default(0)
+  lastError String @default("") @map("last_error")
+
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt  DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  startedAt  DateTime? @map("started_at") @db.Timestamptz(6)
+  finishedAt DateTime? @map("finished_at") @db.Timestamptz(6)
+
+  tenant Tenant  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  source Source? @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+
+  /// One transcription per source. A second is a re-run, not a second
+  /// transcript — and on a paid provider it is a second invoice.
+  @@unique([tenantId, sourceId])
+  @@index([tenantId, state])
+  @@map("transcription_runs")
 }

@@ -30,6 +30,7 @@ from clipforge.store import (
     SourceRecord,
     TenantRecord,
     TenantScopeError,
+    TranscriptionRunRecord,
     UploadRecord,
     UserRecord,
 )
@@ -283,6 +284,63 @@ class StoreContract:
             uow.sources.add(SourceRecord(id="perpetual", tenant_id=A, fingerprint="f3"))
             found = uow.sources.rights_expiring_before(NOW)
         self.assertEqual([s.id for s in found], ["lapsed"])
+
+    # -- transcriptions ----------------------------------------------------
+
+    def test_a_transcript_survives_with_its_word_timings(self) -> None:
+        """The stored row is the only copy of the most expensive artifact in
+        the system. A timing lost in the jsonb round trip is a caption that
+        drifts, and nothing fails at the moment it happens."""
+
+        transcript = {
+            "text": "one two",
+            "language": "en",
+            "words": [
+                {"text": "one", "start_s": 0.12, "end_s": 0.44, "confidence": 0.91},
+                {"text": "two", "start_s": 0.44, "end_s": 0.80, "confidence": None},
+            ],
+        }
+        with self.db.unit_of_work(A) as uow:
+            uow.sources.add(SourceRecord(id="src_1", tenant_id=A, fingerprint="f1"))
+            uow.transcriptions.add(TranscriptionRunRecord(
+                id="txn_1", tenant_id=A, source_id="src_1", state="succeeded",
+                provider="whisper", model="small", text="one two",
+                transcript=transcript, language="en", word_count=2,
+                mean_confidence=0.91, duration_s=0.8,
+            ))
+        with self.db.unit_of_work(A) as uow:
+            found = uow.transcriptions.require("txn_1")
+        self.assertEqual(found.transcript["words"][0]["start_s"], 0.12)
+        self.assertIsNone(found.transcript["words"][1]["confidence"],
+                          "an absent confidence came back as something else")
+        self.assertEqual(found.mean_confidence, 0.91)
+
+    def test_a_transcription_run_is_found_by_source_and_by_state(self) -> None:
+        with self.db.unit_of_work(A) as uow:
+            uow.sources.add(SourceRecord(id="src_1", tenant_id=A, fingerprint="f1"))
+            uow.sources.add(SourceRecord(id="src_2", tenant_id=A, fingerprint="f2"))
+            uow.transcriptions.add(TranscriptionRunRecord(
+                id="txn_1", tenant_id=A, source_id="src_1", state="succeeded"))
+            uow.transcriptions.add(TranscriptionRunRecord(
+                id="txn_2", tenant_id=A, source_id="src_2", state="queued"))
+        with self.db.unit_of_work(A) as uow:
+            self.assertEqual(uow.transcriptions.for_source("src_1").id, "txn_1")
+            self.assertIsNone(uow.transcriptions.for_source("src_nothing"))
+            self.assertEqual([r.id for r in uow.transcriptions.in_state("queued")],
+                             ["txn_2"])
+
+    def test_one_source_cannot_hold_two_transcription_runs(self) -> None:
+        """A second row for the same source is a re-run recorded as a rival
+        transcript. The queue reuses the existing row precisely because this
+        is refused."""
+
+        with self.db.unit_of_work(A) as uow:
+            uow.sources.add(SourceRecord(id="src_1", tenant_id=A, fingerprint="f1"))
+            uow.transcriptions.add(TranscriptionRunRecord(
+                id="txn_1", tenant_id=A, source_id="src_1", state="succeeded"))
+            with self.assertRaises(Conflict):
+                uow.transcriptions.add(TranscriptionRunRecord(
+                    id="txn_2", tenant_id=A, source_id="src_1", state="queued"))
 
     # -- metrics -----------------------------------------------------------
 

@@ -27,6 +27,7 @@ from .records import (
     SocialAccountRecord,
     SourceRecord,
     TenantRecord,
+    TranscriptionRunRecord,
     UploadRecord,
     UserRecord,
     VideoRecord,
@@ -110,6 +111,11 @@ TABLES: dict[str, Table] = {
     "jobs": Table("jobs", JobRecord, json_columns=frozenset({"payload", "result"})),
     "revenue_entries": Table("revenue_entries", RevenueEntryRecord),
     "quota_pools": Table("quota_pools", QuotaPoolRecord),
+    "transcription_runs": Table(
+        "transcription_runs",
+        TranscriptionRunRecord,
+        json_columns=frozenset({"transcript"}),
+    ),
     "acquisition_runs": Table(
         "acquisition_runs",
         AcquisitionRunRecord,

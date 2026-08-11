@@ -226,14 +226,17 @@ class RowLevelSecurityTest(unittest.TestCase):
     def test_every_tenant_scoped_table_has_a_policy(self) -> None:
         """A table added without one is the failure this catches: `ALTER TABLE
         ... ENABLE ROW LEVEL SECURITY` is not something Prisma emits, so a new
-        model is unprotected until someone remembers migration 002."""
+        model is unprotected until someone remembers migration 002.
 
-        expected = {
-            "tenants", "users", "projects", "channels", "social_accounts",
-            "sources", "channel_source_uses", "videos", "clips", "schedules",
-            "uploads", "metric_snapshots", "jobs", "revenue_entries",
-            "quota_pools", "acquisition_runs",
-        }
+        The list is derived from the table descriptors rather than written out
+        again here. A hand-kept copy is the one thing that cannot catch a
+        forgotten table: whoever forgets the migration forgets the list too,
+        and the test then passes on the exact change it exists to stop.
+        """
+
+        from clipforge.store.schema import TABLES
+
+        expected = set(TABLES)
         with self.psycopg.connect(_ADMIN_DSN) as connection:
             rows = connection.execute(
                 "SELECT c.relname, c.relrowsecurity, c.relforcerowsecurity, "

@@ -31,6 +31,7 @@ from .records import (  # noqa: F401 - referenced in Protocol annotations
     SocialAccountRecord,
     SourceRecord,
     TenantRecord,
+    TranscriptionRunRecord,
     UploadRecord,
     UserRecord,
     VideoRecord,
@@ -53,6 +54,7 @@ __all__ = [
     "RevenueRepository",
     "QuotaPoolRepository",
     "AcquisitionRepository",
+    "TranscriptionRepository",
     "UnitOfWork",
     "Database",
 ]
@@ -253,6 +255,15 @@ class JobRepository(Protocol):
     def in_state(self, *states: str) -> tuple[JobRecord, ...]: ...
 
 
+class TranscriptionRepository(Repository["TranscriptionRunRecord"], Protocol):
+    """Transcription runs: queued, running, finished and failed."""
+
+    def for_source(self, source_id: str) -> Any:
+        """The run for this source, or None. One per source by constraint."""
+
+    def in_state(self, *states: str) -> tuple[Any, ...]: ...
+
+
 class AcquisitionRepository(Repository["AcquisitionRunRecord"], Protocol):
     """The record of acquisitions: running, finished and failed."""
 
@@ -305,6 +316,7 @@ class UnitOfWork(Protocol):
     revenue: RevenueRepository
     pools: QuotaPoolRepository
     acquisitions: AcquisitionRepository
+    transcriptions: TranscriptionRepository
 
     def __enter__(self) -> UnitOfWork: ...
     def __exit__(self, *exc: object) -> bool: ...

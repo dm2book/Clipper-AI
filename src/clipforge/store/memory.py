@@ -388,6 +388,40 @@ class _MemoryMetrics(_MemoryRepository):
         return tuple(copy.deepcopy(r) for r in rows)
 
 
+class _MemoryTranscriptions(_MemoryRepository):
+    def for_source(self, source_id: str) -> Any:
+        for row in self._scoped():
+            if row.source_id == source_id:
+                return copy.deepcopy(row)
+        return None
+
+    def add(self, record: Any) -> Any:
+        # `unique(tenant_id, source_id)` in Postgres. Enforced here too, or the
+        # in-memory tests pass on a second run row the database would refuse,
+        # and the constraint error arrives instead from inside the queue.
+        if record.source_id and self.for_source(record.source_id):
+            raise Conflict(
+                f"transcription_runs: source {record.source_id!r} already has a run"
+            )
+        return super().add(record)
+
+    def save(self, record: Any) -> Any:
+        if record.source_id:
+            held = self.for_source(record.source_id)
+            if held is not None and held.id != record.id:
+                raise Conflict(
+                    f"transcription_runs: source {record.source_id!r} already "
+                    f"has run {held.id!r}"
+                )
+        return super().save(record)
+
+    def in_state(self, *states: str) -> tuple[Any, ...]:
+        wanted = set(states)
+        rows = [r for r in self._scoped() if r.state in wanted]
+        rows.sort(key=lambda r: r.created_at)
+        return tuple(copy.deepcopy(r) for r in rows)
+
+
 class _MemoryAcquisitions(_MemoryRepository):
     def for_ref(self, kind: str, ref_key: str, channel_id: str | None) -> Any:
         for row in self._scoped():
@@ -581,6 +615,9 @@ class MemoryUnitOfWork:
         self.revenue = _MemoryRevenue(self, TABLES["revenue_entries"])
         self.pools = _MemoryPools(self, TABLES["quota_pools"])
         self.acquisitions = _MemoryAcquisitions(self, TABLES["acquisition_runs"])
+        self.transcriptions = _MemoryTranscriptions(
+            self, TABLES["transcription_runs"]
+        )
 
     # -- plumbing ----------------------------------------------------------
 

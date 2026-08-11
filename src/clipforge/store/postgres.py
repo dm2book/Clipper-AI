@@ -378,6 +378,14 @@ class _PgMetrics(_PgRepository):
         return rows[0] if rows else None
 
 
+class _PgTranscriptions(_PgRepository):
+    def for_source(self, source_id: str) -> Any:
+        return self._one_where("source_id = %s", [source_id])
+
+    def in_state(self, *states: str) -> tuple[Any, ...]:
+        return self._where("state = ANY(%s)", [list(states)], order="created_at")
+
+
 class _PgAcquisitions(_PgRepository):
     def for_ref(self, kind: str, ref_key: str, channel_id: str | None) -> Any:
         # `IS NOT DISTINCT FROM` rather than `=`: channel_id is nullable, and
@@ -607,6 +615,7 @@ class PostgresUnitOfWork:
         self.revenue = _PgRevenue(self, TABLES["revenue_entries"])
         self.pools = _PgPools(self, TABLES["quota_pools"])
         self.acquisitions = _PgAcquisitions(self, TABLES["acquisition_runs"])
+        self.transcriptions = _PgTranscriptions(self, TABLES["transcription_runs"])
 
     # -- plumbing ----------------------------------------------------------
 

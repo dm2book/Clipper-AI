@@ -97,9 +97,15 @@ class Transcriber(Protocol):
 class NullTranscriber:
     """Refuses rather than inventing timings.
 
-    The honest default. Faking word timings produces captions that drift
-    visibly against the audio, and the drift is worse than having no captions
-    at all — so an item with no transcript stops here and says so.
+    Still the default, and still the honest one: faking word timings produces
+    captions that drift visibly against the audio, and the drift is worse than
+    having no captions at all.
+
+    What has changed is that there is now something real to configure instead.
+    `clipforge.transcribe.EngineTranscriber` implements this protocol against
+    the transcription engine — local Whisper, an OpenAI-compatible API, or an
+    offline recogniser — and reads a stored transcript before producing a new
+    one. This class remains what a factory gets when nobody has chosen.
     """
 
     def transcribe(self, source: Source) -> list[TimedWord]:
