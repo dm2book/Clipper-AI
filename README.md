@@ -55,6 +55,10 @@ with no live transport.
   client for the three platforms: streamed chunk uploads, Google's `308`
   resume, token refresh, post-publish verification and account lifecycle. No
   upload has reached a live platform from here — see below.
+- **Authentication** (`src/clipforge/auth/`) — email and password with real
+  bcrypt, JWT sessions, rotating refresh tokens with reuse detection,
+  verification and reset links, durable rate limiting and an append-only audit
+  log. No email is sent and there is no HTTP layer — see below.
 
 ## Quick start
 
@@ -84,6 +88,7 @@ python demo/run_render_demo.py --captions    # a real 1080x1920 60fps MP4
 python demo/run_transcribe_demo.py --check   # configured providers, and which run
 python demo/run_transcribe_demo.py --synthesise   # speech in, word timings out
 python demo/run_upload_demo.py --all --verify    # real uploads over real sockets
+python demo/run_auth_demo.py --all               # every auth flow, and its defences
 PYTHONPATH=src python -m unittest discover -s tests -t tests
 ```
 
@@ -1866,3 +1871,153 @@ against the platforms themselves. The first real credential will find things.
 | `accounts.py` | Connect, reconnect, disconnect, health. |
 | `adapters.py` | The three protocols, as pure state machines. |
 | `retry.py` | What a failure means and when to come back. |
+
+## Authentication
+
+Email and password, JWT access tokens, rotating refresh tokens, verification
+and reset links, rate limiting and an audit trail, on PostgreSQL. Real bcrypt,
+real PyJWT — no hand-rolled crypto anywhere in it.
+
+```python
+from clipforge.auth import AccessTokenIssuer, AuthService, config_from_env
+
+config = config_from_env()
+config.require_production_ready()        # refuses the unsafe defaults
+service = AuthService(store, AccessTokenIssuer(config.keyring), config=config)
+
+service.sign_up("dana@example.com", "marmalade tuesday bicycle")
+service.verify_email(token_from_the_link)
+result = service.log_in("dana@example.com", "marmalade tuesday bicycle")
+principal = service.authenticate(result.tokens.access_token)
+```
+
+```sh
+python demo/run_auth_demo.py --all       # every flow, and what it refuses
+```
+
+### An identity is not a user
+
+`users` stays tenant-scoped — `unique(tenant_id, email)`, because a global
+unique would leak one customer's staff list to another's signup form. But
+authentication happens *before* a tenant is known, and asking for a workspace
+slug before the password is a cost paid by every user on every login to solve a
+problem the rare multi-workspace person has.
+
+So an **identity** is the human — one global email, one password, one
+verification state — and a **user** is a membership: that human's role inside
+one tenant. One identity, many memberships, which is also what happens when an
+agency operator works across four client workspaces. Access tokens are minted
+per tenant, so a session is always unambiguous about which workspace it is in.
+
+The leak the original comment worried about is handled where it actually lives:
+signup, login and password reset return byte-identical answers whether or not
+the address is registered, and take the same time doing it.
+
+### The request path cannot read a password hash
+
+The five `auth_*` tables are granted to a fourth role, `clipforge_auth`, and
+`clipforge_app` — what every request runs as — is granted **nothing** on them.
+Migration 002 sets `ALTER DEFAULT PRIVILEGES` so later tables are readable by
+the app role, which is right for tenant data and wrong for credentials, so
+migration 006 revokes it explicitly.
+
+There are no RLS policies here, and that is not an omission: RLS scopes rows to
+`app.current_tenant()`, and there is no tenant at login. The grant is the
+boundary instead, and it is stronger — the app role cannot see these rows at
+any tenant setting. Verified directly:
+
+```
+clipforge_app  → SELECT FROM auth_identities   ERROR: permission denied
+clipforge_auth → SELECT FROM clips             ERROR: permission denied
+clipforge_auth → UPDATE auth_audit_log         ERROR: permission denied
+```
+
+The audit log is append-only as a privilege, not a convention: a log the
+authenticating service can rewrite says whatever an attacker who reached that
+service wants it to say.
+
+### bcrypt truncates at 72 bytes; this does not
+
+bcrypt ignores everything past the 72nd byte. Older releases did it silently,
+turning a 100-character passphrase into a 72-character one; bcrypt 5 raises,
+which is better and still the wrong answer on a signup form.
+
+So the password is SHA-256'd and base64'd before it reaches bcrypt — a fixed
+44-byte input with the full entropy preserved. The base64 matters as much as
+the hash: a raw digest can contain a NUL byte, and bcrypt truncates at the
+first one, which would quietly weaken about one hash in 180.
+
+Hashes are upgraded on login. The cost that is right today will be too low in
+2030, and the successful-login path is the one moment the plaintext is
+legitimately in memory. The fleet migrates itself; nobody is asked to reset
+anything.
+
+### Refresh token reuse is treated as theft
+
+Access tokens are JWTs because they must be checkable without a database round
+trip. That is also why they cannot be revoked, which is why they live fifteen
+minutes.
+
+Refresh tokens are 256 bits of opaque randomness, stored as SHA-256, rotated on
+every use. Present a token that has already been rotated away from and exactly
+one of two things happened: a client raced itself, or a copy is in circulation
+and the real client has rotated past it. They are indistinguishable at the time
+and the second is far worse, so **the entire session family is revoked**. The
+legitimate user signs in again; the thief's copy is dead.
+
+Sessions also carry an absolute ceiling, not just an idle timeout. Without one,
+a session that keeps refreshing lives for ever — and so does a stolen one.
+
+### Two rate limits, because they stop different attacks
+
+Per-IP stops one host working through a list of addresses. Per-address stops a
+botnet spread over thousands of hosts grinding one account. Either alone leaves
+the other wide open. Both are durable in Postgres, incremented by a single
+upsert — the read-then-write version loses increments under exactly the load a
+limiter exists for.
+
+The account lockout sits on top and is deliberately *not* reachable in one
+burst: the rate limiter stops a burst, and the lockout catches an attacker
+patient enough to spread attempts across windows.
+
+### What a deployment must set
+
+`AuthConfig.require_production_ready()` refuses to start on any of: a signing
+key generated at startup, bcrypt cost under 10, sign-in without email
+verification, rate limiting disabled, access tokens over an hour, or `http://`
+links. Keys come from `CLIPFORGE_AUTH_SIGNING_KEYS` as `kid:secret,kid:secret`
+— several, so a key can be rotated without ending every session.
+
+`db/roles.sql` gained `clipforge_auth` and needs re-running before migration
+006 applies; `PGAUTH_PASSWORD` is the new variable.
+
+### What is verified, and what is not
+
+`tests/test_auth.py` runs 156 tests — every flow twice, once in memory and once
+against PostgreSQL, with real bcrypt and real PyJWT throughout. Beyond the
+feature coverage it asserts the security properties directly: identical
+enumeration responses, comparable timing on unknown addresses, refresh-reuse
+family revocation, single-use links, session revocation on reset, `alg=none`
+and cross-key and cross-audience token rejection, and that no token or password
+ever reaches the audit log.
+
+**No email has ever been sent.** `RecordingEmailSender` is the default and
+records messages instead of delivering them. `SmtpEmailSender` speaks real SMTP
+and no server has accepted a message from it here. Until that is wired to a
+provider, a deployment registers users who never receive a verification link —
+which is why the default records rather than silently swallows.
+
+**There is still no HTTP layer.** This is a library: it verifies a token and
+returns a `Principal`. Nothing in the repository yet turns an HTTP request into
+a call on it, so "authentication" is complete and "authenticated API" is not.
+
+| Module | Responsibility |
+|---|---|
+| `types.py` | Identity, session, event, and errors phrased for the end user. |
+| `passwords.py` | bcrypt, the length-safe pre-hash, and the policy. |
+| `tokens.py` | JWT issuing and verification; opaque refresh tokens. |
+| `service.py` | Every flow, and the enumeration and reuse defences. |
+| `store.py` | The persistence protocol, and an in-memory implementation. |
+| `postgres.py` | The real store, as `clipforge_auth`. |
+| `email.py` | Message templates and the senders. Nothing is delivered. |
+| `config.py` | What a deployment sets, and what it is refused. |

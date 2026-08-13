@@ -24,6 +24,15 @@ db = ["psycopg[binary]>=3.2", "psycopg_pool>=3.2"]
 # via CLIPFORGE_FFMPEG); without it, thumbnails degrade to embedded artwork
 # only and non-ISO containers cannot be measured.
 acquire = ["yt-dlp>=2024.1"]
+# Authentication. Both are hard requirements of the auth package and there is
+# deliberately no pure-Python fallback for either: a weaker password hash that
+# activates when a dependency is missing is a weaker hash nobody notices.
+auth = ["bcrypt>=4.1", "PyJWT>=2.8"]
+# Transcription. faster-whisper for local inference; the OpenAI-compatible
+# provider needs nothing beyond the standard library. pocketsphinx is the
+# offline smoke-test recogniser the suite uses and is not a production choice.
+transcribe = ["faster-whisper>=1.0"]
+transcribe-offline = ["pocketsphinx>=5.0"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

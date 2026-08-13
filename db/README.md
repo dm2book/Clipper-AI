@@ -32,6 +32,7 @@ db/
     20260811010500_source_acquisition/
                                     acquisition_runs
     20260811193000_transcription/   transcription_runs, and the state enum
+    20260813120000_authentication/  the five auth_* tables, and their grants
 ```
 
 ## Setting one up
@@ -43,6 +44,7 @@ psql -v ON_ERROR_STOP=1 \
      -v owner_password="$PGOWNER_PASSWORD" \
      -v app_password="$PGAPP_PASSWORD" \
      -v worker_password="$PGWORKER_PASSWORD" \
+     -v auth_password="$PGAUTH_PASSWORD" \
      -f db/roles.sql
 
 # 2. Database, owned by the migration role.
@@ -83,13 +85,14 @@ tooling will say so. `tests/test_row_level_security.py` will —
 on any public table that is unprotected. Copy the shape from
 `20260810143700_row_level_security/migration.sql`.
 
-## The three roles
+## The four roles
 
 | Role | Used by | RLS | Reach |
 | --- | --- | --- | --- |
 | `clipforge_owner` | migrations only | subject to it (`FORCE`) | owns the schema |
 | `clipforge_app` | the application | enforced | every table, one tenant at a time |
 | `clipforge_worker` | the job dispatcher | `BYPASSRLS` | `jobs`, and nothing else |
+| `clipforge_auth` | the auth service | n/a — no policies | the five `auth_*` tables, and nothing else |
 
 `clipforge_app` is deliberately neither superuser nor the table owner: Postgres
 lets both bypass row-level security, so an application connected as either
@@ -100,6 +103,16 @@ is necessarily cross-tenant: a worker picking up the oldest due job cannot know
 whose job it is until it has read one. Its grants stop at `jobs`. The contract
 is: claim a job, read its `tenant_id`, then open a `clipforge_app` connection
 scoped to that tenant and do the actual work there.
+
+`clipforge_auth` is the one role that can read a password hash, and
+`clipforge_app` is granted nothing on those tables in return — so an injection
+anywhere in the request path reaches clips and captions and stops there. The
+auth tables carry no RLS policies because authentication happens before a
+tenant exists and a policy could only be `USING (true)`; the grant is the
+boundary instead, which is stronger. Migration 002's `ALTER DEFAULT PRIVILEGES`
+would otherwise have handed them to `clipforge_app`, so migration 006 revokes
+that explicitly — a default that is silently correct today is a default that
+silently changes.
 
 `FORCE ROW LEVEL SECURITY` applies to the owner too. That is not defence
 against an attacker — an owner has DDL rights and could drop the policies. It

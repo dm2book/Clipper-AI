@@ -11,6 +11,7 @@
 --        -v owner_password="$PGOWNER_PASSWORD" \
 --        -v app_password="$PGAPP_PASSWORD" \
 --        -v worker_password="$PGWORKER_PASSWORD" \
+--        -v auth_password="$PGAUTH_PASSWORD" \
 --        -f db/roles.sql
 --
 -- Passwords are passed in, never written here.
@@ -71,3 +72,28 @@ END
 $$;
 ALTER ROLE clipforge_worker NOSUPERUSER NOCREATEDB NOCREATEROLE BYPASSRLS;
 ALTER ROLE clipforge_worker PASSWORD :'worker_password';
+
+-- ---------------------------------------------------------------------------
+-- clipforge_auth — the authentication service, and the only role that can see
+-- a password hash.
+--
+-- Narrow in the way clipforge_worker is narrow. Its grants (migration 006)
+-- reach the five `auth_*` tables and nothing else, and — the point of the
+-- whole arrangement — clipforge_app is granted *nothing* on those tables in
+-- return. The request path therefore cannot read a credential at any tenant
+-- setting, so an injection in the application reaches clips and captions and
+-- stops there.
+--
+-- NOBYPASSRLS despite the auth tables having no policies: it must never be
+-- able to read tenant data, and the day someone adds a policy-bearing table
+-- to its grants is the day the attribute matters.
+-- ---------------------------------------------------------------------------
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'clipforge_auth') THEN
+    CREATE ROLE clipforge_auth LOGIN;
+  END IF;
+END
+$$;
+ALTER ROLE clipforge_auth NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+ALTER ROLE clipforge_auth PASSWORD :'auth_password';
