@@ -37,6 +37,7 @@ from .limits import Readiness, readiness
 from .oauth import ClientCredentials, InMemoryTokenStore, TokenSet, TokenStore
 from .retry import Disposition
 from .schedule import Recurrence
+from .transport import TransportError
 from .types import (
     Account,
     Action,
@@ -127,6 +128,7 @@ class PublishingSystem:
         accounts: MutableMapping[str, Account] | None = None,
         calendar: ContentCalendar | None = None,
         series: MutableMapping[str, Recurrence] | None = None,
+        refresher: Any | None = None,
     ) -> None:
         """Everything durable is injected; the defaults are the volatile ones.
 
@@ -156,6 +158,11 @@ class PublishingSystem:
         self.series: MutableMapping[str, Recurrence] = (
             {} if series is None else series
         )
+        #: Renews access tokens before a post runs. Optional, because a
+        #: `RecordingTransport` test has nothing to renew against — but a
+        #: deployment without one publishes only until its first token
+        #: expiry, which on TikTok is 24 hours.
+        self.refresher = refresher
 
     # -- accounts --------------------------------------------------------------
 
@@ -459,6 +466,26 @@ class PublishingSystem:
                 now,
             )
 
+        # Renewed before the upload rather than during it. A resumable upload
+        # runs for minutes and a token that was valid at the first chunk can
+        # expire before the last one, which surfaces as a 401 halfway through
+        # a file that is already half on the platform.
+        if self.refresher is not None and tokens.needs_refresh(now):
+            from .refresh import ReauthRequired, RefreshFailed
+
+            try:
+                tokens = self.refresher.ensure_fresh(post.account_id, now).tokens
+            except ReauthRequired as error:
+                return self._escalate(post, str(error), now)
+            except RefreshFailed as error:
+                # Transient. Burn an attempt and come back rather than asking
+                # a human to reconnect a healthy account.
+                attempt = Attempt(number=post.attempt_count + 1, started_at=now)
+                post.attempts.append(attempt)
+                return self._handle_failure(
+                    post, attempt, None, now, 0, in_flight=False,
+                )
+
         adapter = adapter_for(post.platform)
         attempt = Attempt(number=post.attempt_count + 1, started_at=now)
         post.attempts.append(attempt)
@@ -532,6 +559,14 @@ class PublishingSystem:
                 return self._handle_failure(
                     post, attempt, None, now, requests,
                     in_flight=in_flight, timed_out=True,
+                )
+            except TransportError as error:
+                # No reply at all: DNS, refused, TLS, a truncated response.
+                # Distinct from a timeout, which is ambiguous about whether
+                # the platform acted; this one means nothing was delivered.
+                post.last_error = str(error)
+                return self._handle_failure(
+                    post, attempt, None, now, requests, in_flight=in_flight,
                 )
             requests += 1
 

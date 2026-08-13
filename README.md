@@ -51,6 +51,10 @@ with no live transport.
   timings out. Local Whisper or any OpenAI-compatible endpoint, chosen by
   environment variable; chunked so long media never lands in memory. The
   Whisper providers themselves are unverified here — see below.
+- **Upload transport** (`src/clipforge/publish/transport.py`) — a real HTTP
+  client for the three platforms: streamed chunk uploads, Google's `308`
+  resume, token refresh, post-publish verification and account lifecycle. No
+  upload has reached a live platform from here — see below.
 
 ## Quick start
 
@@ -79,6 +83,7 @@ python demo/run_render_demo.py --plan-only   # the filtergraph, no ffmpeg needed
 python demo/run_render_demo.py --captions    # a real 1080x1920 60fps MP4
 python demo/run_transcribe_demo.py --check   # configured providers, and which run
 python demo/run_transcribe_demo.py --synthesise   # speech in, word timings out
+python demo/run_upload_demo.py --all --verify    # real uploads over real sockets
 PYTHONPATH=src python -m unittest discover -s tests -t tests
 ```
 
@@ -1727,3 +1732,137 @@ and ends with a measured 1080x1920 MP4 that still has its audio.
 | `config.py` | Everything the environment decides, and what it reports. |
 | `engine.py` | Queue, states, retries, persistence. |
 | `pipeline.py` | The factory's `Transcriber`, backed by all of the above. |
+
+## The upload transport
+
+Adapters build requests; this is the layer that sends them. Until it existed,
+the only `Transport` in the repository was a scripted test double and **nothing
+had ever been uploaded to any platform**.
+
+```python
+from clipforge.publish import (
+    AccountManager, HttpTransport, PublishingSystem, TokenRefresher,
+)
+
+transport = HttpTransport()
+refresher = TokenRefresher(transport, token_store, credentials)
+system = PublishingSystem(token_store=token_store, refresher=refresher)
+system.tick(transport)          # one pass of the worker loop
+```
+
+```sh
+python demo/run_upload_demo.py --all --verify   # a real upload over a socket
+python demo/run_upload_demo.py --refresh        # the token lifecycle
+python demo/run_upload_demo.py --failures       # what each failure becomes
+```
+
+### `http.client`, not `urllib`
+
+`urllib.request` follows redirects and raises on 4xx, and both are wrong here.
+
+**308 is not a redirect.** Google's resumable protocol uses `308 Resume
+Incomplete` to mean "still going, here is how much I have" — the single most
+important status in the whole upload. A client that follows it re-sends the
+chunk to a URL that was never meant to receive it.
+
+**4xx is data.** `retry.py` turns a 401 into REAUTH, a 429 into a delay taken
+from `Retry-After`, and a 400 into a permanent failure — using the error code
+in the body. An exception loses the body.
+
+### Retries stop at the connection
+
+The transport retries exactly one thing: establishing a connection, before any
+byte of the request body has been sent. That is safe, because the platform has
+not been told anything.
+
+Once bytes are on the wire it gives up and reports, because it cannot know
+whether the platform processed them — and `retry.py` can, via
+`already_in_flight`, which is the difference between RETRY and RECONCILE. A
+transport that helpfully retried a POST would silently turn the ambiguous case
+into a double post, which is the failure this system is most careful to avoid.
+
+Failures are typed by what a caller can do about them: `TimeoutError` (may have
+been acted on) and `TransportError` (nothing was delivered) are different
+answers, and `retry.py` treats them differently.
+
+### Memory is flat regardless of chunk size
+
+A chunk is streamed off disk through a bounded reader, so a 64 MB TikTok chunk
+never exists in memory. Slicing it into a `bytes` would make peak memory the
+platform's chunk size times the worker count, which is how a four-worker box
+dies on a long podcast.
+
+### Token refresh
+
+Renewed *before* the upload, not at expiry. A resumable upload runs for
+minutes, and a token that was valid when the session opened can expire while
+the third chunk is in flight — which surfaces as a 401 halfway through a file
+that is already half on the platform.
+
+The two failures are kept apart, because they need opposite handling: a
+rejected grant (`invalid_grant`, a revoked app) raises `ReauthRequired` and
+asks for a human, while an undeliverable refresh (timeout, 503) raises
+`RefreshFailed` and is retried. Conflating them produces either a system that
+never asks you to reconnect or one that asks constantly.
+
+Refresh is serialised per account. Several platforms retire the old refresh
+token on use, so two workers refreshing at once leaves the loser holding a
+credential the platform has already invalidated — an account that then fails
+every post with credentials that look present and valid.
+
+### Verification is a separate read
+
+The state machine reports DONE when the protocol says the upload finished. That
+is not the same claim as "the video is on the account":
+
+- YouTube's `uploadStatus` can become `rejected` — duplicate, claimed audio —
+  minutes after a perfectly successful upload, and nothing pushes that back.
+- TikTok returns `PUBLISH_COMPLETE`, but a moderation failure arrives as
+  `FAILED` and the post never appears.
+
+`UploadVerifier` reads the post back. Every request it makes is a GET or a
+status POST that creates nothing, which is what makes it safe on a timer and
+safe after a timeout. `Verification.unknown` is deliberately not `rejected`:
+treating an outage as a missing post would re-upload videos that are live.
+
+### Account management
+
+`AccountManager` owns the two halves of the OAuth flow and the gap between
+them. The `state` is checked rather than trusted — an unchecked `state` is the
+CSRF hole in every OAuth integration that has one, letting an attacker connect
+*their* account to the victim's channel so every subsequent post goes to the
+attacker's audience. Verifiers are single-use and pending connections expire.
+
+Disconnect revokes before it forgets. Deleting a token locally leaves a live
+grant on the platform. A revocation failure does not block the local delete —
+the operator asked to disconnect, and refusing because the platform is down
+leaves them unable to act — but it is reported.
+
+### What is verified, and what is not
+
+`tests/test_publish_transport.py` runs a real `ThreadingHTTPServer` per
+platform and drives the production client at it over TCP: real framing, real
+streamed bodies, real status codes, byte-for-byte comparison of what the
+server received against what is on disk. The servers are strict, and reject
+what the platforms reject — a non-contiguous chunk, a `Content-Range` that
+disagrees with the body, a chunk count that differs from what was declared.
+
+**No upload has reached a real platform.** Outbound CONNECT to
+`open.tiktokapis.com` and `graph.facebook.com` is refused by policy in the
+environment this was built in, and there are no credentials for any of the
+three. One test does leave the machine: `LiveGoogleTokenTest` sends an invalid
+refresh to Google's real token endpoint over real TLS and asserts the reply is
+understood — which verifies TLS, form encoding, a genuine Google error body,
+and the dead-grant path. Run it with `CLIPFORGE_LIVE_OAUTH=1`.
+
+So: the client is correct against the documented protocols, and unproven
+against the platforms themselves. The first real credential will find things.
+
+| Module | Responsibility |
+|---|---|
+| `transport.py` | The HTTP client. TLS, streamed ranges, typed failures. |
+| `refresh.py` | Token renewal, and the difference between the two failures. |
+| `verify.py` | Reading a post back to see whether it really exists. |
+| `accounts.py` | Connect, reconnect, disconnect, health. |
+| `adapters.py` | The three protocols, as pure state machines. |
+| `retry.py` | What a failure means and when to come back. |

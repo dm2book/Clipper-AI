@@ -303,6 +303,11 @@ class Request:
     form_body: dict[str, str] | None = None
     #: Byte range of the asset to send, for chunked uploads.
     byte_range: tuple[int, int] | None = None
+    #: Where the bytes named by `byte_range` live. Carried on the request
+    #: rather than handed to the transport separately, so the transport stays
+    #: stateless and one client can serve every worker. Empty on every request
+    #: that sends no media, which is most of them.
+    asset_path: str = ""
     description: str = ""
 
     def redacted(self) -> dict[str, Any]:

@@ -143,6 +143,7 @@ class YouTubeAdapter:
                 "offset": 0,
                 "chunk": google_chunk_size(),
                 "access_token": tokens.access_token,
+                "asset_path": asset.path,
                 "scheduled": "publishAt" in status,
                 "short_form": is_short_form(asset, Platform.YOUTUBE),
                 "idempotency_key": idempotency_key,
@@ -221,6 +222,7 @@ class YouTubeAdapter:
                 "Content-Range": f"bytes {offset}-{end}/{size}",
             },
             byte_range=(offset, end),
+            asset_path=context.get("asset_path", ""),
             description=(
                 f"youtube: upload bytes {offset}-{end} of {size}"
             ),
@@ -330,6 +332,7 @@ class TikTokAdapter:
                 "chunk_count": count,
                 "chunk_index": 0,
                 "access_token": tokens.access_token,
+                "asset_path": asset.path,
                 "draft_only": bool(gap),
                 "idempotency_key": idempotency_key,
                 "polls": 0,
@@ -427,6 +430,7 @@ class TikTokAdapter:
                 "Content-Range": f"bytes {start}-{end}/{size}",
             },
             byte_range=(start, end),
+            asset_path=context.get("asset_path", ""),
             description=f"tiktok: chunk {index + 1}/{count}",
         )
         return Step(
@@ -615,8 +619,18 @@ class Transport(Protocol):
 class RecordingTransport:
     """Records requests and replays scripted responses.
 
-    The default transport for tests and for the demo. A publisher whose test
-    suite needs live credentials is a publisher whose test suite does not run.
+    **A test double. Never use it in a deployment** — it reaches no platform
+    and reports success for posts that were never sent. `transport.HttpTransport`
+    is the real client.
+
+    It stays because it is the right tool for its job: driving every branch of
+    every platform's state machine, including the ones a live platform will not
+    produce on demand — a 429 with a specific `Retry-After`, a 308 that resumes
+    from an awkward offset, a moderation rejection. A publisher whose test suite
+    needs live credentials is a publisher whose test suite does not run.
+
+    The protocols are exercised against real sockets too, in
+    `tests/test_publish_transport.py`.
     """
 
     responses: list[Response]

@@ -28,9 +28,26 @@ out a *credentials* problem, since an Instagram token is good for sixty days.
 `limits.readiness()` and `oauth.accounts_needing_attention()` exist to make
 that visible before it costs a quarter of someone's content calendar.
 
-Requests are built, never performed: adapters are state machines over a
-`Transport`, so the whole system runs offline and secrets never reach the layer
-that formats logs.
+Adapters build requests and interpret replies; they never perform I/O. A
+`Transport` does that, and there are two:
+
+* `HttpTransport` — the real client. TLS, streamed chunk uploads, exact status
+  codes including Google's `308`, and typed failures.
+* `RecordingTransport` — a scripted double, for exercising every branch of
+  every platform's state machine offline.
+
+Production wiring is `HttpTransport` plus a `TokenRefresher`; without the
+latter a deployment publishes only until its first token expiry, which on
+TikTok is 24 hours.
+
+    from clipforge.publish import (
+        AccountManager, HttpTransport, PublishingSystem, TokenRefresher,
+    )
+
+    transport = HttpTransport()
+    refresher = TokenRefresher(transport, token_store, credentials)
+    system = PublishingSystem(token_store=token_store, refresher=refresher)
+    system.tick(transport)
 """
 
 from .adapters import (
@@ -77,7 +94,16 @@ from .oauth import (
     parse_token_response,
     refresh_request,
 )
+from .accounts import (
+    AccountHealth,
+    AccountManager,
+    ConnectionResult,
+    PendingConnection,
+)
+from .refresh import ReauthRequired, RefreshFailed, RefreshResult, TokenRefresher
 from .retry import Decision, Disposition, backoff_delay, classify
+from .transport import HttpTransport, TransportConfig, TransportError
+from .verify import UploadVerifier, Verification
 from .schedule import (
     AmbiguousTime,
     DstReport,
@@ -110,73 +136,86 @@ from .types import (
 )
 
 __all__ = [
-    "ADAPTERS",
     "Account",
+    "AccountHealth",
+    "AccountManager",
+    "accounts_needing_attention",
     "Action",
     "Adapter",
+    "adapter_for",
+    "ADAPTERS",
     "AmbiguousTime",
     "Attempt",
+    "authorization_url",
     "AuthorizationRequest",
+    "automation_gap",
+    "backoff_delay",
+    "classify",
     "ClientCredentials",
     "Conflict",
+    "ConnectionResult",
     "ContentCalendar",
+    "daily",
     "DaySlot",
     "Decision",
     "Disposition",
+    "dst_report",
     "DstReport",
+    "effective_visibility",
     "EVERY_DAY",
+    "exchange_request",
     "Frequency",
+    "HttpTransport",
     "InMemoryTokenStore",
     "InstagramAdapter",
+    "is_short_form",
     "LIMITS",
+    "limits_for",
     "LIMITS_VERSION",
-    "MIN_SPACING_S",
+    "make_pkce",
     "MediaAsset",
+    "MIN_SPACING_S",
+    "monthly_on",
     "NonexistentTime",
+    "parse_token_response",
+    "PendingConnection",
     "PkceChallenge",
     "Platform",
     "PlatformLimits",
     "PostSpec",
     "PostState",
     "PublishConfig",
-    "PublishResult",
     "PublishingSystem",
+    "PublishResult",
+    "readiness",
     "Readiness",
+    "ReauthRequired",
     "RecordingTransport",
     "Recurrence",
+    "refresh_request",
+    "RefreshFailed",
+    "RefreshResult",
     "Request",
     "Response",
-    "ScheduleError",
     "ScheduledPost",
+    "ScheduleError",
     "SealedTokenStore",
     "Step",
     "TikTokAdapter",
+    "TokenRefresher",
     "TokenSet",
     "TokenStore",
     "Transport",
-    "Visibility",
-    "WEEKDAYS",
-    "WEEKEND",
-    "YouTubeAdapter",
-    "accounts_needing_attention",
-    "adapter_for",
-    "authorization_url",
-    "automation_gap",
-    "backoff_delay",
-    "classify",
-    "daily",
-    "dst_report",
-    "effective_visibility",
-    "exchange_request",
-    "is_short_form",
-    "limits_for",
-    "make_pkce",
-    "monthly_on",
-    "parse_token_response",
-    "readiness",
-    "refresh_request",
+    "TransportConfig",
+    "TransportError",
+    "UploadVerifier",
     "utcnow",
     "validate",
+    "Verification",
+    "Visibility",
+    "WEEKDAYS",
     "weekdays_at",
+    "WEEKEND",
     "weekly_on",
+    "YouTubeAdapter",
 ]
