@@ -53,6 +53,9 @@ class Services:
     #: Optional. Present only when the deployment has one configured, and the
     #: capability list reports its absence rather than the UI guessing.
     acquisition_factory: Any = None
+    #: Durable media storage. Absent means media lives on whichever container
+    #: downloaded it, which the settings page says out loud.
+    storage: Any = None
 
     def close(self) -> None:
         for held in (self.database, getattr(self.auth, "store", None)):

@@ -64,6 +64,10 @@ with no live transport.
   runnable process in the repository.
 - **Dashboard** (`web/`) — React + TypeScript, seven pages, types generated
   from the API's OpenAPI document. No mock data anywhere in it.
+- **Media storage** (`src/clipforge/storage/`) — Cloudflare R2 over boto3, with
+  a local backend behind the same interface: tenant-scoped keys, signed URLs,
+  the public URLs Instagram needs, lifecycle rules, retries and metrics. No
+  byte has reached Cloudflare from here — see below.
 
 ## Quick start
 
@@ -2126,3 +2130,119 @@ actually writes `ready`, so that stage always read zero.
 | `api/schemas.py` | The wire contract, and the source of the TypeScript. |
 | `api/routes/` | One router per page, plus auth. |
 | `api/server.py` | The runnable process. |
+
+## Media storage
+
+Durable media lives in Cloudflare R2. Local disk is scratch.
+
+```sh
+CLIPFORGE_STORAGE_BACKEND=r2 \
+CLIPFORGE_R2_BUCKET=clipforge-media \
+CLIPFORGE_R2_ACCOUNT_ID=... \
+CLIPFORGE_R2_ACCESS_KEY_ID=... \
+CLIPFORGE_R2_SECRET_ACCESS_KEY=... \
+CLIPFORGE_R2_PUBLIC_BASE_URL=https://media.example.com \
+  python -m clipforge.api.server
+```
+
+### The migration is a change of system of record, not a deletion of paths
+
+ffmpeg reads files, yt-dlp writes them, and the MP4 box reader seeks. None of
+them speaks S3, and a FUSE mount would turn every seek into a range request —
+a codec probes a file dozens of times before decoding a frame, so the result
+works in testing and takes four minutes to start in production.
+
+So R2 holds the durable copy, local disk holds a working copy for as long as a
+job is running, and `Workspace` is the only place the two meet:
+
+```python
+with Workspace(storage, tenant_id) as work:
+    media = work.fetch(source_ref)        # object → scratch file
+    output = work.path("clip.mp4")
+    ...ffmpeg...
+    ref = work.publish(output, work.key("renders", clip_id, "clip.mp4"))
+```
+
+Anything on local disk after a job finishes is a bug. `sweep()` finds it, and
+it exists because a worker killed mid-job — a reclaimed spot instance, an OOM,
+a deploy — never reaches its cleanup.
+
+### Keys start with the tenant
+
+`ten_acme/renders/cl_123/clip.mp4`, and `key_for` is the only way to build one.
+Not for tidiness: a bug that builds a wrong key lands inside the same tenant's
+prefix, an IAM policy can be scoped by prefix, and deleting a customer is a
+prefix delete rather than a query. `key_for` refuses traversal, because `a/../b`
+is a *different object* from `b` in an object store rather than the same one —
+there are no directories for the store to normalise.
+
+### Both forms of `media_path` keep working
+
+`StorageRef` parses `r2://bucket/key` and a bare filesystem path. Every row
+written before the migration holds the latter, and a migration that required a
+completed backfill before anything ran is one that gets deferred and then run
+under pressure. `migrate.backfill()` moves them when convenient, is idempotent,
+and leaves the local file alone unless asked twice.
+
+If an upload fails after a successful download, the acquisition records the
+local path rather than failing: the expensive half of the work succeeded, and
+throwing it away to protect the cheap half is the wrong trade.
+
+### R2 is S3-compatible, not S3
+
+Three differences, all of which fail at the endpoint rather than at the signer:
+
+- **`region` must be `auto`.** A real region signs fine and is then rejected.
+- **No ACLs.** `ACL="public-read"` fails; public access is a bucket setting
+  with a domain in front, which is why `public_url` is configured and never
+  derived. A guessed URL that 403s surfaces as "Instagram could not fetch the
+  media" and sends the next person to debug Meta's API instead of this setting.
+- **Lifecycle is the bucket's job.** `lifecycle.RULES` describes what this
+  system wants and `apply()` sets it; expiry then runs whether or not a worker
+  is alive. Renders and transcripts never expire — a source is gigabytes and
+  reproducible, a transcript is kilobytes and cost real inference time.
+
+Every rule aborts incomplete multipart uploads, which are invisible in a
+listing and still billed. That is the classic S3 cost leak.
+
+### Retries, and what is not retried
+
+boto3's adaptive retry is left on and the loop here sits above it for what
+botocore does not treat as retryable but which is worth one more attempt — a
+connection reset mid-upload most of all. Writes are retried too, safely: every
+write is an idempotent PUT to a key the caller chose, so repeating one
+overwrites the same object with the same bytes. A 403 is not retried, because
+four attempts at a bad credential only delay the useful error.
+
+Metrics count retries separately from failures. Failures rising means something
+is broken; retries rising while failures stay flat means something is degraded
+and the retry budget is absorbing it — the state worth catching before it
+becomes the first.
+
+### What is verified, and what is not
+
+`tests/test_storage.py` — 60 tests. One contract runs over both backends, and
+the R2 side runs against a real S3 server (moto) over HTTP with real boto3:
+round trips, multipart above the threshold, presigned GET and PUT, prefix
+listing and deletion, usage, lifecycle configuration, the retry loop and the
+permanent/transient split.
+
+**No byte has reached Cloudflare.** `*.r2.cloudflarestorage.com` is refused by
+this environment's egress policy — a 403 to CONNECT — and there are no R2
+credentials. What is proven is that this client is correct against the S3 API,
+not that R2 behaves as documented.
+
+**moto does not validate signatures.** A presigned URL with a tampered key
+returns 404 rather than 403, so these tests exercise presigning as URL
+construction and not as authentication. The reason to trust the signing is that
+boto3 does it.
+
+| Module | Responsibility |
+|---|---|
+| `types.py` | Keys, refs, errors split by what a caller can do. |
+| `protocol.py` | The interface, and the metrics every backend reports. |
+| `local.py` | A directory. Still the right choice for one machine. |
+| `r2.py` | boto3 against R2, with retries and multipart. |
+| `workspace.py` | The seam between objects and the tools that need files. |
+| `lifecycle.py` | What is kept, for how long, and who deletes it. |
+| `migrate.py` | Wiring into the engines, and the backfill. |

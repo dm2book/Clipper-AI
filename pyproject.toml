@@ -32,6 +32,10 @@ auth = ["bcrypt>=4.1", "PyJWT>=2.8"]
 # support the 1.x line, and the incompatibility is silent — routers register
 # without error and serve nothing.
 api = ["fastapi>=0.115,<0.142", "starlette>=0.46,<0.50", "uvicorn>=0.30"]
+# Durable media storage. boto3 rather than a hand-written SigV4 signer: it is
+# what Cloudflare's own R2 documentation points at, and it brings multipart,
+# presigning and connection reuse with it.
+storage = ["boto3>=1.34"]
 # Transcription. faster-whisper for local inference; the OpenAI-compatible
 # provider needs nothing beyond the standard library. pocketsphinx is the
 # offline smoke-test recogniser the suite uses and is not a production choice.

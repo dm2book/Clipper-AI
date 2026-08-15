@@ -138,14 +138,8 @@ def _capabilities(context: ContextDep) -> list[CapabilityOut]:
         ),
     ))
 
-    # Known-absent, and stated rather than left for a user to discover.
-    checks.append(CapabilityOut(
-        key="object_storage", label="Object storage", available=False,
-        detail=(
-            "Media lives on local disk. Instagram fetches from a public URL, "
-            "so Reels cannot publish until this exists."
-        ),
-    ))
+    checks.append(_storage_capability(services))
+    checks.append(_public_url_capability(services))
     checks.append(CapabilityOut(
         key="metrics", label="Live platform metrics", available=False,
         detail=(
@@ -162,6 +156,62 @@ def _capabilities(context: ContextDep) -> list[CapabilityOut]:
         ),
     ))
     return checks
+
+
+def _storage_capability(services) -> CapabilityOut:
+    """Whether media survives the container it was downloaded onto."""
+
+    storage = getattr(services, "storage", None)
+    backend = getattr(storage, "backend", "")
+    if backend == "r2":
+        bucket = getattr(getattr(storage, "config", None), "bucket", "")
+        return CapabilityOut(
+            key="object_storage", label="Object storage", available=True,
+            detail=f"Cloudflare R2, bucket {bucket or 'unnamed'}",
+        )
+    if backend == "local":
+        return CapabilityOut(
+            key="object_storage", label="Object storage", available=False,
+            detail=(
+                "Media is on this machine's disk and is lost when the "
+                "container is replaced. Set CLIPFORGE_STORAGE_BACKEND=r2."
+            ),
+        )
+    return CapabilityOut(
+        key="object_storage", label="Object storage", available=False,
+        detail=(
+            "No storage backend configured, so acquired media stays wherever "
+            "the worker downloaded it."
+        ),
+    )
+
+
+def _public_url_capability(services) -> CapabilityOut:
+    """Instagram fetches media itself, so this decides whether Reels work.
+
+    Broken out from object storage because the two fail independently: R2 can
+    be configured and working while the bucket has no public domain, and that
+    combination publishes to TikTok and YouTube perfectly while every Reel
+    fails at Meta's fetcher with an error that names neither.
+    """
+
+    storage = getattr(services, "storage", None)
+    if storage is None:
+        return CapabilityOut(
+            key="public_media_urls", label="Public media URLs",
+            available=False, detail="No storage backend configured.",
+        )
+    try:
+        storage.public_url("probe/capability-check")
+    except Exception as error:                              # noqa: BLE001
+        return CapabilityOut(
+            key="public_media_urls", label="Public media URLs",
+            available=False, detail=str(error).split(".")[0] + ".",
+        )
+    return CapabilityOut(
+        key="public_media_urls", label="Public media URLs", available=True,
+        detail="Configured — Instagram can fetch rendered clips.",
+    )
 
 
 @router.post("/sessions/{session_id}/revoke", status_code=204)

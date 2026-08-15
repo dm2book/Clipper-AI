@@ -116,6 +116,7 @@ class TranscriptionEngine:
         *,
         config: TranscriptionConfig | None = None,
         clock: Callable[[], datetime] = utcnow,
+        storage: Any | None = None,
     ) -> None:
         if not tenant_id:
             raise ValueError("transcription needs a tenant")
@@ -125,6 +126,9 @@ class TranscriptionEngine:
         self.config = config or TranscriptionConfig()
         self.audio = self.config.audio or AudioConfig()
         self.clock = clock
+        #: Durable media storage. When set, a `r2://` media path is fetched
+        #: into the job's scratch directory before ffmpeg sees it.
+        self.storage = storage
 
     # -- queueing ----------------------------------------------------------
 
@@ -275,6 +279,24 @@ class TranscriptionEngine:
 
     # -- the work ----------------------------------------------------------
 
+    def _materialise(self, media_path: str, directory: str) -> str:
+        """A local file for whatever `media_path` names.
+
+        Since the storage migration this is a `r2://` ref for anything
+        acquired recently and a filesystem path for everything older. Both
+        have to work: a transcription layer that only understood the new form
+        would stop being able to read the existing library.
+        """
+
+        if self.storage is None or not media_path.startswith("r2://"):
+            return media_path
+        from ..storage.types import StorageRef
+
+        parsed = StorageRef.parse(media_path)
+        local = os.path.join(directory, parsed.filename or "media")
+        self.storage.get_file(parsed.key, local)
+        return local
+
     def transcribe(self, media_path: str, *, language: str = "") -> Transcript:
         """Transcribe one media file. No queue involved.
 
@@ -285,7 +307,9 @@ class TranscriptionEngine:
         podcast has hundreds of megabytes to answer for.
         """
 
-        if not media_path or not os.path.exists(media_path):
+        if not media_path:
+            raise AudioExtractionFailed("no media path given")
+        if not media_path.startswith("r2://") and not os.path.exists(media_path):
             raise AudioExtractionFailed(f"no media at {media_path!r}")
 
         available = self.provider.availability()
@@ -298,7 +322,8 @@ class TranscriptionEngine:
         directory = tempfile.mkdtemp(prefix="clipforge-audio-",
                                      dir=self.config.workspace)
         try:
-            transcript = self._transcribe_in(directory, media_path, language)
+            local = self._materialise(media_path, directory)
+            transcript = self._transcribe_in(directory, local, language)
         finally:
             if not self.config.keep_audio:
                 shutil.rmtree(directory, ignore_errors=True)

@@ -126,6 +126,7 @@ class AcquisitionEngine:
         youtube: YouTubeAdapter | None = None,
         fetch_text: Callable[[str], bytes] | None = None,
         clock: Callable[[], datetime] = utcnow,
+        storage: Any | None = None,
     ) -> None:
         if not tenant_id:
             raise ValueError("acquisition needs a tenant")
@@ -137,6 +138,11 @@ class AcquisitionEngine:
         self.youtube = youtube or YouTubeAdapter(YouTubeConfig())
         self._fetch_text = fetch_text or self._default_fetch_text
         self.clock = clock
+        #: Durable object storage. Optional, because a single-machine
+        #: deployment can legitimately keep media on disk — but when it is
+        #: absent the downloaded file is the only copy, and it lives on
+        #: whichever container happened to run the job.
+        self.storage = storage
 
     # -- submission --------------------------------------------------------
 
@@ -553,7 +559,9 @@ class AcquisitionEngine:
                 metadata=acquisition.raw_metadata or None,
             )
             if download is not None:
-                record.media_path = download.path
+                record.media_path = self._durable_path(
+                    acquisition, download.path
+                )
                 record.bytes_done = download.bytes_done
                 record.bytes_total = download.bytes_total
                 record.validator = download.validator
@@ -579,6 +587,29 @@ class AcquisitionEngine:
                 record.media_path = record.media_path or existing.media_path
                 record.bytes_done = max(record.bytes_done, existing.bytes_done)
             return uow.acquisitions.save(record)
+
+    def _durable_path(self, acquisition: Acquisition, path: str) -> str:
+        """Upload the downloaded file and return what to record.
+
+        Falls back to the local path when no storage is configured, and — more
+        importantly — when the upload fails. The download succeeded; losing
+        the whole acquisition because the object store had a bad minute would
+        throw away the expensive half of the work to protect the cheap half.
+        The local path still resolves, and `migrate.backfill` picks it up
+        later.
+        """
+
+        if self.storage is None or not path:
+            return path
+        try:
+            from ..storage.migrate import store_acquisition
+
+            source_id = acquisition.external_id or acquisition.acquisition_id
+            return str(store_acquisition(
+                self.storage, self.tenant_id, source_id, path
+            ))
+        except Exception:                                   # noqa: BLE001
+            return path
 
     def workspace_for(self, acquisition_id: str) -> str:
         return os.path.join(self.config.workspace, self.tenant_id, acquisition_id)

@@ -257,4 +257,15 @@ def build_services(
         ),
         config=config,
     )
-    return Services(database=database, auth=auth)
+    storage = None
+    try:
+        from ..storage.config import storage_from_env
+
+        storage = storage_from_env()
+    except Exception:                                       # noqa: BLE001
+        # Not fatal: the API serves every page without it, and the settings
+        # capability list reports the absence rather than the app refusing to
+        # start over something only the media pipeline needs.
+        storage = None
+
+    return Services(database=database, auth=auth, storage=storage)
