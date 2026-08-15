@@ -28,11 +28,18 @@ acquire = ["yt-dlp>=2024.1"]
 # deliberately no pure-Python fallback for either: a weaker password hash that
 # activates when a dependency is missing is a weaker hash nobody notices.
 auth = ["bcrypt>=4.1", "PyJWT>=2.8"]
+# The HTTP API. starlette is pinned below 0.50 because FastAPI 0.141 does not
+# support the 1.x line, and the incompatibility is silent — routers register
+# without error and serve nothing.
+api = ["fastapi>=0.115,<0.142", "starlette>=0.46,<0.50", "uvicorn>=0.30"]
 # Transcription. faster-whisper for local inference; the OpenAI-compatible
 # provider needs nothing beyond the standard library. pocketsphinx is the
 # offline smoke-test recogniser the suite uses and is not a production choice.
 transcribe = ["faster-whisper>=1.0"]
 transcribe-offline = ["pocketsphinx>=5.0"]
+
+[project.scripts]
+clipforge-api = "clipforge.api.server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

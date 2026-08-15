@@ -205,7 +205,7 @@ class PostgresAuthStore:
             (
                 session.session_id, session.identity_id, session.token_hash,
                 session.previous_hash or None, session.tenant_id or None,
-                session.user_agent, session.ip or None, session.issued_at,
+                session.user_agent, _inet(session.ip), session.issued_at,
                 session.expires_at, session.absolute_expires_at,
                 session.revoked_at, session.revoked_reason, session.rotations,
             ),
@@ -272,7 +272,7 @@ class PostgresAuthStore:
             f"VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
             (token.token_id, token.identity_id, token.kind.value,
              token.token_hash, token.expires_at, token.created_at,
-             token.used_at, token.requested_ip or None),
+             token.used_at, _inet(token.requested_ip)),
         )
         return token
 
@@ -345,7 +345,7 @@ class PostgresAuthStore:
             (event.event_id, event.kind.value, event.at,
              event.identity_id or None, event.email or None,
              event.tenant_id or None, event.session_id or None,
-             event.ip or None, event.user_agent, event.succeeded,
+             _inet(event.ip), event.user_agent, event.succeeded,
              event.detail, dumps(event.metadata or {})),
         )
         return event
@@ -378,6 +378,29 @@ class PostgresAuthStore:
 # ---------------------------------------------------------------------------
 # Row mapping
 # ---------------------------------------------------------------------------
+
+
+def _inet(value: str) -> str | None:
+    """An IP address Postgres will accept, or NULL.
+
+    `ip` is an `INET` column, which refuses anything that is not an address —
+    and the value arriving here is whatever the transport believed the client
+    was. A proxy that sets `X-Forwarded-For: garbage`, or a test client that
+    reports a hostname, would otherwise turn an audit write into an unhandled
+    500 on the login path.
+
+    Dropping an unparseable value is right: the audit row is worth more than
+    the field, and a string that is not an address tells nobody anything.
+    """
+
+    if not value:
+        return None
+    import ipaddress
+
+    try:
+        return str(ipaddress.ip_address(value.strip()))
+    except ValueError:
+        return None
 
 
 def _text(value: Any) -> str:

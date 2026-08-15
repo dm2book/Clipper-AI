@@ -58,7 +58,12 @@ with no live transport.
 - **Authentication** (`src/clipforge/auth/`) — email and password with real
   bcrypt, JWT sessions, rotating refresh tokens with reuse detection,
   verification and reset links, durable rate limiting and an append-only audit
-  log. No email is sent and there is no HTTP layer — see below.
+  log. No email is sent — see below.
+- **HTTP API** (`src/clipforge/api/`) — FastAPI over the stores, bearer-token
+  authenticated, tenant taken from the token rather than the URL. The first
+  runnable process in the repository.
+- **Dashboard** (`web/`) — React + TypeScript, seven pages, types generated
+  from the API's OpenAPI document. No mock data anywhere in it.
 
 ## Quick start
 
@@ -89,6 +94,7 @@ python demo/run_transcribe_demo.py --check   # configured providers, and which r
 python demo/run_transcribe_demo.py --synthesise   # speech in, word timings out
 python demo/run_upload_demo.py --all --verify    # real uploads over real sockets
 python demo/run_auth_demo.py --all               # every auth flow, and its defences
+python -m clipforge.api.server --in-memory       # the API, nothing persisted
 PYTHONPATH=src python -m unittest discover -s tests -t tests
 ```
 
@@ -2021,3 +2027,102 @@ a call on it, so "authentication" is complete and "authenticated API" is not.
 | `postgres.py` | The real store, as `clipforge_auth`. |
 | `email.py` | Message templates and the senders. Nothing is delivered. |
 | `config.py` | What a deployment sets, and what it is refused. |
+
+## The API, and the dashboard on top of it
+
+Until this existed, every layer in this repository was a library that nothing
+turned an HTTP request into a call on. `authenticate()` returned a `Principal`
+and no request ever produced one.
+
+```sh
+# 1. the API
+CLIPFORGE_DSN=postgresql://clipforge_app:...@host/clipforge \
+CLIPFORGE_AUTH_DSN=postgresql://clipforge_auth:...@host/clipforge \
+CLIPFORGE_AUTH_SIGNING_KEYS="k1:$(python -c 'import secrets;print(secrets.token_urlsafe(48))')" \
+  python -m clipforge.api.server
+
+# 2. some real rows to look at
+python demo/seed_dashboard.py --dsn ... --auth-dsn ...
+
+# 3. the dashboard
+cd web && npm install && npm run dev      # http://localhost:5173
+```
+
+`--in-memory` runs the API with nothing persisted. It must be asked for: the
+alternative — falling back when a DSN is missing — is a deployment that starts
+cleanly, serves requests and loses everything on restart with no error anywhere.
+
+### The tenant comes from the token
+
+There is no `?tenant_id=` anywhere in the API and there must never be. The
+tenant is a claim inside a signed access token, so reaching another customer's
+data means forging a signature rather than editing a URL. Every read then goes
+through `unit_of_work(principal.tenant_id)`, which sets `app.tenant_id` for the
+transaction and puts row-level security underneath the Python — two independent
+checks, and the database's one does not trust the application at all.
+
+`TenantIsolationTest` signs in as one tenant and goes looking for the other's
+rows, because "there is no parameter to tamper with" is an argument and not
+evidence.
+
+### Errors have one shape
+
+Every failure leaves as `{"error": {"code", "message"}}`, whatever it started
+as. `code` is stable and for machines; `message` is for a person. An unhandled
+exception becomes a generic 500 whose body says nothing about the failure — a
+stack trace in a response is a map of the system for anyone who can provoke one.
+The shape is declared in the OpenAPI document, so it reaches the generated
+TypeScript too.
+
+### Types cannot drift
+
+`web/src/api/types.ts` is generated from `/api/v1/openapi.json`. Rename a field
+in `schemas.py`, regenerate, and every page that used the old name fails `tsc`.
+The alternative is a hand-written interface that agrees with the backend until
+one day it does not, and then renders `undefined` into a cell.
+
+Response models are deliberately *not* the store records: a record is an
+internal shape that changes with the schema, and returning one directly makes a
+column rename a breaking change for every client — and a column added a leak
+nobody reviewed.
+
+### Null is not zero
+
+Most metric fields are nullable and the dashboard renders `—`. No live metric
+source is wired up, so a published post usually has no measurement, and
+charting that as zero would be a claim about the video rather than about the
+collection. `/api/v1/analytics` carries a `note` explaining itself rather than
+returning a flat line.
+
+### What the dashboard admits it cannot do
+
+The Settings page ends with a capability list, and most of its answers are
+negative: no object storage, no live metrics, no email delivery, no acquisition
+worker. Each explains a way the product will appear broken. A dashboard that
+hid them would show an upload queue that never drains and give no clue why.
+
+### Verified
+
+`tests/test_api.py` — 39 tests over the real ASGI stack with real signed
+tokens: authentication on every endpoint, cross-tenant reads and writes, role
+enforcement, the error envelope, pagination bounds, and that a validation error
+never echoes the password it rejected.
+
+The dashboard was driven in a real Chromium against the running API and live
+PostgreSQL: all seven pages rendered real rows, 25 API calls, no non-2xx, no
+console errors. Clicking **Retry** on a failed post and **Pause** on a channel
+both changed the rows in Postgres — the UI writes through the API to the
+database, with nothing stubbed in between.
+
+Writing those tests found two real bugs: `failed` uploads were excluded from
+the queue, which made the Retry button unreachable from the only page that
+offers it; and the overview counted acquisition `complete` when the engine
+actually writes `ready`, so that stage always read zero.
+
+| Module | Responsibility |
+|---|---|
+| `api/app.py` | The app factory, error handlers, CORS, health. |
+| `api/deps.py` | Bearer auth to a `Principal`, tenant-scoped unit of work. |
+| `api/schemas.py` | The wire contract, and the source of the TypeScript. |
+| `api/routes/` | One router per page, plus auth. |
+| `api/server.py` | The runnable process. |

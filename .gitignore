@@ -9,3 +9,11 @@ venv/
 # engine binaries it downloads are not.
 db/node_modules/
 db/generated/
+
+# Dashboard build output and dependencies.
+web/node_modules/
+web/dist/
+# Regenerated from the running API by `npm run generate:api`; committed types
+# live at web/src/api/types.ts instead.
+openapi.json
+web/tsconfig.tsbuildinfo
