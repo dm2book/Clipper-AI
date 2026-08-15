@@ -41,6 +41,14 @@ storage = ["boto3>=1.34"]
 # offline smoke-test recogniser the suite uses and is not a production choice.
 transcribe = ["faster-whisper>=1.0"]
 transcribe-offline = ["pocketsphinx>=5.0"]
+# Face detection for automatic framing. The headless wheel, because nothing
+# here opens a window and the GUI build drags in GTK for no benefit in a
+# container. The YuNet weights ship inside the package (227 KB, MIT) rather
+# than being fetched at runtime — see src/clipforge/vision/models/NOTICE.md.
+#
+# numpy arrives with OpenCV anyway, but it is named because `vision` imports
+# it directly, and an implicit dependency is one nobody knows they can break.
+vision = ["opencv-python-headless>=4.8", "numpy>=1.24"]
 
 [project.scripts]
 clipforge-api = "clipforge.api.server:main"
@@ -50,3 +58,10 @@ where = ["src"]
 
 [tool.setuptools.package-dir]
 "" = "src"
+
+# The face model is data, not code, so `packages.find` does not pick it up.
+# Without this a `pip install .` produces a package whose detector cannot
+# start, and `vision.config.resolve_model` says exactly that — but the repair
+# is here rather than at the deployment.
+[tool.setuptools.package-data]
+"clipforge.vision" = ["models/*.onnx", "models/NOTICE.md"]

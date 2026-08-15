@@ -44,6 +44,11 @@ with no live transport.
 - **Source acquisition** (`src/clipforge/acquire/`) — YouTube videos and
   channels, podcast RSS feeds and uploaded files in; resumable downloads,
   measured media and thumbnails out.
+- **Face detection** (`src/clipforge/vision/`) — YuNet over OpenCV, tracked
+  into stable speakers with occlusion tolerance, feeding the camera solver
+  that was previously handed an empty track on every clip. GPU when there is
+  one, CPU when there is not, and it says which. Validated on constructed
+  videos, not on real footage — see below.
 - **Rendering** (`src/clipforge/render/`) — executes the gameplay engine's
   filtergraph, burns captions in, and checks the output is what the plan
   asked for. Real 1080x1920 60fps MP4s.
@@ -477,6 +482,11 @@ was chosen for.
 With no track at all the crop is a centred static one and the plan says
 `tracking: "static"`. That is what an editor does with no information, and it
 never looks broken — but the caller can tell it apart from a solved path.
+
+The tracks themselves come from `src/clipforge/vision/`, described under
+[Face detection](#face-detection-and-automatic-framing) below. Until that
+existed, every one of the mechanisms in the table above was unreachable code:
+the factory passed an empty track, so every clip took the static branch.
 
 ### Salience is the design axis, not texture
 
@@ -1521,6 +1531,228 @@ Without the fixtures those cases skip and say so.
 through recorded `info_dict` payloads, which exercises the mapping, the error
 classification and the channel walk — where this adapter's own bugs live — but
 not that yt-dlp can reach YouTube.
+
+## Face detection and automatic framing
+
+`src/clipforge/vision/` turns a video into the `SpeakerTrack` the camera solver
+was written for.
+
+```python
+from clipforge.vision import FaceTrackEngine
+
+with FaceTrackEngine() as engine:
+    result = engine.track_video("interview.mp4", start_s=612.0, duration_s=52.0)
+
+plan = GameplayEngine().compose(duration_s=52.0, track=result.track)
+```
+
+### What this replaced
+
+The factory passed `SpeakerTrack()` — literally empty, with the comment "no
+face track in this path". Two consequences, both real:
+
+**Every clip was framed by a static centred crop.** The camera solver handles
+an empty track correctly and labels it `tracking: "static"`, so nothing looked
+broken. But the deadband, the 1€ filter, the slew limit, the cut-on-speaker-
+change logic and the gap handling — the entire table in
+[The camera is the hard part](#the-camera-is-the-hard-part) — were unreachable.
+A centred 9:16 crop of a 16:9 two-shot cuts both people in half.
+
+**The source size was a guess.** `SpeakerTrack` defaults to 1920x1080, so a
+plan composed for 1280x720 media asked ffmpeg to crop a 1080-pixel-tall window
+out of a 720-pixel-tall frame. `render.engine._preflight` exists specifically
+to catch that, which is to say the placeholder was already known to be
+producing plans the renderer had to reject. The fallback path is now better
+than it was even when it finds nothing, because it probes the file first:
+`test_the_old_placeholder_would_not_have_fitted` pins the difference.
+
+### YuNet, and why not something bigger
+
+227 KB, MIT, bundled in the package. Haar cascades are free and OpenCV 5 no
+longer ships the XML files, and they miss any face not looking straight down
+the lens — which is most of a podcast. MediaPipe is excellent and is a 60 MB
+dependency with its own threading model. RetinaFace and SCRFD are better on
+tiny faces in crowds, which is not this problem: a clip has one to three people
+filling much of the frame.
+
+The deciding factor was landmarks. YuNet returns five, and the mouth corners
+are what make the active-speaker signal possible at all.
+
+The model is committed rather than downloaded on first use. It is smaller than
+several source files here; a runtime download turns the first render of a new
+deployment into a failure that looks like a code bug; and a model fetched at
+runtime is a model whose version nobody pinned.
+
+### Detection is sampled and downscaled, and both are contracts
+
+A 60-second 1080p clip at 30fps is 1800 frames. Detection runs at 10fps
+instead, because faces do not move meaningfully between consecutive frames and
+the camera deadbands whatever it is given — `SpeakerTrack` already documents
+itself as arriving at about 10fps.
+
+Frames are detected at 640px on the long side and **every box is scaled back
+into source pixels before it leaves the detector**. That is not an internal
+detail: the camera's crop rectangle is in source pixels, so a track in detector
+coordinates would be silently wrong by a factor of three on 1080p and correct
+on small test fixtures — the exact bug a suite built on small videos never
+catches. `test_boxes_come_back_in_source_pixels_after_a_downscale` scales a
+fixture 4x and asserts the box scales with it.
+
+The cost is small faces: below about 3.5% of frame height there is nothing left
+to detect after the downscale. That is `MIN_FACE_FRACTION`, and the `small_face`
+fixture pins it so a change shows up here rather than as a mysterious
+improvement somewhere else.
+
+### Tracking is IoU plus a centroid gate
+
+At ten samples a second a head can travel further than its own width, so two
+boxes for the same person can have zero overlap. An IoU-only matcher ends the
+track and starts a new one — and the visible symptom is not a lost track, it is
+**a hard cut every time somebody leans forward**, because the camera reads a new
+`speaker_id` as a new speaker. So a detection also continues a track if its
+centre is within 1.6 face-widths of the last one, a gate that scales with face
+size because 80px is nothing for a face filling the frame and a different
+person entirely for a face at the back of a room.
+
+| Behaviour | Why |
+|---|---|
+| Occlusion emits **nothing**, never a guess | `camera.solve` already holds the shot through a gap, which beats any position this layer could invent. A predicted box drifts, and the camera follows it and then snaps back. |
+| A lost track forgets its mouth | Differencing the frame before an occlusion against the frame after measures the occlusion, not speech. It would spike activity for the person who was *hidden* — handing the camera its strongest reason to cut to them at the moment it has the least. |
+| Tracks survive 12 missed samples (1.2s) | Long enough for a head turn or someone walking past; short enough that a person who left does not hold an id the next arrival inherits. |
+| Confirmation needs 2 hits, and is **retroactive** | One spurious box must not become a speaker the camera cuts to. But the buffered samples are emitted on confirmation, so a real entrance does not start two frames late — which is exactly when framing matters most. |
+| Greedy association, not Hungarian | Three faces against three tracks. Optimal differs from greedy only when two people overlap, where identity is already a guess, and a scipy dependency to improve a guess is a poor trade. |
+
+### Who is talking, and how weak that signal is
+
+`camera._observe` documents `FaceSample.confidence` as the tracker's channel for
+saying which of several visible faces is speaking. So `vision` fills it with a
+**salience** score, not the detector's score — a silent person is not a poor
+detection, and a camera that treated them as one would cut away from somebody
+standing still in good light. The detector's own confidence is kept on
+`PersonSummary` for anyone who needs the real number.
+
+Salience blends mouth motion (62%), face size (23%) and centrality (15%), and
+is floored at 0.50 — comfortably above the camera's 0.35 gate, so nothing in
+this scoring can make a real face disappear.
+
+**The mouth-motion signal cannot hear anything.** It is the mean absolute
+pixel difference of a normalised mouth crop between consecutive samples,
+smoothed over 0.6s so a closed mouth between syllables does not read as
+silence. It cannot tell speech from chewing, laughing or yawning; it goes to
+zero for someone speaking with a still mouth on a small face; it fires on
+someone silent and animated. It is used because the alternative for choosing
+between two visible faces is face area, which is a fixed property of where
+people sat, and because a wrong choice costs one camera cut rather than a wrong
+transcript.
+
+On the two-speaker fixture it picks the correct speaker in **every** frame of
+every unambiguous talking window. That is a rendered mouth on a scripted
+schedule, and it should be read as "the mechanism works", not as an accuracy
+figure for real footage. Real diarisation, where it exists, should override
+this outright.
+
+### GPU when there is one, CPU when there is not
+
+`CLIPFORGE_FACE_DEVICE=auto|cpu|cuda|opencl`. A CUDA request on a box without
+CUDA is **downgraded, not refused** — taking a working CPU deployment offline
+over an aspiration in a config file is the wrong failure — and the downgrade
+travels out on `DetectorInfo.device_note` rather than sitting in a log nobody
+correlates. `device` reports what ran, never what was asked for.
+
+Two honest caveats. The stock `opencv-python-headless` wheel is built without
+CUDA whatever the host's driver says, so `cuda` on an unmodified install
+degrades to CPU and says so. And OpenCV 5.0 routes DNN work through a new graph
+engine that does not yet honour a preferred target at all — it logs "Targets
+are not supported by the new graph engine for now" and runs on CPU regardless,
+which is why selecting CUDA under OpenCV 5 carries that sentence in the note.
+**No GPU path has been executed here.** This container has no CUDA device.
+
+CPU throughput as measured: ~100 sampled frames per second at 1280x720,
+so a 60-second clip costs about six seconds of detection.
+
+### Failure is a fallback, never an exception
+
+A source with no faces is not an error — it is a gameplay compilation, a
+screencast, a slideshow. A detector that will not load is a deployment problem
+that should not stop a channel publishing. Both come back as a
+`FaceTrackResult` with an empty track, a populated `fallback` string, and the
+real source dimensions. Only `DecodeError` propagates, because a file the
+decoder cannot open was never going to render either.
+
+In the factory the reason lands on the work item's history, so "why is this
+clip framed dead centre" is answerable from the run report:
+
+```
+composed  speaker_dominant over subway_surfers; framed on 2 speakers (100% of frames)
+composed  speaker_only; static framing — no faces detected …
+composed  speaker_only; no media for framing (static crop)
+```
+
+### Testing it
+
+`tests/test_vision.py` — 91 tests in three layers.
+
+**Tracker logic** runs on synthetic detections with no model and no video:
+association across fast movement, two people who must not swap identities, the
+one-frame false-positive filter, retroactive confirmation, occlusion tolerance,
+and that nothing is emitted for frames with no detection.
+
+**The detector** runs the shipped weights over a real photograph — Eileen
+Collins, NASA, public domain, provenance and sha256 in
+`tests/fixtures/README.md`. It detects at 0.93, the landmarks are ordered eyes
+above nose above mouth, a blank frame yields nothing, and a greyscale array is
+refused rather than misread.
+
+**Integration** runs decode → detect → track → solve over six constructed
+1280x720 videos — real H.264, encoded by ffmpeg, decoded by OpenCV — whose
+ground truth is exact because this repo placed every face:
+
+| Fixture | What it pins |
+|---|---|
+| `single_speaker` | Detected centres land within 6px median / 9px p90 of where the face was drawn. |
+| `two_speakers` | Two ids, neither wandering to the other's side; the talking one wins every judged frame. |
+| `enter_exit` | Nothing tracked before arrival or after departure; one identity across a 400px traverse. |
+| `occlusion` | A pillar hides the face for ~0.9s: one identity throughout, a real gap, **and no camera cut**. |
+| `no_faces` | Empty track, stated fallback, zero false positives, real dimensions. |
+| `small_face` | The documented size floor. |
+
+The camera tests assert what a viewer would notice: the crop never leaves the
+frame, movement stays under the slew ceiling, a still speaker provokes no cuts,
+cuts between two people respect the minimum shot length, and during the window
+where the camera genuinely has no observation it does not move at all — a
+window derived from the track and narrowed by `MATCH_TOLERANCE_S` at each end,
+not hardcoded.
+
+Writing them corrected two of my own assumptions rather than finding bugs. The
+camera holds still only 41% of the time on `single_speaker`, which is correct:
+that fixture sways ±26px against a 20px deadband, so the subject really is
+moving. The meaningful invariant is that the crop travels 70px while the face
+travels 156px, and that is what the test now asserts. And the camera legitimately
+pans within 0.2s of a detection gap's edges, because `MATCH_TOLERANCE_S` is
+designed to bridge exactly that.
+
+**What none of this proves.** Every face in the video fixtures is either a
+photograph moved along a path or a drawing. There is no measurement here of
+detection rate on real footage — lighting, motion blur, profile views, faces at
+the back of a room, more than three people. That needs a labelled dataset and
+this is not one. What is established is that the pipeline is correct end to
+end and that the tracker behaves under movement, arrival, departure and
+occlusion.
+
+One incidental finding worth recording: making the drawn face detectable at all
+took radial shading, brow bars with lid shadows, and a neck and shoulders. The
+first version — an oval with two dots — scored 0.61-0.72 and flickered across
+the threshold. That is a rough map of what this detector is looking for.
+
+| Module | Responsibility |
+|---|---|
+| `types.py` | Detections, landmarks, tracks, the result and its fallback. |
+| `config.py` | Environment, model resolution, device selection. |
+| `detector.py` | The one-method contract a second model would implement. |
+| `yunet.py` | The model, the downscale, and the scale back to source pixels. |
+| `decode.py` | Sampled sequential frame reading, and honest timestamps. |
+| `tracking.py` | Association, occlusion, confirmation, salience. |
+| `engine.py` | Video in, `SpeakerTrack` out, fallbacks instead of exceptions. |
 
 ## Rendering
 

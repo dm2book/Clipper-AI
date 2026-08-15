@@ -131,6 +131,10 @@ class WorkItem:
     hooks: list[Hook] = field(default_factory=list)
     caption_track: Any = None
     gameplay_plan: Any = None
+    #: The `vision.FaceTrackResult` for this clip, when framing ran. Kept whole
+    #: rather than reduced to a boolean: the detection rate and the fallback
+    #: reason are what make a badly framed clip diagnosable after the fact.
+    face_track: Any = None
     post_specs: list[PostSpec] = field(default_factory=list)
     scheduled_post_ids: list[str] = field(default_factory=list)
 
@@ -198,6 +202,18 @@ class PipelineConfig:
     #: booking time with a message naming the cause. `render.RenderEngine`
     #: fills the real URL in once the clip is actually in storage.
     cdn_base: str = ""
+
+    #: Produces a `SpeakerTrack` from a video, for automatic framing. Anything
+    #: with `track_video(path, start_s=, duration_s=)` will do; `None` means
+    #: build a `vision.FaceTrackEngine` on first use.
+    #:
+    #: Only consulted when the source has a `media_path`, so a pipeline running
+    #: on transcripts alone — which is most of this suite — pays nothing and
+    #: loads no model.
+    face_tracker: Any = None
+    #: Turns framing off entirely, media or not, for a batch where the cost of
+    #: detection is not wanted and a centred crop is accepted knowingly.
+    disable_face_tracking: bool = False
 
 
 class Pipeline:
@@ -550,19 +566,74 @@ class Pipeline:
             )
             return
 
+        track, framing = self._speaker_track(item, moment, duration)
+
         engine = GameplayEngine(GameplayConfig(
             game=bed, seed=item.item_id,
         ))
         item.gameplay_plan = engine.compose(
             duration_s=duration,
-            track=SpeakerTrack(),          # no face track in this path
+            track=track,
             assets=assets,
             word_count=len(moment.candidate.text.split()),
         )
         item.advance(
             Stage.COMPOSED,
             f"{item.gameplay_plan.style.value}"
-            + (f" over {bed.value}" if bed else " (no bed — footage is the visual)"),
+            + (f" over {bed.value}" if bed else " (no bed — footage is the visual)")
+            + f"; {framing}",
+        )
+
+    def _speaker_track(self, item: WorkItem, moment, duration: float):
+        """Detect faces over the clip's window, or explain why there is none.
+
+        Returns `(track, note)`. The note is put on the work item's history so
+        that "why is this clip framed dead centre" is answerable from the run
+        report rather than by re-running the pipeline with a debugger.
+
+        Detection is scoped to the moment's own span, not the whole source.
+        A two-hour podcast sampled at 10fps is 72,000 detections for a
+        fifty-second clip, and the camera solver only ever looks at the clip.
+        """
+
+        source = item.source
+        if self.config.disable_face_tracking:
+            return SpeakerTrack(), "framing off (static crop)"
+        if not source.media_path:
+            return SpeakerTrack(), "no media for framing (static crop)"
+
+        tracker = self.config.face_tracker
+        if tracker is None:
+            try:
+                from ..vision import FaceTrackEngine
+            except ImportError as error:                    # pragma: no cover
+                return SpeakerTrack(), f"framing unavailable ({error})"
+            tracker = FaceTrackEngine()
+            self.config.face_tracker = tracker
+
+        start_s = moment.candidate.start_ms / 1000.0
+        try:
+            result = tracker.track_video(
+                source.media_path, start_s=start_s, duration_s=duration,
+            )
+        except Exception as error:                          # noqa: BLE001
+            # Framing is an enhancement. A clip that is cleared, cut, hooked
+            # and captioned is not thrown away because the detector fell over
+            # — it ships centred, and the reason travels with it.
+            return SpeakerTrack(), f"framing failed ({type(error).__name__})"
+
+        item.face_track = result
+        if not result.ok:
+            # Still the real track: even with no faces it carries the source's
+            # true dimensions, which is what keeps the plan from being solved
+            # against SpeakerTrack's 1920x1080 default and then rejected by
+            # the renderer against smaller media.
+            return result.track, f"static framing — {result.fallback}"
+
+        people = len(result.people)
+        return result.track, (
+            f"framed on {people} speaker{'s' if people != 1 else ''} "
+            f"({result.detection_rate:.0%} of frames)"
         )
 
     def _specs(self, channel: Channel, item: WorkItem, _words, now) -> None:

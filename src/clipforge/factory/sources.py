@@ -128,6 +128,16 @@ class Source:
     #: Set when a transcript already exists; otherwise one must be produced
     #: before the viral engine can see it.
     has_transcript: bool = False
+    #: Where the media actually is, once acquisition has fetched it. A local
+    #: filesystem path, because the things that read it — the face detector,
+    #: ffmpeg — need a file to seek in rather than an object key.
+    #:
+    #: Empty is normal rather than an error: a source can be discovered,
+    #: cleared and clipped from its transcript alone. What that costs is
+    #: framing, because face detection then has nothing to look at, and the
+    #: pipeline records that on the work item instead of quietly shipping a
+    #: centred crop as though it had been chosen.
+    media_path: str = ""
 
     @property
     def fingerprint(self) -> str:

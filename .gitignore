@@ -17,3 +17,7 @@ web/dist/
 # live at web/src/api/types.ts instead.
 openapi.json
 web/tsconfig.tsbuildinfo
+
+# setuptools build output, e.g. from a local `pip install .`
+build/
+dist/
