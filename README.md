@@ -2234,6 +2234,73 @@ links. Keys come from `CLIPFORGE_AUTH_SIGNING_KEYS` as `kid:secret,kid:secret`
 `db/roles.sql` gained `clipforge_auth` and needs re-running before migration
 006 applies; `PGAUTH_PASSWORD` is the new variable.
 
+Email is now configuration rather than a default, and the default is the one
+that delivers nothing:
+
+```sh
+CLIPFORGE_EMAIL_BACKEND=smtp        # smtp | console | recording
+CLIPFORGE_SMTP_HOST=smtp.example.com
+CLIPFORGE_EMAIL_FROM=no-reply@yourdomain.com
+CLIPFORGE_SMTP_USER=... CLIPFORGE_SMTP_PASSWORD=...
+```
+
+`smtp` with no host or no from-address **refuses to start** rather than falling
+back. Falling back would reproduce the exact bug this replaces: `AuthService`
+defaults its sender to `RecordingEmailSender`, and nothing ever passed one in,
+so a deployment appended verification links to a list in memory. Signup
+returned 200, the audit log recorded a token, and no human ever received a
+link. The account could not be verified and the password could not be reset —
+a silent outage, not a degraded mode.
+
+### Signing up gets you a workspace
+
+`sign_up` creates an *identity* and nothing else, because the auth store is
+reached as `clipforge_auth`, a role scoped to the five `auth_*` tables so the
+request path cannot read a password hash. Tenants live in the application
+schema behind `clipforge_app`. Two roles, two connections, no object that can
+write both — so a self-service signup produced an identity with no membership,
+the token carried an empty `tenant_id`, and every page answered
+`409 NO_WORKSPACE`. The endpoint worked; the product did not.
+
+`api/onboarding.ensure_workspace` closes it, in the API layer because that is
+the first place holding a handle to each store. `AuthService` gained a
+`provisioner` callback rather than a database handle, which is what keeps the
+role boundary intact.
+
+Provisioning happens at **first login**, not at signup. An address that
+registers and never returns leaves no tenant row behind, there is one code path
+instead of two, and accounts created before any of this existed are repaired
+the next time their owner signs in. It is keyed on having no membership *row* —
+a suspended member keeps theirs and gets an empty session rather than a silent
+new private tenant. A hard-deleted membership is indistinguishable from a new
+account and will be re-provisioned; if revoking access needs to stick,
+deactivate rather than delete.
+
+There is no transaction across the two stores. A crash between the tenant write
+and the membership write leaves an orphaned empty tenant, and the next login
+mints a fresh one rather than trying to adopt it. Deleting rows on an error
+path is how the wrong tenant gets deleted when the error was something else.
+
+### Four routes existed on the service and could not be reached
+
+`verify_email`, `reset_password`, `resend_verification` and `request_deletion`
+were all implemented and tested, with no HTTP entry point. So an address could
+never be confirmed, a reset link could be requested but never redeemed, and an
+account could not be deleted — which for a real customer is a GDPR exposure
+rather than a missing feature. They are now `POST /auth/verify`,
+`/auth/password/reset`, `/auth/verify/resend` and `/auth/account/delete`.
+
+Verification and reset are unauthenticated, because the token *is* the
+credential: requiring a session first would mean a deployment that blocks
+unverified sign-in has accounts that can never verify. Deletion asks for the
+password again through `check_password`, a new method added for it — reusing
+`change_password` with the same value looked tidy and fails, because that path
+rejects an unchanged password with `PASSWORD_UNCHANGED`.
+
+The dashboard gained the pages these need: signup, a verify landing page, and
+forgot/reset. `/verify` and `/reset` sit outside the auth gate for the same
+reason the endpoints are unauthenticated.
+
 ### What is verified, and what is not
 
 `tests/test_auth.py` runs 156 tests — every flow twice, once in memory and once
@@ -2244,15 +2311,26 @@ family revocation, single-use links, session revocation on reset, `alg=none`
 and cross-key and cross-audience token rejection, and that no token or password
 ever reaches the audit log.
 
-**No email has ever been sent.** `RecordingEmailSender` is the default and
-records messages instead of delivering them. `SmtpEmailSender` speaks real SMTP
-and no server has accepted a message from it here. Until that is wired to a
-provider, a deployment registers users who never receive a verification link —
-which is why the default records rather than silently swallows.
+The self-service path is covered end to end in `tests/test_api.py`, over HTTP
+only: signup sends a link with a real token in it, the token confirms the
+address, login provisions a workspace, and all seven pages return 200 for an
+account that has only just been created — the assertion that would have failed
+against every build before this one. Also pinned: provisioning runs once, the
+tenant row really exists in the *application* store rather than only the
+membership in the auth store, a failing provisioner does not refuse a valid
+login, a suspended member is not handed a fresh private tenant, a spent reset
+token cannot be reused, and deletion refuses a wrong password.
 
-**There is still no HTTP layer.** This is a library: it verifies a token and
-returns a `Principal`. Nothing in the repository yet turns an HTTP request into
-a call on it, so "authentication" is complete and "authenticated API" is not.
+That flow was then driven in a real Chromium against the built dashboard, the
+running API and live PostgreSQL: signup → the link printed by
+`ConsoleEmailSender` → verify → login → a working Overview reading
+`owner · Northwind labs`. Fifteen API calls, no non-2xx, no console errors.
+
+**Still no email has left this environment.** `SmtpEmailSender` is now
+selectable and no SMTP server has accepted a message from it here — there is
+none reachable and no credentials. `describe_sender` reports that as
+"configured, unproven" rather than as working, and the settings capability list
+shows it. The first real signup is the test.
 
 | Module | Responsibility |
 |---|---|

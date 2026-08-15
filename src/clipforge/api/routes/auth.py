@@ -24,14 +24,18 @@ from ...auth.types import AuthError
 from ..deps import ContextDep, LivePrincipalDep, PrincipalDep, _services
 from ..schemas import (
     ChangePasswordRequest,
+    DeleteAccountRequest,
+    EmailRequest,
     LoginRequest,
     LoginResponse,
     MembershipOut,
     MeResponse,
     MessageResponse,
+    PasswordResetRequest,
     RefreshRequest,
     SignUpRequest,
     TokenPairOut,
+    VerifyEmailRequest,
 )
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -176,13 +180,12 @@ async def change_password(
 
 @router.post("/password/reset-request", response_model=MessageResponse)
 async def request_reset(
-    body: SignUpRequest, request: Request
+    body: EmailRequest, request: Request
 ) -> MessageResponse:
     """Ask for a reset link.
 
-    Takes the signup shape because it needs only the address; the password
-    field is ignored. Same uninformative contract: the answer does not depend
-    on whether the address is registered.
+    Same uninformative contract as signup: the answer does not depend on
+    whether the address is registered.
     """
 
     services = _services(request)
@@ -190,5 +193,94 @@ async def request_reset(
     return MessageResponse(
         message=(
             "If that address has an account, a reset link is on its way."
+        )
+    )
+
+
+@router.post("/password/reset", response_model=MessageResponse)
+async def reset_password(
+    body: PasswordResetRequest, request: Request
+) -> MessageResponse:
+    """Spend a reset token on a new password.
+
+    The other half of `reset-request`, which shipped without it — so a link
+    could be asked for and never redeemed, and the reset flow had no ending.
+    Every session for the identity dies here, which is what makes "reset your
+    password" a remedy for a compromise rather than a gesture.
+    """
+
+    services = _services(request)
+    services.auth.reset_password(
+        body.token, body.new_password, ip=client_ip(request),
+    )
+    return MessageResponse(
+        message=(
+            "Password set. Every device has been signed out — sign in again "
+            "with the new password."
+        )
+    )
+
+
+@router.post("/verify", response_model=MessageResponse)
+async def verify_email(
+    body: VerifyEmailRequest, request: Request
+) -> MessageResponse:
+    """Confirm an address from the emailed token.
+
+    Unauthenticated on purpose: the token *is* the credential. Requiring a
+    session first would mean that a deployment which blocks unverified sign-in
+    has accounts that can never verify.
+    """
+
+    services = _services(request)
+    identity = services.auth.verify_email(body.token, ip=client_ip(request))
+    return MessageResponse(
+        message=f"{identity.email} is confirmed. You can sign in now."
+    )
+
+
+@router.post("/verify/resend", response_model=MessageResponse)
+async def resend_verification(
+    body: EmailRequest, request: Request
+) -> MessageResponse:
+    """Send another confirmation link, if one is owed."""
+
+    services = _services(request)
+    services.auth.resend_verification(body.email, ip=client_ip(request))
+    return MessageResponse(
+        message=(
+            "If that address has an unconfirmed account, a new link is on "
+            "its way."
+        )
+    )
+
+
+@router.post("/account/delete", response_model=MessageResponse)
+async def request_deletion(
+    body: DeleteAccountRequest, principal: LivePrincipalDep, request: Request
+) -> MessageResponse:
+    """Schedule this account for deletion after a grace period.
+
+    `LivePrincipalDep` rather than the stateless dependency: this pays one
+    database read to confirm the session has not been revoked, which is the
+    right trade for the only action here that cannot be undone once the grace
+    window closes.
+
+    The password is re-checked first through `check_password`, which exists for
+    this and is rate limited on the same bucket as a password change — an
+    endpoint that confirms a password without a limit is a password oracle for
+    anyone holding a stolen session.
+    """
+
+    services = _services(request)
+    ip = client_ip(request)
+    services.auth.check_password(principal.identity_id, body.password, ip=ip)
+    identity = services.auth.request_deletion(principal.identity_id, ip=ip)
+    when = getattr(identity, "delete_after", None)
+    return MessageResponse(
+        message=(
+            "Account scheduled for deletion"
+            + (f" on {when:%d %B %Y}" if when else "")
+            + ". Sign in again before then to cancel it."
         )
     )

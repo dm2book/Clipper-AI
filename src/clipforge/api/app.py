@@ -228,6 +228,8 @@ def build_services(
     from ..auth import AccessTokenIssuer, AuthService, MemoryAuthStore
     from ..auth.config import config_from_env
     from ..store import MemoryDatabase
+    from .email_config import email_sender_from_env
+    from .onboarding import ensure_workspace
 
     config = config_from_env()
 
@@ -249,14 +251,6 @@ def build_services(
         database = PostgresDatabase(dsn)
         auth_store = PostgresAuthStore(auth_dsn)
 
-    auth = AuthService(
-        auth_store,
-        AccessTokenIssuer(
-            config.keyring, issuer=config.issuer, audience=config.audience,
-            ttl_s=config.access_ttl_s,
-        ),
-        config=config,
-    )
     storage = None
     try:
         from ..storage.config import storage_from_env
@@ -268,4 +262,21 @@ def build_services(
         # start over something only the media pipeline needs.
         storage = None
 
-    return Services(database=database, auth=auth, storage=storage)
+    # The container is built first and its `auth` filled in below, because the
+    # provisioner has to close over the container rather than over the database
+    # alone — it is the container that a request carries. The cycle is real and
+    # small; the alternative is a second way to reach the stores.
+    services = Services(database=database, auth=None, storage=storage)
+    services.auth = AuthService(
+        auth_store,
+        AccessTokenIssuer(
+            config.keyring, issuer=config.issuer, audience=config.audience,
+            ttl_s=config.access_ttl_s,
+        ),
+        config=config,
+        sender=email_sender_from_env(),
+        provisioner=lambda identity: ensure_workspace(
+            services, identity.identity_id, identity.email,
+        ),
+    )
+    return services

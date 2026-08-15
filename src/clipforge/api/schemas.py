@@ -97,6 +97,37 @@ class SignUpRequest(BaseModel):
     password: str
 
 
+class EmailRequest(BaseModel):
+    """An address and nothing else.
+
+    Reset and resend used to borrow `SignUpRequest`, which made a caller invent
+    a password for a form that has none — and made the generated client types
+    describe a password field on a request that must never carry one.
+    """
+
+    email: str
+
+
+class VerifyEmailRequest(BaseModel):
+    token: str
+
+
+class PasswordResetRequest(BaseModel):
+    token: str
+    new_password: str
+
+
+class DeleteAccountRequest(BaseModel):
+    """Deleting an account asks for the password again.
+
+    Not ceremony. An unattended session is the ordinary way this endpoint is
+    reached by someone who should not have it, and it is the only action here
+    with no undo once the grace period expires.
+    """
+
+    password: str
+
+
 class MessageResponse(BaseModel):
     """Used where the answer must not depend on whether an account exists."""
 

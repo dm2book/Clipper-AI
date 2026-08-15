@@ -8,8 +8,11 @@ import { Login } from "./pages/Login";
 import { Overview } from "./pages/Overview";
 import { Published } from "./pages/Published";
 import { Queue } from "./pages/Queue";
+import { ForgotPassword, ResetPassword } from "./pages/ResetPassword";
 import { Settings } from "./pages/Settings";
+import { Signup } from "./pages/Signup";
 import { Sources } from "./pages/Sources";
+import { Verify } from "./pages/Verify";
 
 function Gate() {
   const { me, loading } = useAuth();
@@ -24,7 +27,15 @@ function Gate() {
       </div>
     );
   }
-  if (!me) return <Login />;
+  if (!me) {
+    return (
+      <Routes>
+        <Route path="/signup" element={<Signup />} />
+        <Route path="/forgot" element={<ForgotPassword />} />
+        <Route path="*" element={<Login />} />
+      </Routes>
+    );
+  }
 
   return (
     <Routes>
@@ -46,7 +57,18 @@ export function App() {
   return (
     <BrowserRouter>
       <AuthProvider>
-        <Gate />
+        {/*
+          `/verify` and `/reset` sit outside the gate on purpose. Both carry a
+          token that *is* the credential, and both must work whether or not
+          there is a session — a deployment that blocks unverified sign-in
+          would otherwise have accounts that can never verify, because the link
+          would bounce to a login they are not yet allowed to complete.
+        */}
+        <Routes>
+          <Route path="/verify" element={<Verify />} />
+          <Route path="/reset" element={<ResetPassword />} />
+          <Route path="/*" element={<Gate />} />
+        </Routes>
       </AuthProvider>
     </BrowserRouter>
   );

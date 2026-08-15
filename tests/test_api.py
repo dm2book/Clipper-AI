@@ -720,5 +720,356 @@ class OpenApiTest(ApiTest):
         self.assertEqual(body["status"], "ok")
 
 
+# ---------------------------------------------------------------------------
+# Onboarding: a self-service account that can actually be used
+# ---------------------------------------------------------------------------
+
+
+NEW_PASSWORD = "correct-horse-battery-staple-9"
+
+
+def build_self_service() -> tuple[TestClient, Services]:
+    """An app wired the way `build_services` wires a deployment.
+
+    The one difference from `build()` is the provisioner. Without it an
+    identity that signs up has no membership, `_choose_membership` returns
+    None, the token carries an empty tenant, and every page answers 409
+    NO_WORKSPACE. That was the shipped behaviour; these tests pin the repair.
+    """
+
+    from clipforge.api.onboarding import ensure_workspace
+
+    database = MemoryDatabase()
+    services = Services(database=database, auth=None)
+    services.auth = AuthService(
+        MemoryAuthStore(),
+        AccessTokenIssuer(Keyring((SigningKey("k1", "x" * 40),))),
+        config=AuthConfig(password_policy=FAST, require_verified_email=True),
+        hasher=PasswordHasher(FAST),
+        sender=RecordingEmailSender(),
+        provisioner=lambda identity: ensure_workspace(
+            services, identity.identity_id, identity.email,
+        ),
+    )
+    return TestClient(create_app(services)), services
+
+
+class OnboardingTest(unittest.TestCase):
+    """Signup to a usable workspace, over HTTP only."""
+
+    def setUp(self) -> None:
+        self.client, self.services = build_self_service()
+        self.addCleanup(self.services.close)
+
+    # -- helpers -----------------------------------------------------------
+
+    def sign_up(self, email: str) -> None:
+        response = self.client.post(
+            "/api/v1/auth/signup",
+            json={"email": email, "password": NEW_PASSWORD},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+    def verify(self, email: str) -> None:
+        link = self.services.auth.sender.links_for(email)[-1]
+        response = self.client.post(
+            "/api/v1/auth/verify", json={"token": link.split("token=")[1]}
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+    def log_in(self, email: str, password: str = NEW_PASSWORD):
+        response = self.client.post(
+            "/api/v1/auth/login", json={"email": email, "password": password},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()
+
+    def onboard(self, email: str = "founder@acme-corp.com"):
+        self.sign_up(email)
+        self.verify(email)
+        return self.log_in(email)
+
+    # -- the flow ----------------------------------------------------------
+
+    def test_signup_sends_a_verification_link(self) -> None:
+        """Not a recorded intention to send one — a link a person can click."""
+        self.sign_up("founder@acme-corp.com")
+        delivered = self.services.auth.sender.deliveries
+        self.assertTrue(delivered)
+        self.assertIn("token=", delivered[-1].link)
+
+    def test_the_verify_route_confirms_the_address(self) -> None:
+        """`verify_email` existed on the service with no way to reach it."""
+        self.sign_up("founder@acme-corp.com")
+        self.verify("founder@acme-corp.com")
+        identity = self.services.auth.store.identity_by_email(
+            "founder@acme-corp.com"
+        )
+        self.assertTrue(identity.verified)
+
+    def test_a_new_account_gets_a_workspace(self) -> None:
+        body = self.onboard()
+        self.assertTrue(body["tokens"]["tenant_id"])
+        self.assertEqual(len(body["memberships"]), 1)
+        self.assertEqual(body["memberships"][0]["role"], "owner")
+
+    def test_a_new_account_can_read_every_page(self) -> None:
+        """The regression. All seven answered 409 NO_WORKSPACE before."""
+        body = self.onboard()
+        headers = {"Authorization": f"Bearer {body['tokens']['access_token']}"}
+        for path in PAGES:
+            with self.subTest(path=path):
+                self.assertEqual(
+                    self.client.get(path, headers=headers).status_code, 200
+                )
+
+    def test_the_workspace_is_named_from_the_address(self) -> None:
+        body = self.onboard("founder@acme-corp.com")
+        self.assertEqual(body["memberships"][0]["tenant_name"], "Acme corp")
+
+    def test_provisioning_happens_once(self) -> None:
+        first = self.onboard()
+        second = self.log_in("founder@acme-corp.com")
+        self.assertEqual(
+            first["tokens"]["tenant_id"], second["tokens"]["tenant_id"]
+        )
+        self.assertEqual(len(second["memberships"]), 1)
+
+    def test_the_tenant_row_exists_in_the_application_store(self) -> None:
+        """The membership lives in the auth store; the tenant does not.
+
+        Separate roles write them, so a membership pointing at a tenant that
+        was never created is a real failure mode, and this is what catches it.
+        """
+
+        body = self.onboard()
+        tenant_id = body["tokens"]["tenant_id"]
+        with self.services.database.unit_of_work(tenant_id) as uow:
+            self.assertIsNotNone(uow.tenants.get(tenant_id))
+            users = list(uow.users.all())
+        self.assertEqual([user.role for user in users], ["owner"])
+
+    def test_an_account_with_no_workspace_is_repaired_at_login(self) -> None:
+        """Accounts made before provisioning existed must not stay broken."""
+        auth = self.services.auth
+        auth.provisioner = None
+        self.sign_up("stranded@acme-corp.com")
+        self.verify("stranded@acme-corp.com")
+        self.assertEqual(
+            self.log_in("stranded@acme-corp.com")["tokens"]["tenant_id"], ""
+        )
+
+        from clipforge.api.onboarding import ensure_workspace
+
+        auth.provisioner = lambda identity: ensure_workspace(
+            self.services, identity.identity_id, identity.email,
+        )
+        self.assertTrue(
+            self.log_in("stranded@acme-corp.com")["tokens"]["tenant_id"]
+        )
+
+    def test_a_suspended_member_is_not_given_a_private_tenant(self) -> None:
+        """Losing access must not silently hand someone an empty workspace."""
+        self.onboard()
+        identity = self.services.auth.store.identity_by_email(
+            "founder@acme-corp.com"
+        )
+        held = self.services.auth.store.memberships(identity.identity_id)[0]
+        held.active = False
+        self.services.auth.store.add_membership(held)
+
+        again = self.log_in("founder@acme-corp.com")
+        self.assertEqual(again["tokens"]["tenant_id"], "")
+        self.assertEqual(len(again["memberships"]), 1)
+
+    def test_a_failing_provisioner_does_not_break_the_login(self) -> None:
+        """Valid credentials must not be refused over a tenant row."""
+
+        def explode(identity):
+            raise RuntimeError("the application database is down")
+
+        self.services.auth.provisioner = explode
+        self.sign_up("unlucky@acme-corp.com")
+        self.verify("unlucky@acme-corp.com")
+        with self.assertLogs("clipforge.auth", level="ERROR"):
+            body = self.log_in("unlucky@acme-corp.com")
+        self.assertEqual(body["tokens"]["tenant_id"], "")
+
+    # -- password reset ----------------------------------------------------
+
+    def test_a_reset_link_can_be_redeemed(self) -> None:
+        """`reset-request` shipped without the endpoint that ends the flow."""
+        self.onboard()
+        self.assertEqual(
+            self.client.post(
+                "/api/v1/auth/password/reset-request",
+                json={"email": "founder@acme-corp.com"},
+            ).status_code,
+            200,
+        )
+        link = self.services.auth.sender.links_for("founder@acme-corp.com")[-1]
+        response = self.client.post(
+            "/api/v1/auth/password/reset",
+            json={"token": link.split("token=")[1],
+                  "new_password": "a-different-long-password-42"},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+        stale = self.client.post(
+            "/api/v1/auth/login",
+            json={"email": "founder@acme-corp.com", "password": NEW_PASSWORD},
+        )
+        self.assertEqual(stale.status_code, 401)
+        self.log_in("founder@acme-corp.com", "a-different-long-password-42")
+
+    def test_a_spent_reset_token_cannot_be_reused(self) -> None:
+        self.onboard()
+        self.client.post("/api/v1/auth/password/reset-request",
+                         json={"email": "founder@acme-corp.com"})
+        link = self.services.auth.sender.links_for("founder@acme-corp.com")[-1]
+        body = {"token": link.split("token=")[1],
+                "new_password": "a-different-long-password-42"}
+        self.assertEqual(
+            self.client.post("/api/v1/auth/password/reset",
+                             json=body).status_code, 200,
+        )
+        self.assertGreaterEqual(
+            self.client.post("/api/v1/auth/password/reset",
+                             json=body).status_code, 400,
+        )
+
+    def test_reset_does_not_reveal_whether_an_address_exists(self) -> None:
+        known = self.client.post("/api/v1/auth/password/reset-request",
+                                 json={"email": "founder@acme-corp.com"})
+        unknown = self.client.post("/api/v1/auth/password/reset-request",
+                                   json={"email": "nobody@nowhere.example"})
+        self.assertEqual(known.status_code, unknown.status_code)
+        self.assertEqual(known.json(), unknown.json())
+
+    def test_resend_does_not_reveal_whether_an_address_exists(self) -> None:
+        known = self.client.post("/api/v1/auth/verify/resend",
+                                 json={"email": "founder@acme-corp.com"})
+        unknown = self.client.post("/api/v1/auth/verify/resend",
+                                   json={"email": "nobody@nowhere.example"})
+        self.assertEqual(known.json(), unknown.json())
+
+    # -- account deletion --------------------------------------------------
+
+    def test_deletion_needs_the_password(self) -> None:
+        body = self.onboard()
+        headers = {"Authorization": f"Bearer {body['tokens']['access_token']}"}
+        wrong = self.client.post("/api/v1/auth/account/delete",
+                                 json={"password": "not-the-password"},
+                                 headers=headers)
+        self.assertEqual(wrong.status_code, 401)
+
+    def test_deletion_is_scheduled_and_cancelled_by_signing_in(self) -> None:
+        body = self.onboard()
+        headers = {"Authorization": f"Bearer {body['tokens']['access_token']}"}
+        response = self.client.post("/api/v1/auth/account/delete",
+                                    json={"password": NEW_PASSWORD},
+                                    headers=headers)
+        self.assertEqual(response.status_code, 200, response.text)
+
+        store = self.services.auth.store
+        self.assertEqual(
+            store.identity_by_email("founder@acme-corp.com").status.value,
+            "pending_deletion",
+        )
+        self.log_in("founder@acme-corp.com")
+        self.assertNotEqual(
+            store.identity_by_email("founder@acme-corp.com").status.value,
+            "pending_deletion",
+        )
+
+
+class WorkspaceNameTest(unittest.TestCase):
+    def test_a_company_domain_names_the_workspace(self) -> None:
+        from clipforge.api.onboarding import workspace_name
+
+        self.assertEqual(workspace_name("dana@acme-corp.com"), "Acme corp")
+
+    def test_a_free_mail_domain_falls_back_to_the_local_part(self) -> None:
+        """"Gmail" is not the name of anybody's company."""
+        from clipforge.api.onboarding import workspace_name
+
+        self.assertEqual(workspace_name("dana.smith@gmail.com"), "Dana smith")
+
+    def test_an_unusable_address_still_gets_a_name(self) -> None:
+        from clipforge.api.onboarding import workspace_name
+
+        self.assertEqual(workspace_name("@@@"), "My workspace")
+
+
+class EmailBackendTest(unittest.TestCase):
+    """What a deployment will actually do with a verification link."""
+
+    def setUp(self) -> None:
+        for name in ("CLIPFORGE_EMAIL_BACKEND", "CLIPFORGE_SMTP_HOST",
+                     "CLIPFORGE_EMAIL_FROM", "CLIPFORGE_SMTP_PORT"):
+            self.addCleanup(os.environ.pop, name, None)
+            os.environ.pop(name, None)
+
+    def test_the_default_delivers_nothing_and_says_so(self) -> None:
+        from clipforge.api.email_config import (
+            describe_sender, email_sender_from_env,
+        )
+
+        backend = describe_sender(email_sender_from_env())
+        self.assertEqual(backend.name, "recording")
+        self.assertFalse(backend.delivers)
+        self.assertIn("never delivered", backend.detail)
+
+    def test_smtp_without_a_host_refuses_rather_than_discarding_mail(self) -> None:
+        from clipforge.api.email_config import (
+            EmailConfigError, email_sender_from_env,
+        )
+
+        os.environ["CLIPFORGE_EMAIL_BACKEND"] = "smtp"
+        with self.assertRaises(EmailConfigError) as caught:
+            email_sender_from_env()
+        self.assertIn("CLIPFORGE_SMTP_HOST", str(caught.exception))
+
+    def test_smtp_without_a_from_address_refuses(self) -> None:
+        from clipforge.api.email_config import (
+            EmailConfigError, email_sender_from_env,
+        )
+
+        os.environ["CLIPFORGE_EMAIL_BACKEND"] = "smtp"
+        os.environ["CLIPFORGE_SMTP_HOST"] = "smtp.example.com"
+        with self.assertRaises(EmailConfigError):
+            email_sender_from_env()
+
+    def test_a_configured_smtp_backend_reports_itself_unproven(self) -> None:
+        from clipforge.api.email_config import (
+            describe_sender, email_sender_from_env,
+        )
+
+        os.environ["CLIPFORGE_EMAIL_BACKEND"] = "smtp"
+        os.environ["CLIPFORGE_SMTP_HOST"] = "smtp.example.com"
+        os.environ["CLIPFORGE_EMAIL_FROM"] = "no-reply@example.com"
+        backend = describe_sender(email_sender_from_env())
+        self.assertEqual(backend.name, "smtp")
+        self.assertTrue(backend.delivers)
+        self.assertIn("no message has been accepted", backend.detail)
+
+    def test_console_is_honest_about_delivering_to_nobody(self) -> None:
+        from clipforge.api.email_config import (
+            describe_sender, email_sender_from_env,
+        )
+
+        os.environ["CLIPFORGE_EMAIL_BACKEND"] = "console"
+        self.assertFalse(describe_sender(email_sender_from_env()).delivers)
+
+    def test_an_unknown_backend_is_refused(self) -> None:
+        from clipforge.api.email_config import (
+            EmailConfigError, email_sender_from_env,
+        )
+
+        os.environ["CLIPFORGE_EMAIL_BACKEND"] = "carrier-pigeon"
+        with self.assertRaises(EmailConfigError):
+            email_sender_from_env()
+
+
 if __name__ == "__main__":
     unittest.main()

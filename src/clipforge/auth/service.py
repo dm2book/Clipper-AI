@@ -35,6 +35,7 @@ refresh token outlives the reset.
 
 from __future__ import annotations
 
+import logging
 import threading
 import uuid
 from dataclasses import dataclass
@@ -62,6 +63,8 @@ from .types import (
     normalise_email,
     utcnow,
 )
+
+log = logging.getLogger("clipforge.auth")
 
 __all__ = ["AuthService", "SignUpResult", "LoginResult"]
 
@@ -102,6 +105,7 @@ class AuthService:
         hasher: PasswordHasher | None = None,
         sender: Any | None = None,
         clock: Callable[[], datetime] = utcnow,
+        provisioner: Callable[[Identity], None] | None = None,
     ) -> None:
         self.store = store
         self.issuer = issuer
@@ -109,6 +113,16 @@ class AuthService:
         self.hasher = hasher or PasswordHasher(self.config.password_policy)
         self.sender = sender or email_mod.RecordingEmailSender()
         self.clock = clock
+        #: Called during login when an authenticated identity turns out to
+        #: have no live membership, and given one chance to create one.
+        #:
+        #: A callback rather than a database handle, because tenants live in
+        #: the application schema behind `clipforge_app` while this service
+        #: connects as `clipforge_auth` — a role scoped to the five `auth_*`
+        #: tables precisely so the request path cannot reach a password hash.
+        #: Handing this object an application connection would undo that.
+        #: `api.onboarding.ensure_workspace` is what fills it in.
+        self.provisioner = provisioner
         #: Serialises refresh rotation per session. Two tabs refreshing at the
         #: same instant is ordinary, and without this one of them reads the
         #: pre-rotation row and both write, leaving two live tokens.
@@ -304,6 +318,27 @@ class AuthService:
 
         self._clear_limit("login_email", address)
         memberships = self.store.memberships(identity.identity_id)
+
+        # A verified person with nowhere to work. Provisioning happens here,
+        # at first sign-in, rather than at signup: an address that registers
+        # and never returns then leaves no tenant row behind, and there is one
+        # code path instead of two. It also repairs accounts created before
+        # workspaces were provisioned at all.
+        if not tenant_id and not any(m.active for m in memberships):
+            if self.provisioner is not None:
+                try:
+                    self.provisioner(identity)
+                except Exception:                           # noqa: BLE001
+                    # Never fail a login over this. The credentials were
+                    # valid; the session is simply workspace-less, which the
+                    # API already handles and reports.
+                    log.exception(
+                        "provisioning a workspace failed for identity %s",
+                        identity.identity_id,
+                    )
+                else:
+                    memberships = self.store.memberships(identity.identity_id)
+
         chosen = self._choose_membership(memberships, tenant_id)
 
         tokens = self._start_session(
@@ -635,6 +670,40 @@ class AuthService:
                     identity_id=identity.identity_id, email=identity.email,
                     ip=ip)
         self._send(email_mod.password_changed_email(identity.email))
+        return identity
+
+    def check_password(
+        self, identity_id: str, password: str, *, ip: str = "",
+    ) -> Identity:
+        """Re-verify the password of an already-authenticated identity.
+
+        For the actions that need a second proof of presence — deleting an
+        account, and anything else added later with no undo. Rate limited on
+        the same bucket as `change_password`, because an endpoint that
+        confirms a password without a limit is a password oracle for anyone
+        who has stolen a session.
+
+        Split out rather than reusing `change_password` with the same value
+        twice: that path rejects an unchanged password with
+        `PASSWORD_UNCHANGED`, so the "correct password" case failed and the
+        wrong one returned 403 where the caller wanted 401. Two different
+        questions deserve two methods.
+        """
+
+        now = self.clock()
+        self._limit("change_password", identity_id, now, ip=ip)
+
+        identity = self.store.identity(identity_id)
+        if identity is None:
+            raise AuthError("NOT_FOUND", "No such account.", status=404)
+        if not self.hasher.verify(password, identity.password_hash):
+            self._audit(EventKind.LOGIN_FAILED, identity_id=identity_id,
+                        email=identity.email, ip=ip, succeeded=False,
+                        detail="password re-check failed")
+            raise AuthError(
+                "INVALID_CREDENTIALS", "That password is not correct.",
+                status=401,
+            )
         return identity
 
     def change_password(

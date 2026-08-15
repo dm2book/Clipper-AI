@@ -1,4 +1,5 @@
 import { useState, type FormEvent } from "react";
+import { Link } from "react-router-dom";
 import { useAuth } from "../api/auth";
 import { ApiError } from "../api/client";
 import { Notice } from "../components/ui";
@@ -74,6 +75,12 @@ export function Login() {
                 disabled={busy} type="submit">
           {busy ? "Signing in…" : "Sign in"}
         </button>
+
+        <p className="small faint" style={{ marginTop: 16 }}>
+          <Link to="/signup">Create an account</Link>
+          {" · "}
+          <Link to="/forgot">Forgot your password?</Link>
+        </p>
       </form>
     </div>
   );

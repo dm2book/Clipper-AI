@@ -117,16 +117,12 @@ def _capabilities(context: ContextDep) -> list[CapabilityOut]:
         ),
     ))
 
-    sender = type(getattr(services.auth, "sender", None)).__name__
-    sends_mail = sender not in ("RecordingEmailSender", "NoneType",
-                                "ConsoleEmailSender")
+    from ..email_config import describe_sender
+
+    backend = describe_sender(getattr(services.auth, "sender", None))
     checks.append(CapabilityOut(
-        key="email", label="Email delivery", available=sends_mail,
-        detail=(
-            "configured" if sends_mail else
-            "No transport wired up. Verification and reset links are recorded, "
-            "not delivered, so a new user never receives one."
-        ),
+        key="email", label="Email delivery", available=backend.delivers,
+        detail=backend.detail,
     ))
 
     checks.append(CapabilityOut(

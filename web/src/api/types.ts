@@ -6,7 +6,7 @@
  * makes the types agree with nothing.
  *
  * Source: /workspace/clipper-ai/openapi.json
- * Schemas: 35
+ * Schemas: 40
  */
 
 export interface ActivityOut {
@@ -66,6 +66,16 @@ export interface ChannelOut {
 export interface ChannelStateUpdate {
   /** draft, active or paused */
   state: string;
+}
+
+/** Deleting an account asks for the password again. */
+export interface DeleteAccountRequest {
+  password: string;
+}
+
+/** An address and nothing else. */
+export interface EmailRequest {
+  email: string;
 }
 
 export interface ErrorBody {
@@ -156,6 +166,11 @@ export interface PageUploadOut {
   total: number;
   limit: number;
   offset: number;
+}
+
+export interface PasswordResetRequest {
+  token: string;
+  new_password: string;
 }
 
 /** One stage of acquisition → transcription → clips → uploads. */
@@ -270,6 +285,21 @@ export interface StatOut {
   unit?: string;
 }
 
+/** What this workspace is storing, and what the backend is doing. */
+export interface StorageUsageOut {
+  backend: string;
+  objects?: number | null;
+  bytes?: number | null;
+  gigabytes?: number | null;
+  largest_key?: string;
+  largest_bytes?: number | null;
+  operations?: Record<string, Record<string, number>>;
+  total_calls?: number;
+  total_failures?: number;
+  total_retries?: number;
+  note?: string;
+}
+
 export interface SubmitSourceRequest {
   url: string;
   channel_id?: string;
@@ -301,4 +331,8 @@ export interface UploadOut {
   remote_post_id?: string;
   published_at?: string | null;
   clip_id?: string | null;
+}
+
+export interface VerifyEmailRequest {
+  token: string;
 }
