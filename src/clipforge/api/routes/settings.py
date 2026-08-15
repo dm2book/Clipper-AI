@@ -17,6 +17,7 @@ from ..schemas import (
     SessionOut,
     SettingsResponse,
     SocialAccountOut,
+    StorageUsageOut,
 )
 
 router = APIRouter(prefix="/settings", tags=["settings"])
@@ -158,6 +159,56 @@ def _capabilities(context: ContextDep) -> list[CapabilityOut]:
     return checks
 
 
+@router.get("/storage", response_model=StorageUsageOut)
+async def storage_usage(context: ContextDep) -> StorageUsageOut:
+    """How much this workspace is storing, and how the backend is behaving.
+
+    Scoped to the caller's own prefix — `usage()` is a full listing, so an
+    unscoped call would walk every tenant's objects and bill the caller for
+    the privilege. Operation counters are process-wide because that is what
+    they measure; they say nothing about any one tenant's data.
+    """
+
+    storage = context.services.storage
+    if storage is None:
+        return StorageUsageOut(
+            backend="none",
+            note=(
+                "No storage backend is configured, so media stays on whichever "
+                "worker downloaded it and is lost when that container is "
+                "replaced."
+            ),
+        )
+
+    metrics = storage.metrics.snapshot()
+    report = StorageUsageOut(
+        backend=storage.backend,
+        operations={
+            name: {k: float(v) for k, v in stats.items()}
+            for name, stats in metrics["operations"].items()
+        },
+        total_calls=int(metrics["total"]["calls"]),
+        total_failures=int(metrics["total"]["failures"]),
+        total_retries=int(metrics["total"]["retries"]),
+    )
+
+    try:
+        usage = storage.usage(f"{context.tenant_id}/")
+    except Exception as error:                              # noqa: BLE001
+        # Null rather than zero. "Could not measure" and "you are storing
+        # nothing" are different answers and the second is a lie.
+        report.note = f"Usage could not be measured: {error}"
+        return report
+
+    largest = usage.get("largest") or {}
+    report.objects = usage["objects"]
+    report.bytes = usage["bytes"]
+    report.gigabytes = usage["gigabytes"]
+    report.largest_key = largest.get("key", "")
+    report.largest_bytes = largest.get("size_bytes")
+    return report
+
+
 def _storage_capability(services) -> CapabilityOut:
     """Whether media survives the container it was downloaded onto."""
 
@@ -204,9 +255,13 @@ def _public_url_capability(services) -> CapabilityOut:
     try:
         storage.public_url("probe/capability-check")
     except Exception as error:                              # noqa: BLE001
+        # Whole message, not the first sentence. The reason this matters —
+        # that Instagram fetches media itself and cannot present a signature —
+        # is in the second one, and truncating leaves an operator with
+        # "no public URL" and nothing to act on.
         return CapabilityOut(
             key="public_media_urls", label="Public media URLs",
-            available=False, detail=str(error).split(".")[0] + ".",
+            available=False, detail=" ".join(str(error).split()),
         )
     return CapabilityOut(
         key="public_media_urls", label="Public media URLs", available=True,

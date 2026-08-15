@@ -568,6 +568,270 @@ class SweepTest(unittest.TestCase):
         self.assertTrue(os.path.exists(other), "swept a directory it did not own")
 
 
+class RenderStorageTest(unittest.TestCase):
+    """The render engine's hand-off to durable storage.
+
+    A finished clip that exists only on the container that encoded it is a
+    clip Instagram cannot fetch and a deploy can delete, so this is the point
+    where the render becomes real.
+    """
+
+    server = None
+    port = 5012
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        import logging
+
+        logging.getLogger("werkzeug").setLevel(logging.ERROR)
+        cls.server = _moto()(port=cls.port, verbose=False)
+        cls.server.start()
+        time.sleep(0.6)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        if cls.server is not None:
+            cls.server.stop()
+
+    def setUp(self) -> None:
+        import boto3
+
+        self.scratch = tempfile.mkdtemp(prefix="clipforge-rs-")
+        self.addCleanup(shutil.rmtree, self.scratch, ignore_errors=True)
+        endpoint = f"http://127.0.0.1:{self.port}"
+        bucket = f"renders-{int(time.time() * 1000) % 100000}"
+        boto3.client(
+            "s3", endpoint_url=endpoint, aws_access_key_id="k",
+            aws_secret_access_key="s", region_name="us-east-1",
+        ).create_bucket(Bucket=bucket)
+        self.storage = R2Storage(R2Config(
+            bucket=bucket, endpoint_url=endpoint, access_key_id="k",
+            secret_access_key="s",
+            public_base_url="https://media.clipforge.test",
+            max_attempts=2, backoff_s=0.01,
+        ))
+
+    def _result(self):
+        from clipforge.render.types import RenderResult, RenderState
+
+        output = os.path.join(self.scratch, "clip.mp4")
+        with open(output, "wb") as handle:
+            handle.write(b"\x00" * 4096)
+        return RenderResult(
+            render_id="rnd_1", state=RenderState.READY, output_path=output,
+        )
+
+    def _engine(self, storage):
+        from clipforge.render import RenderConfig, RenderEngine
+        from clipforge.store import MemoryDatabase, TenantRecord
+
+        database = MemoryDatabase()
+        with database.unit_of_work(TENANT) as uow:
+            uow.tenants.save(TenantRecord(id=TENANT, name="A"))
+        return RenderEngine(
+            database, TENANT,
+            config=RenderConfig(workspace=self.scratch), storage=storage,
+        )
+
+    def test_a_finished_clip_is_uploaded_and_gets_a_public_url(self) -> None:
+        from clipforge.render.types import RenderRequest
+
+        engine = self._engine(self.storage)
+        result = self._result()
+        engine._store(
+            RenderRequest(render_id="rnd_1", plan=None, speaker_path="",
+                          output_path=result.output_path, clip_id="cl_1"),
+            result,
+        )
+
+        self.assertTrue(result.storage_ref.startswith("r2://"))
+        self.assertIn("ten_a/renders/cl_1/", result.storage_ref)
+        # The whole reason R2 is here: Instagram fetches the file itself and
+        # cannot present a signature.
+        self.assertEqual(
+            result.public_url,
+            f"https://media.clipforge.test/{StorageRef.parse(result.storage_ref).key}",
+        )
+        self.assertTrue(
+            self.storage.exists(StorageRef.parse(result.storage_ref).key)
+        )
+
+    def test_no_public_domain_leaves_the_url_empty_rather_than_guessing(self) -> None:
+        """TikTok and YouTube publish fine without one. A guessed URL would
+        pass the scheduler and then 404 inside Meta's fetcher."""
+
+        from clipforge.render.types import RenderRequest
+
+        self.storage.config.public_base_url = ""
+        engine = self._engine(self.storage)
+        result = self._result()
+        engine._store(
+            RenderRequest(render_id="rnd_2", plan=None, speaker_path="",
+                          output_path=result.output_path, clip_id="cl_2"),
+            result,
+        )
+
+        self.assertTrue(result.storage_ref)
+        self.assertEqual(result.public_url, "")
+
+    def test_an_upload_failure_does_not_fail_the_render(self) -> None:
+        """The encode is the expensive part and it succeeded. The file is
+        still on disk and the backfill will pick it up."""
+
+        from clipforge.render.types import RenderRequest
+
+        def broken(*args, **kwargs):
+            raise ConnectionError("R2 unreachable")
+
+        self.storage.client.upload_file = broken
+        engine = self._engine(self.storage)
+        result = self._result()
+        engine._store(
+            RenderRequest(render_id="rnd_3", plan=None, speaker_path="",
+                          output_path=result.output_path, clip_id="cl_3"),
+            result,
+        )
+
+        self.assertEqual(result.storage_ref, "")
+        self.assertIn("stored locally only", result.error)
+        self.assertTrue(os.path.exists(result.output_path))
+
+    def test_no_storage_configured_is_a_no_op(self) -> None:
+        from clipforge.render.types import RenderRequest
+
+        engine = self._engine(None)
+        result = self._result()
+        engine._store(
+            RenderRequest(render_id="rnd_4", plan=None, speaker_path="",
+                          output_path=result.output_path, clip_id="cl_4"),
+            result,
+        )
+        self.assertEqual(result.storage_ref, "")
+        self.assertEqual(result.error, "")
+
+
+class FabricatedUrlTest(unittest.TestCase):
+    def test_the_factory_no_longer_invents_a_public_url(self) -> None:
+        """It used to emit `https://cdn.clipforge.test/<item>.mp4` for a clip
+        that had not been rendered. That passes the scheduler's check and then
+        fails inside Meta's fetcher, which reports "media could not be
+        downloaded" and names neither the URL nor this system."""
+
+        from clipforge.factory.pipeline import PipelineConfig
+
+        self.assertEqual(PipelineConfig().cdn_base, "")
+
+
+class MigrateTest(unittest.TestCase):
+    """Backfilling rows written before object storage existed."""
+
+    def setUp(self) -> None:
+        self.scratch = tempfile.mkdtemp(prefix="clipforge-mg-")
+        self.addCleanup(shutil.rmtree, self.scratch, ignore_errors=True)
+        self.storage = LocalStorage(
+            root=tempfile.mkdtemp(prefix="clipforge-mgs-")
+        )
+
+    def _database(self, paths):
+        from clipforge.store import (
+            AcquisitionRunRecord, MemoryDatabase, TenantRecord,
+        )
+
+        database = MemoryDatabase()
+        with database.unit_of_work(TENANT) as uow:
+            uow.tenants.save(TenantRecord(id=TENANT, name="A"))
+            for index, path in enumerate(paths):
+                uow.acquisitions.save(AcquisitionRunRecord(
+                    id=f"acq_{index}", tenant_id=TENANT,
+                    source_id=f"src_{index}", kind="media_url",
+                    ref_key=f"src_{index}", state="ready", media_path=path,
+                ))
+        return database
+
+    def _file(self, name: str) -> str:
+        path = os.path.join(self.scratch, name)
+        with open(path, "wb") as handle:
+            handle.write(b"x" * 512)
+        return path
+
+    def test_local_rows_are_uploaded_and_rewritten(self) -> None:
+        from clipforge.storage.migrate import backfill
+
+        database = self._database([self._file("a.mp4"), self._file("b.mp4")])
+        report = backfill(database, self.storage, TENANT)
+
+        self.assertEqual(report.uploaded, 2)
+        self.assertEqual(report.bytes_moved, 1024)
+        with database.unit_of_work(TENANT) as uow:
+            for run in uow.acquisitions.all():
+                self.assertFalse(StorageRef.parse(run.media_path).local)
+
+    def test_a_second_run_changes_nothing(self) -> None:
+        """Idempotent, so an interrupted backfill is resumed by running it
+        again rather than by working out where it stopped."""
+
+        from clipforge.storage.migrate import backfill
+
+        database = self._database([self._file("a.mp4")])
+        backfill(database, self.storage, TENANT)
+        second = backfill(database, self.storage, TENANT)
+
+        self.assertEqual(second.uploaded, 0)
+        self.assertEqual(second.already_remote, 1)
+
+    def test_a_missing_file_is_counted_not_fatal(self) -> None:
+        from clipforge.storage.migrate import backfill
+
+        database = self._database(["/gone/forever.mp4", self._file("a.mp4")])
+        report = backfill(database, self.storage, TENANT)
+
+        self.assertEqual(report.missing, 1)
+        self.assertEqual(report.uploaded, 1)
+
+    def test_a_dry_run_uploads_nothing(self) -> None:
+        from clipforge.storage.migrate import backfill
+
+        database = self._database([self._file("a.mp4")])
+        report = backfill(database, self.storage, TENANT, dry_run=True)
+
+        self.assertEqual(report.uploaded, 1)
+        self.assertEqual(len(list(self.storage.list(""))), 0)
+        with database.unit_of_work(TENANT) as uow:
+            self.assertTrue(
+                StorageRef.parse(uow.acquisitions.all()[0].media_path).local
+            )
+
+    def test_the_local_file_survives_unless_asked(self) -> None:
+        """An upload is verifiable; a delete is not reversible."""
+
+        from clipforge.storage.migrate import backfill
+
+        path = self._file("a.mp4")
+        database = self._database([path])
+        backfill(database, self.storage, TENANT)
+        self.assertTrue(os.path.exists(path))
+
+    def test_verify_finds_a_ref_that_resolves_to_nothing(self) -> None:
+        """Invisible until a job tries to use it, which is usually days later
+        and reads as a transcription failure."""
+
+        from clipforge.storage.migrate import backfill, verify
+
+        database = self._database([self._file("a.mp4")])
+        backfill(database, self.storage, TENANT)
+
+        report = verify(self.storage, database, TENANT)
+        self.assertEqual(report["resolved"], 1)
+        self.assertEqual(report["missing_count"], 0)
+
+        with database.unit_of_work(TENANT) as uow:
+            run = uow.acquisitions.all()[0]
+            self.storage.delete(StorageRef.parse(run.media_path).key)
+
+        after = verify(self.storage, database, TENANT)
+        self.assertEqual(after["missing_count"], 1)
+
+
 class RefTest(unittest.TestCase):
     def test_both_forms_parse(self) -> None:
         remote = StorageRef.parse("r2://media/ten_a/sources/x/media.mp4")

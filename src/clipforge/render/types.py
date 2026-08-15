@@ -121,6 +121,14 @@ class RenderResult:
     attempts: int = 0
     error: str = ""
     video_id: str = ""
+    #: Where the finished clip durably lives, as `r2://bucket/key`. Empty when
+    #: no storage is configured, in which case `output_path` on whichever
+    #: container ran the render is the only copy.
+    storage_ref: str = ""
+    #: The unsigned URL Instagram fetches from. Empty unless the object is
+    #: really there and the bucket really has a public domain — a fabricated
+    #: one fails at Meta's fetcher with an error naming neither.
+    public_url: str = ""
     finished_at: datetime | None = field(default=None)
 
     @property

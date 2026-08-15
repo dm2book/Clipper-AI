@@ -186,8 +186,18 @@ class PipelineConfig:
     hook_count: int = 20
     #: Base CTR the hook estimate is projected onto, for legibility only.
     baseline_ctr: float = 5.0
-    #: Where rendered files are published from. Instagram needs a public URL.
-    cdn_base: str = "https://cdn.clipforge.test"
+    #: Where rendered files are published from, when a render already exists.
+    #:
+    #: Empty by default, and deliberately so. This stage runs *before* the
+    #: clip is rendered, so there is no object to point at yet — and a
+    #: fabricated URL is worse than none: it passes the scheduler's check and
+    #: then 404s inside Meta's fetcher, which reports it as "media could not
+    #: be downloaded" and sends the next person to debug Instagram.
+    #:
+    #: An empty `public_url` makes the scheduler refuse an Instagram post at
+    #: booking time with a message naming the cause. `render.RenderEngine`
+    #: fills the real URL in once the clip is actually in storage.
+    cdn_base: str = ""
 
 
 class Pipeline:
@@ -564,7 +574,13 @@ class Pipeline:
         asset = MediaAsset(
             asset_id=item.item_id,
             path=f"/renders/{item.item_id}.mp4",
-            public_url=f"{self.config.cdn_base}/{item.item_id}.mp4",
+            # Only when a base is configured. See `cdn_base` above: an
+            # invented URL for an object that does not exist yet is the
+            # failure this stage used to ship.
+            public_url=(
+                f"{self.config.cdn_base.rstrip('/')}/{item.item_id}.mp4"
+                if self.config.cdn_base else ""
+            ),
             size_bytes=int(duration * 0.7 * 1024**2),
             duration_s=duration,
             width=1080, height=1920, fps=60,

@@ -351,6 +351,27 @@ class CapabilityOut(BaseModel):
     detail: str = ""
 
 
+class StorageUsageOut(BaseModel):
+    """What this workspace is storing, and what the backend is doing."""
+
+    backend: str
+    #: Null when the backend cannot answer cheaply or is not configured.
+    objects: int | None = None
+    bytes: int | None = None
+    gigabytes: float | None = None
+    largest_key: str = ""
+    largest_bytes: int | None = None
+    #: Per-operation counters since the process started. Reset on restart,
+    #: which is right for what they are — an exporter scrapes them.
+    operations: dict[str, dict[str, float]] = Field(default_factory=dict)
+    total_calls: int = 0
+    total_failures: int = 0
+    total_retries: int = 0
+    #: Set when usage could not be measured, so the UI says why rather than
+    #: rendering a zero that reads as "you are storing nothing".
+    note: str = ""
+
+
 class SettingsResponse(BaseModel):
     identity_id: str
     email: str

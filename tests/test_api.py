@@ -20,6 +20,7 @@ has to branch on three shapes gets two of them wrong.
 
 from __future__ import annotations
 
+import os
 import unittest
 from datetime import UTC, datetime, timedelta
 
@@ -470,6 +471,82 @@ class PageDataTest(ApiTest):
         current = [s for s in body["sessions"] if s["current"]]
         self.assertEqual(len(current), 1)
         self.assertNotIn("token_hash", body["sessions"][0])
+
+
+class StorageEndpointTest(ApiTest):
+    def test_no_backend_says_so_rather_than_reporting_zero(self) -> None:
+        """Zero bytes reads as "you are storing nothing", which is a different
+        claim from "nothing is measuring"."""
+
+        body = self.get("/api/v1/settings/storage").json()
+        self.assertEqual(body["backend"], "none")
+        self.assertIsNone(body["objects"])
+        self.assertIn("lost when that container is replaced", body["note"])
+
+    def test_usage_is_scoped_to_the_callers_prefix(self) -> None:
+        """`usage()` is a full listing, so an unscoped call would walk every
+        tenant's objects and bill the caller for the privilege."""
+
+        import tempfile
+
+        from clipforge.storage import LocalStorage, key_for
+
+        root = tempfile.mkdtemp(prefix="clipforge-apis-")
+        storage = LocalStorage(root=root)
+        self.services.storage = storage
+
+        payload = os.path.join(root, "src.bin")
+        with open(payload, "wb") as handle:
+            handle.write(b"x" * 300)
+        storage.put_file(key_for("ten_a", "renders", "cl_1", "a.mp4"), payload)
+        storage.put_file(key_for("ten_other", "renders", "cl_2", "b.mp4"), payload)
+
+        body = self.get("/api/v1/settings/storage").json()
+        self.assertEqual(body["backend"], "local")
+        self.assertEqual(body["objects"], 1, "counted another tenant's objects")
+        self.assertEqual(body["bytes"], 300)
+
+    def test_operation_counters_are_reported(self) -> None:
+        import tempfile
+
+        from clipforge.storage import LocalStorage, key_for
+
+        root = tempfile.mkdtemp(prefix="clipforge-apim-")
+        storage = LocalStorage(root=root)
+        self.services.storage = storage
+        payload = os.path.join(root, "src.bin")
+        with open(payload, "wb") as handle:
+            handle.write(b"y" * 64)
+        storage.put_file(key_for("ten_a", "renders", "cl_1", "a.mp4"), payload)
+
+        body = self.get("/api/v1/settings/storage").json()
+        self.assertGreater(body["total_calls"], 0)
+        self.assertEqual(body["total_failures"], 0)
+        self.assertIn("put_file", body["operations"])
+
+    def test_the_endpoint_needs_authentication(self) -> None:
+        self.assertEqual(
+            self.client.get("/api/v1/settings/storage").status_code, 401
+        )
+
+    def test_capabilities_name_the_storage_backend(self) -> None:
+        import tempfile
+
+        from clipforge.storage import LocalStorage
+
+        self.services.storage = LocalStorage(
+            root=tempfile.mkdtemp(prefix="clipforge-apic-")
+        )
+        capabilities = {
+            c["key"]: c for c in self.get("/api/v1/settings").json()["capabilities"]
+        }
+        self.assertFalse(capabilities["object_storage"]["available"])
+        self.assertIn("container is replaced",
+                      capabilities["object_storage"]["detail"])
+        # Broken out from object storage because they fail independently: R2
+        # can work perfectly while the bucket has no public domain.
+        self.assertFalse(capabilities["public_media_urls"]["available"])
+        self.assertIn("Instagram", capabilities["public_media_urls"]["detail"])
 
 
 class MutationTest(ApiTest):

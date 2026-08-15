@@ -112,11 +112,16 @@ class RenderEngine:
         clock: Callable[[], datetime] = utcnow,
         runner: Callable[[Sequence[str], float], subprocess.CompletedProcess] | None = None,
         plan_loader: Callable[[dict], Any] | None = None,
+        storage: Any | None = None,
     ) -> None:
         if not tenant_id:
             raise ValueError("rendering needs a tenant")
         self.database = database
         self.tenant_id = tenant_id
+        #: Durable storage for finished clips. Without it the render exists
+        #: only on the container that produced it, and Instagram — which
+        #: fetches the file itself — cannot publish it at all.
+        self.storage = storage
         self.config = config or RenderConfig()
         self.ffmpeg = self.config.ffmpeg or find_ffmpeg()
         self.prober = prober or MediaProber(ffmpeg=self.ffmpeg or None)
@@ -329,7 +334,40 @@ class RenderEngine:
         result.finished_at = self.clock()
         if plan.duration_s:
             result.realtime_ratio = result.elapsed_s / plan.duration_s
+        self._store(request, result)
         return result
+
+    def _store(self, request: RenderRequest, result: RenderResult) -> None:
+        """Upload the finished clip and record where it went.
+
+        A failure here does not fail the render. The encode is the expensive
+        part and it succeeded; the file is still on disk and
+        `storage.migrate.backfill` will pick it up. What is *not* done is
+        pretending it worked — `storage_ref` stays empty, so anything that
+        needs a durable copy can tell.
+        """
+
+        if self.storage is None:
+            return
+        clip_id = request.clip_id or request.render_id
+        try:
+            from ..storage.migrate import store_render
+
+            ref = store_render(
+                self.storage, self.tenant_id, clip_id, result.output_path
+            )
+            result.storage_ref = str(ref)
+        except Exception as error:                          # noqa: BLE001
+            result.error = result.error or f"stored locally only: {error}"
+            return
+
+        try:
+            result.public_url = self.storage.public_url(ref.key)
+        except Exception:                                   # noqa: BLE001
+            # No public domain on the bucket. TikTok and YouTube are fine
+            # without one; Instagram is not, and the capability list says so
+            # rather than this failing a render that is otherwise complete.
+            result.public_url = ""
 
     def _preflight(self, request: RenderRequest) -> None:
         """Check the plan against the media it will be applied to.

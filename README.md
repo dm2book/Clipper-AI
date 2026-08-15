@@ -66,8 +66,9 @@ with no live transport.
   from the API's OpenAPI document. No mock data anywhere in it.
 - **Media storage** (`src/clipforge/storage/`) — Cloudflare R2 over boto3, with
   a local backend behind the same interface: tenant-scoped keys, signed URLs,
-  the public URLs Instagram needs, lifecycle rules, retries and metrics. No
-  byte has reached Cloudflare from here — see below.
+  the public URLs Instagram needs, lifecycle rules, retries and metrics. Both
+  producers write through it — acquisition's download and the render's finished
+  clip. No byte has reached Cloudflare from here — see below.
 
 ## Quick start
 
@@ -2107,10 +2108,12 @@ hid them would show an upload queue that never drains and give no clue why.
 
 ### Verified
 
-`tests/test_api.py` — 39 tests over the real ASGI stack with real signed
+`tests/test_api.py` — 44 tests over the real ASGI stack with real signed
 tokens: authentication on every endpoint, cross-tenant reads and writes, role
 enforcement, the error envelope, pagination bounds, and that a validation error
-never echoes the password it rejected.
+never echoes the password it rejected. The storage endpoint is covered for the
+no-backend case, tenant-scoped usage, the operation counters, and that its
+capability entries name which backend answered.
 
 The dashboard was driven in a real Chromium against the running API and live
 PostgreSQL: all seven pages rendered real rows, 25 API calls, no non-2xx, no
@@ -2167,6 +2170,30 @@ Anything on local disk after a job finishes is a bug. `sweep()` finds it, and
 it exists because a worker killed mid-job — a reclaimed spot instance, an OOM,
 a deploy — never reaches its cleanup.
 
+Both producers of media are wired to it. Acquisition stores its download, and
+`RenderEngine` stores the finished clip once ffmpeg's output has been verified
+— after, not before, because storing a file that failed verification puts a
+broken clip somewhere durable and pays to keep it there. A storage failure does
+not fail the render: the encode is the expensive part and it succeeded, so the
+file stays on disk and `backfill()` picks it up later. What it will not do is
+claim success — an empty `storage_ref` is how a caller that needs a durable
+copy can tell it does not have one.
+
+### A public URL is never invented
+
+`RenderResult.public_url` comes from `storage.public_url()` and is empty
+whenever the bucket has no configured domain. `PipelineConfig.cdn_base`
+defaulted to `https://cdn.clipforge.test` until the render path was wired; that
+default is now `""`.
+
+The reason is narrow and worth stating, because the fabricated default looked
+harmless. Instagram publishing is a fetch: Meta's servers retrieve the video
+from the URL supplied. A made-up URL passes every check on this side — it is a
+well-formed HTTPS URL ending in `.mp4` — and then fails inside Meta's fetcher,
+which reports a media error naming neither the URL nor this system. An empty
+`public_url` fails immediately, here, in `validate()`, with a message about
+configuration. The second failure costs an hour; the first has cost people days.
+
 ### Keys start with the tenant
 
 `ten_acme/renders/cl_123/clip.mp4`, and `key_for` is the only way to build one.
@@ -2219,13 +2246,29 @@ is broken; retries rising while failures stay flat means something is degraded
 and the retry budget is absorbing it — the state worth catching before it
 becomes the first.
 
+`GET /api/v1/settings/storage` returns them, alongside usage for the calling
+tenant's prefix only. Usage is `objects`, `bytes` and `gigabytes` as nullable
+fields with a `note` beside them: a listing can be refused or too expensive to
+walk, and a zero there reads as "you are storing nothing", which is a different
+and much more alarming statement than "this could not be measured".
+
 ### What is verified, and what is not
 
-`tests/test_storage.py` — 60 tests. One contract runs over both backends, and
+`tests/test_storage.py` — 71 tests. One contract runs over both backends, and
 the R2 side runs against a real S3 server (moto) over HTTP with real boto3:
 round trips, multipart above the threshold, presigned GET and PUT, prefix
 listing and deletion, usage, lifecycle configuration, the retry loop and the
-permanent/transient split.
+permanent/transient split. The render wiring is covered too — that a finished
+clip lands in storage, that the public URL is empty without a configured
+domain, and that an upload failure leaves the render successful with an empty
+`storage_ref` rather than a fabricated one. One test asserts
+`PipelineConfig().cdn_base == ""`, which is there to fail if anyone restores a
+plausible-looking default.
+
+End to end, with real ffmpeg and moto standing in for R2: a 4-second clip
+renders at 1080x1920 with audio, uploads to `r2://media/ten_a/renders/cl_1/
+clip.mp4`, the local file is deleted, the object is fetched back and probes
+identical, and the resulting `MediaAsset` passes Instagram's `validate()`.
 
 **No byte has reached Cloudflare.** `*.r2.cloudflarestorage.com` is refused by
 this environment's egress policy — a 403 to CONNECT — and there are no R2
