@@ -91,7 +91,13 @@ class AnalyticsEngine:
         store: AnalyticsStore | None = None,
     ) -> None:
         self.config = config or AnalyticsConfig()
-        self.store = store or AnalyticsStore()
+        # `is not None`, not `or`. `AnalyticsStore` defines `__len__`, so an
+        # *empty* store is falsy — and `store or AnalyticsStore()` therefore
+        # discarded a caller's durable store and substituted an in-memory one
+        # whenever it had no records yet, which is exactly the state a freshly
+        # constructed one is in. Every snapshot then went to memory and was
+        # lost at process exit, with the collection run reporting success.
+        self.store = store if store is not None else AnalyticsStore()
         self.baselines = Baselines()
 
     # -- ingest ------------------------------------------------------------------

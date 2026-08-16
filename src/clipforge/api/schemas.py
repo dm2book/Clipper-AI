@@ -480,6 +480,37 @@ class StorageUsageOut(BaseModel):
     note: str = ""
 
 
+class KindDepthOut(BaseModel):
+    kind: str
+    queued: int
+    leased: int
+    dead: int
+    oldest_queued_s: float | None = None
+
+
+class QueueHealthOut(BaseModel):
+    """What the work queue looks like right now.
+
+    `healthy` is a judgement rather than a raw number, because depth alone
+    cannot make one: a queue holding steady at forty jobs is fine if the
+    oldest is twenty seconds old and broken if it is four hours old.
+    """
+
+    tenant_id: str
+    at: datetime
+    queued: int
+    leased: int
+    dead: int
+    succeeded_recently: int
+    oldest_queued_s: float | None = None
+    #: Leases that expired without being reaped — a worker died, or none is
+    #: running. Invisible to both the queued count and the dead count.
+    stale_leases: int = 0
+    healthy: bool = True
+    by_kind: list[KindDepthOut] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+
+
 class SettingsResponse(BaseModel):
     identity_id: str
     email: str

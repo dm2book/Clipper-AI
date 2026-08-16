@@ -49,6 +49,10 @@ with no live transport.
   that was previously handed an empty track on every clip. GPU when there is
   one, CPU when there is not, and it says which. Validated on constructed
   videos, not on real footage — see below.
+- **Worker runtime** (`src/clipforge/worker/`) — the process that drains the
+  queue. Leased claims, heartbeats, retry with jittered backoff, a dead-letter
+  state, crash recovery through lease expiry, graceful shutdown, and idempotent
+  handlers for acquisition, transcription, render, publish and analytics.
 - **Rendering** (`src/clipforge/render/`) — executes the gameplay engine's
   filtergraph, burns captions in, and checks the output is what the plan
   asked for. Real 1080x1920 60fps MP4s.
@@ -1753,6 +1757,118 @@ the threshold. That is a rough map of what this detector is looking for.
 | `decode.py` | Sampled sequential frame reading, and honest timestamps. |
 | `tracking.py` | Association, occlusion, confirmation, salience. |
 | `engine.py` | Video in, `SpeakerTrack` out, fallbacks instead of exceptions. |
+
+## The worker runtime
+
+`jobs` always had everything a durable queue needs — leases, attempt counting
+in SQL, dedupe keys, `FOR UPDATE SKIP LOCKED`. What it did not have was
+anything that called it. The audit's four findings were one finding: no worker
+process existed, so no queue was drained, so nothing rendered and nothing
+published.
+
+```sh
+scripts/run-worker.sh --tenants ten_acme
+scripts/run-worker.sh --kinds render_video      # a render box
+scripts/queue.sh                                # depth, dead letters, health
+```
+
+### The lease is the crash-recovery mechanism
+
+A claim sets `lease_until`; a daemon thread extends it while the handler runs.
+Kill the process — OOM, a reclaimed spot instance, `kill -9` — and nothing
+extends it, so it expires and `reap()` returns the job to `queued`. **No
+cleanup path has to run on the way down**, which is the point: a recovery
+mechanism that depends on the crashed process doing something is not one.
+
+The consequence is at-least-once delivery, and it is not negotiable — the
+alternative is a job a crash loses for ever. So every handler is idempotent
+and each says how in its own docstring, never "it probably will not happen".
+
+Heartbeating is a thread rather than a callback because the jobs whose leases
+most need extending are exactly the ones blocked in something uninterruptible:
+ffmpeg on a 90-second render, a multipart upload, a model loading. If a beat
+comes back false the lease has been lost, and the runtime stops rather than
+racing — two workers writing the same render is what leases exist to prevent.
+
+### Three outcomes, not two
+
+`Done`, `Retry` and `Fatal`. Collapsing the last two means either retrying
+permanent failures eight times — burning a paid API call each round — or
+killing transient ones on the first blip. A handler that raises is treated as
+`Retry`: bounded by `max_attempts`, and the cost of killing a blip is a lost
+clip.
+
+Backoff is exponential **with jitter**. Without it a hundred jobs failed by one
+outage all retry at the same instant, hit the recovering service together and
+fail together, turning a brief outage into a sustained one.
+
+### The dead-letter queue is a state, not a table
+
+`jobs.state = 'dead'`, reached by exhausting `max_attempts` or by a `Fatal`.
+A separate table would need its own retention, access control and requeue
+path, to hold rows that already have all three. `scripts/queue.sh
+--requeue-dead` moves them back and **resets the attempt count** — a human
+requeues because the cause was fixed, and leaving the count at its ceiling
+sends the job straight back to dead on the first hiccup.
+
+### Monitoring reports four numbers, and depth is the least useful
+
+Depth alone cannot tell a busy queue from a stalled one. `GET
+/api/v1/settings/queue` also reports the **oldest queued age** (measured from
+`run_after`, so a deliberate retry is not counted as backlog), the **dead
+count**, and **stale leases** — jobs held by a worker that died, which are
+neither queued nor dead and are therefore invisible to every other count.
+`healthy` is a judgement so a dashboard does not have to invent one.
+
+### What a worker cannot do, it says
+
+`services_from_env` assembles whatever the host can actually do and records
+why for everything else. A render box with no publishing credentials runs
+renders and returns `Fatal` with a reason on a publish job — rather than
+refusing to start, or, far worse, draining publish jobs into nowhere and
+marking them done. `describe()` is logged on startup.
+
+### Testing it
+
+`tests/test_worker.py` — 32 tests in three layers. Queue mechanics on trivial
+handlers; each of the five handlers reporting *why* it cannot run; and an end
+to end that puts a real 6-second source through the runtime and asserts a real
+file comes out — measured at 1080x1920 by reading the MP4 header, not assumed.
+
+Crash recovery is tested by killing a worker mid-flight rather than asking it
+politely: a lease is taken and abandoned, reaped, and picked up by a second
+worker that completes it. A separate test steals a lease *while a handler
+runs* and asserts the losing worker records nothing.
+
+Writing these found three real bugs, two of them mine:
+
+- **`AnalyticsEngine` silently discarded a durable store.** `store or
+  AnalyticsStore()` — and `AnalyticsStore` defines `__len__`, so an *empty*
+  durable store is falsy. Every snapshot a worker collected would have gone to
+  memory and been lost, with the run reporting success. Now `is not None`.
+- **The render handler composed against the wrong source size.** With no face
+  tracker it passed a bare `SpeakerTrack()`, which defaults to 1920x1080 —
+  the exact defect fixed in the vision work, reintroduced. The renderer's
+  preflight caught it, which is what that preflight is for.
+- **Media path was read from the wrong record.** `sources` has no
+  `media_path`; the downloaded path lives on `acquisition_runs`, because a
+  source can be known long before anything is fetched.
+
+**What this does not prove.** The end-to-end test covers source → clip →
+render with real ffmpeg. It does **not** cover publish reaching a platform:
+`CLIPFORGE_PUBLISH_TRANSPORT=http` builds the real client, and no credentials
+exist here, so a publish job in this environment returns `Fatal` naming the
+missing transport. Nor does it cover acquisition over the network or metric
+collection, which has no live source to collect from.
+
+| Module | Responsibility |
+|---|---|
+| `types.py` | What a handler is given and may answer. |
+| `runtime.py` | Claim, heartbeat, retry, reap, shut down cleanly. |
+| `handlers.py` | The five kinds, over the engines that already existed. |
+| `services.py` | What this host can do, and why not otherwise. |
+| `monitor.py` | Depth, oldest, dead letters, stale leases. |
+| `main.py` | The entrypoint. |
 
 ## Rendering
 

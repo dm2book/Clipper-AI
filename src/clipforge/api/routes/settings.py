@@ -13,6 +13,8 @@ from fastapi import APIRouter, Request
 
 from ..deps import ContextDep, LivePrincipalDep, PrincipalDep, _services
 from ..schemas import (
+    KindDepthOut,
+    QueueHealthOut,
     CapabilityOut,
     SessionOut,
     SettingsResponse,
@@ -153,6 +155,22 @@ def _capabilities(context: ContextDep) -> list[CapabilityOut]:
         ),
     ))
     return checks
+
+
+@router.get("/queue", response_model=QueueHealthOut)
+async def queue_health(context: ContextDep) -> QueueHealthOut:
+    """The work queue for this workspace.
+
+    On the settings router rather than its own because it answers the same
+    question the capability list does — "is this deployment actually able to
+    do the thing" — and a queue with work in it and no worker running is the
+    most common way the answer is no.
+    """
+
+    from ...worker.monitor import snapshot
+
+    payload = snapshot(context.services.database, context.tenant_id).to_dict()
+    return QueueHealthOut(**payload)
 
 
 @router.get("/storage", response_model=StorageUsageOut)

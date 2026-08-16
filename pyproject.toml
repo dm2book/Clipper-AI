@@ -57,6 +57,10 @@ vision = ["opencv-python-headless>=4.8", "numpy>=1.24"]
 
 [project.scripts]
 clipforge-api = "clipforge.api.server:main"
+# A separate process from the API on purpose. They fail and scale differently:
+# an API pod is memory-light and latency-sensitive, a render worker holds a
+# gigabyte of ffmpeg and does not care about a hundred milliseconds.
+clipforge-worker = "clipforge.worker.main:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
