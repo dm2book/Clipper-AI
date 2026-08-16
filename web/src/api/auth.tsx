@@ -15,12 +15,23 @@ import {
   type ReactNode,
 } from "react";
 import { ApiError, api, onSignedOut, tokens } from "./client";
-import type { LoginResponse, MeResponse } from "./types";
+import type { LoginResponse, MeResponse, MfaChallengeOut } from "./types";
 
 interface AuthState {
   me: MeResponse | null;
   loading: boolean;
-  signIn: (email: string, password: string, tenantId?: string) => Promise<void>;
+  /**
+   * Resolves to a challenge when a second factor is owed, or null when the
+   * session is open. Deliberately not `void`: the generated types made
+   * `tokens` nullable the moment MFA landed, and `tsc` refused to compile the
+   * old signature — which is the whole reason the types are generated.
+   */
+  signIn: (
+    email: string, password: string, tenantId?: string,
+  ) => Promise<MfaChallengeOut | null>;
+  completeMfa: (
+    challengeToken: string, code: string, tenantId?: string,
+  ) => Promise<void>;
   signOut: () => Promise<void>;
   refreshMe: () => Promise<void>;
 }
@@ -52,6 +63,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return onSignedOut(() => setMe(null));
   }, [refreshMe]);
 
+  const adopt = useCallback(async (result: LoginResponse) => {
+    if (!result.tokens) {
+      throw new Error("The server returned no tokens and no challenge.");
+    }
+    tokens.set(result.tokens);
+    setMe(await api.get<MeResponse>("/auth/me"));
+  }, []);
+
   const signIn = useCallback(
     async (email: string, password: string, tenantId?: string) => {
       const result = await api.post<LoginResponse>("/auth/login", {
@@ -59,10 +78,26 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         password,
         tenant_id: tenantId ?? "",
       });
-      tokens.set(result.tokens);
-      setMe(await api.get<MeResponse>("/auth/me"));
+      // A challenge is a successful password step, not a failure. The caller
+      // shows a code prompt; nothing is stored, because half a login must
+      // leave no credential behind.
+      if (result.mfa) return result.mfa;
+      await adopt(result);
+      return null;
     },
-    [],
+    [adopt],
+  );
+
+  const completeMfa = useCallback(
+    async (challengeToken: string, code: string, tenantId?: string) => {
+      const result = await api.post<LoginResponse>("/auth/mfa/verify", {
+        challenge_token: challengeToken,
+        code,
+        tenant_id: tenantId ?? "",
+      });
+      await adopt(result);
+    },
+    [adopt],
   );
 
   const signOut = useCallback(async () => {
@@ -80,8 +115,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const value = useMemo(
-    () => ({ me, loading, signIn, signOut, refreshMe }),
-    [me, loading, signIn, signOut, refreshMe],
+    () => ({ me, loading, signIn, completeMfa, signOut, refreshMe }),
+    [me, loading, signIn, completeMfa, signOut, refreshMe],
   );
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }

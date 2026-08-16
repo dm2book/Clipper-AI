@@ -46,12 +46,16 @@ from typing import Any
 __all__ = [
     "AuthError",
     "AuthEvent",
+    "Device",
     "EventKind",
     "Identity",
     "IdentityStatus",
     "Membership",
+    "MfaFactor",
+    "MfaKind",
     "Principal",
     "RateLimited",
+    "RecoveryCode",
     "Session",
     "TokenKind",
     "TokenPair",
@@ -89,6 +93,26 @@ class IdentityStatus(str, enum.Enum):
 class TokenKind(str, enum.Enum):
     EMAIL_VERIFICATION = "email_verification"
     PASSWORD_RESET = "password_reset"
+    #: Issued when a password has been accepted but a second factor is still
+    #: owed. Deliberately the same machinery as the other two — hashed at rest,
+    #: single use, short expiry — because a challenge that outlives its purpose
+    #: or can be spent twice is a password bypass.
+    MFA_CHALLENGE = "mfa_challenge"
+
+
+class MfaKind(str, enum.Enum):
+    """The second factors this system can hold.
+
+    Only `TOTP` is implemented. The others are named because the storage,
+    the enrolment flow and the login challenge are all factor-agnostic —
+    adding WebAuthn means an implementation of `verify`, not a new column and
+    not a second login path. That is what "MFA-ready" has to mean to be worth
+    saying.
+    """
+
+    TOTP = "totp"
+    WEBAUTHN = "webauthn"
+    RECOVERY = "recovery"
 
 
 class EventKind(str, enum.Enum):
@@ -119,6 +143,15 @@ class EventKind(str, enum.Enum):
     DELETION_CANCELLED = "deletion_cancelled"
     DELETION_COMPLETED = "deletion_completed"
     RATE_LIMITED = "rate_limited"
+    MFA_ENROLMENT_STARTED = "mfa_enrolment_started"
+    MFA_ENABLED = "mfa_enabled"
+    MFA_DISABLED = "mfa_disabled"
+    MFA_CHALLENGED = "mfa_challenged"
+    MFA_SUCCEEDED = "mfa_succeeded"
+    MFA_FAILED = "mfa_failed"
+    MFA_RECOVERY_USED = "mfa_recovery_used"
+    DEVICE_FIRST_SEEN = "device_first_seen"
+    DEVICE_REVOKED = "device_revoked"
 
 
 class AuthError(Exception):
@@ -234,8 +267,17 @@ class Session:
     #: Which tenant this session is acting in. A user with four memberships
     #: has four sessions, and an access token is only ever good for one.
     tenant_id: str = ""
+    #: The browser or app this session belongs to, when one is identifiable.
+    #: Empty for a client that sends no device cookie — an API script, curl —
+    #: which is normal and not an error.
+    device_id: str = ""
     user_agent: str = ""
     ip: str = ""
+    #: True when a second factor was presented while starting this session.
+    #: Recorded rather than inferred, because "the account has MFA" and "this
+    #: session passed it" are different facts and only the second one should
+    #: gate a sensitive action.
+    mfa_satisfied: bool = False
     issued_at: datetime = field(default_factory=utcnow)
     #: Extended on each rotation, but never past `absolute_expires_at`.
     expires_at: datetime | None = None
@@ -291,6 +333,119 @@ class VerificationToken:
     def usable(self, now: datetime | None = None) -> bool:
         now = now or utcnow()
         return self.used_at is None and now < self.expires_at
+
+
+@dataclass(slots=True)
+class MfaFactor:
+    """One second factor belonging to an identity.
+
+    `secret` holds the base32 TOTP seed. It is stored recoverable, unlike a
+    password, and there is no way around that: verifying a TOTP code requires
+    recomputing the HMAC, so the server needs the seed itself. What that means
+    in practice is worth being blunt about — **a database dump is a set of
+    working authenticator apps**. The mitigations are the ones that apply to
+    any recoverable secret: encrypt the column at rest, restrict the role that
+    can read it, and treat a dump as a full MFA reset. `auth_mfa_factors` is
+    readable only by `clipforge_auth` for that reason.
+
+    `last_counter` is what makes replay refusable — see `totp.verify_totp`.
+    """
+
+    factor_id: str
+    identity_id: str
+    kind: MfaKind = MfaKind.TOTP
+    #: What the user calls it. "iPhone", "1Password", "the old phone".
+    label: str = ""
+    secret: str = ""
+    created_at: datetime = field(default_factory=utcnow)
+    #: Set when the user has proved they can produce a code from it. An
+    #: unconfirmed factor never gates a login: enrolling and then failing to
+    #: scan the QR code must not lock somebody out of their own account.
+    confirmed_at: datetime | None = None
+    last_used_at: datetime | None = None
+    #: The highest TOTP step already spent, so a captured code cannot be
+    #: replayed inside its validity window.
+    last_counter: int | None = None
+
+    @property
+    def active(self) -> bool:
+        return self.confirmed_at is not None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Never includes the secret. That is the whole point of the method."""
+        return {
+            "factor_id": self.factor_id,
+            "kind": self.kind.value,
+            "label": self.label,
+            "created_at": self.created_at.isoformat(),
+            "confirmed_at": (
+                self.confirmed_at.isoformat() if self.confirmed_at else None
+            ),
+            "last_used_at": (
+                self.last_used_at.isoformat() if self.last_used_at else None
+            ),
+            "active": self.active,
+        }
+
+
+@dataclass(slots=True)
+class RecoveryCode:
+    """A single-use way back in when the phone is gone.
+
+    Stored as a SHA-256 hash, like a refresh token and for the same reason: a
+    dump of this table must not be a set of working logins. Not Argon2 —
+    these are high-entropy values from `secrets`, so there is nothing to
+    guess and a slow hash would only add latency.
+    """
+
+    code_id: str
+    identity_id: str
+    code_hash: str
+    created_at: datetime = field(default_factory=utcnow)
+    used_at: datetime | None = None
+    used_ip: str = ""
+
+    @property
+    def spent(self) -> bool:
+        return self.used_at is not None
+
+
+@dataclass(slots=True)
+class Device:
+    """A browser or app that has signed in, across sessions.
+
+    Identity comes from a long-lived random cookie, not from a fingerprint of
+    the user agent and IP. Fingerprinting is unreliable — two identical
+    laptops on one office IP are one device — and it is a tracking technique
+    applied to people who did not ask for it. The cost of the honest approach
+    is that clearing cookies looks like a new device, which is a support
+    question rather than a security hole.
+    """
+
+    device_id: str
+    identity_id: str
+    #: A readable summary of the user agent: "Chrome on macOS".
+    label: str = ""
+    user_agent: str = ""
+    last_ip: str = ""
+    first_seen_at: datetime = field(default_factory=utcnow)
+    last_seen_at: datetime = field(default_factory=utcnow)
+    revoked_at: datetime | None = None
+
+    @property
+    def active(self) -> bool:
+        return self.revoked_at is None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "device_id": self.device_id,
+            "label": self.label,
+            "user_agent": self.user_agent,
+            "last_ip": self.last_ip,
+            "first_seen_at": self.first_seen_at.isoformat(),
+            "last_seen_at": self.last_seen_at.isoformat(),
+            "active": self.active,
+        }
 
 
 @dataclass(slots=True)

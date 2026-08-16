@@ -2179,21 +2179,126 @@ The audit log is append-only as a privilege, not a convention: a log the
 authenticating service can rewrite says whatever an attacker who reached that
 service wants it to say.
 
-### bcrypt truncates at 72 bytes; this does not
+### Argon2id, with bcrypt kept for the hashes already written
 
-bcrypt ignores everything past the 72nd byte. Older releases did it silently,
-turning a 100-character passphrase into a 72-character one; bcrypt 5 raises,
-which is better and still the wrong answer on a signup form.
+New hashes are Argon2id at OWASP's floor: 19 MiB, two passes, one lane. The
+reason to prefer it over bcrypt is **memory hardness** — bcrypt's cost is CPU
+time with a 4 KiB working set, so a GPU runs thousands of guesses in parallel
+for very little silicon, while Argon2id makes each guess pay for 19 MiB.
 
-So the password is SHA-256'd and base64'd before it reaches bcrypt — a fixed
-44-byte input with the full entropy preserved. The base64 matters as much as
-the hash: a raw digest can contain a NUL byte, and bcrypt truncates at the
-first one, which would quietly weaken about one hash in 180.
+Measured here: Argon2id verifies in ~25 ms against ~275 ms for bcrypt cost 12.
+Stronger against parallel attack *and* eight times cheaper per login, which is
+unusual enough to be worth stating.
 
-Hashes are upgraded on login. The cost that is right today will be too low in
-2030, and the successful-login path is the one moment the plaintext is
-legitimately in memory. The fleet migrates itself; nobody is asked to reset
-anything.
+**Every bcrypt hash still verifies.** The scheme is chosen from the stored
+hash's own prefix, not from the algorithm tag beside it — the tag is metadata
+that can be wrong after a bad migration, and trusting it would lock out a
+mislabelled row for ever. `needs_rehash` then reports bcrypt as stale, and the
+existing upgrade-on-login path replaces it. No flag day, no forced resets: the
+fleet migrates itself on next sign-in. A flag day here locks out every account
+that has not signed in since.
+
+The legacy path keeps its pre-hash, because bcrypt ignores everything past the
+72nd byte — the password is SHA-256'd and base64'd to a fixed 44 bytes, and the
+base64 matters as much as the hash since a raw digest can contain a NUL that
+bcrypt truncates at. Argon2 has no length limit, so the new path hashes the
+normalised password directly.
+
+`PasswordPolicy.fast()` exists for tests and is named so that no call site can
+mistake it for a deployable configuration. `require_production_ready()` now
+audits the Argon2 parameters rather than the bcrypt cost.
+
+### A second factor, implemented from the RFC
+
+TOTP is about forty lines of `hmac` and `struct`, and both RFC 4226 and
+RFC 6238 publish test vectors — so writing it here means it can be *proved*
+correct rather than trusted because a package is popular. All twenty-two
+vectors run in the suite, across SHA-1, SHA-256 and SHA-512.
+
+Three things make it safe rather than merely working. Comparison is
+`compare_digest`, because a digit-by-digit `==` on six digits is a timing
+oracle that cuts the search from a million to sixty. Drift is one step either
+side — at ±5 an attacker gets eleven codes per guess instead of three. And
+**replay is refused**: the matched counter is stored, so a code observed over
+someone's shoulder cannot be spent again inside its own 90-second window.
+
+The login shape is the part that has to be right:
+
+```
+log_in(email, password)        -> LoginResult(mfa=MfaChallenge(...))
+complete_mfa(challenge, code)  -> LoginResult(tokens=...)
+```
+
+The password step returns **no session, no tokens and no cookies**. The
+challenge is a single-use five-minute token in `auth_tokens`, hashed at rest
+like every other token here. A flag on a real session, or a signed blob the
+server does not track, would make the factor advisory — a client that skips
+the second call would already be signed in.
+
+Enrolment cannot lock anyone out: `begin_enrolment` stores an *unconfirmed*
+factor that gates nothing, and only a working code activates it. Ten recovery
+codes are issued at that point, stored as SHA-256 (high-entropy already, so
+Argon2 would buy latency and nothing else) and shown exactly once.
+
+`MfaKind` names `webauthn` alongside `totp` because the storage, the enrolment
+flow and the challenge are all factor-agnostic — adding WebAuthn is an
+implementation of `verify`, not a new column and not a second login path.
+That is what "MFA-ready" has to mean to be worth saying.
+
+**`auth_mfa_factors.secret` is stored recoverably**, and that is not a
+shortcut. Verifying a TOTP code means recomputing the HMAC, so the server
+needs the seed. A dump of that table is a set of working authenticator apps.
+It cannot be designed away while the factor is TOTP; it can be contained,
+which is why exactly one narrow role can read it and why a dump should be
+treated as a reason to reset every factor.
+
+### The refresh token moved into an HttpOnly cookie
+
+Only two things are cookies: the refresh token and the device id, both
+`HttpOnly`. The **access token stays in the response body** and lives in
+memory, and everything else follows from that choice:
+
+- A cookie is attached by the browser to every request whether the page meant
+  it or not. That *is* CSRF. An access token in a cookie means every mutating
+  endpoint needs checking.
+- In memory, only the two endpoints that read the refresh cookie — refresh and
+  logout — need protecting. The rest authenticate with an `Authorization`
+  header, which a browser never attaches by itself.
+- The cost is that a reload loses the access token. That is what the refresh
+  cookie is for, and the reload path then runs on every visit rather than only
+  after fifteen minutes — a refresh path exercised once a session is a refresh
+  path only tested in production.
+
+CSRF is double-submit: a readable cookie plus an `X-CSRF-Token` header,
+compared with `compare_digest`. An attacker's page can cause the cookie to be
+sent but cannot read it to copy into the header. It is enforced **only when the
+cookie is what is being spent** — a caller that supplies the refresh token in
+the body cannot be a forgery, because the attacker could not have read it.
+
+`__Host-` prefixes are used when cookies are secure, which forbids a `Domain`
+attribute and stops a sibling subdomain setting them; `SameSite=Lax` is a
+second independent layer, not `Strict`, because Strict also suppresses the
+cookie when arriving from a link in an email — exactly how verification and
+reset land. `CLIPFORGE_COOKIE_SECURE=0` is the only way to get insecure
+cookies, so forgetting to configure anything produces the safe behaviour.
+
+### Devices, and the email that actually catches a break-in
+
+A device is a long-lived random cookie, not a fingerprint. Fingerprinting is
+unreliable — two identical laptops on one office IP are one device — and it is
+a tracking technique applied to people who did not ask for it. The cost is
+that clearing cookies looks like a new device, which is a support question
+rather than a security hole.
+
+The point of the feature is the first-sign-in email. A sign-in from a device
+the owner does not recognise is the earliest signal a stolen password gives
+off, and often the only one. So `first_seen_at` is **never updated** — it is
+the fact the alert is judged against, and refreshing it on every sign-in would
+silence every future alert for that device.
+
+Revoking a device revokes its sessions too. Revoking only the row would leave
+the phone refreshing on its own token, and the user watching a button do
+nothing.
 
 ### Refresh token reuse is treated as theft
 
@@ -2303,8 +2408,9 @@ reason the endpoints are unauthenticated.
 
 ### What is verified, and what is not
 
-`tests/test_auth.py` runs 156 tests — every flow twice, once in memory and once
-against PostgreSQL, with real bcrypt and real PyJWT throughout. Beyond the
+`tests/test_auth.py` runs 208 tests — every flow twice, once in memory and once
+against PostgreSQL, with real Argon2, real bcrypt (for the legacy path) and
+real PyJWT throughout. Beyond the
 feature coverage it asserts the security properties directly: identical
 enumeration responses, comparable timing on unknown addresses, refresh-reuse
 family revocation, single-use links, session revocation on reset, `alg=none`
@@ -2325,6 +2431,20 @@ That flow was then driven in a real Chromium against the built dashboard, the
 running API and live PostgreSQL: signup → the link printed by
 `ConsoleEmailSender` → verify → login → a working Overview reading
 `owner · Northwind labs`. Fifteen API calls, no non-2xx, no console errors.
+
+The second-factor work adds: all twenty-two RFC vectors, replay refusal, drift
+bounds, challenge expiry and single use, recovery codes that work once and are
+invalidated by regeneration, and that no secret or recovery code ever reaches
+the audit log. Over HTTP, `tests/test_api.py` covers the cookie asymmetry (the
+refresh cookie `HttpOnly`, the CSRF cookie deliberately not), that a
+cookie-authenticated refresh without the header is a 403, that a body-supplied
+token needs no header, that the refresh cookie rotates, and that a challenge
+sets no session cookie at all. `RbacUnchangedTest` pins the role ladder and
+checks a second factor does not change the role in the token — proving who you
+are is not the same as changing what you may do.
+
+Migration `20260816090000_mfa_and_devices` was applied to a real PostgreSQL
+here and both stores exercised against it.
 
 **Still no email has left this environment.** `SmtpEmailSender` is now
 selectable and no SMTP server has accepted a message from it here — there is

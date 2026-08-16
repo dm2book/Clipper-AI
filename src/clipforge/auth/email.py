@@ -243,3 +243,85 @@ def deletion_requested_email(to: str, when: str) -> Email:
         ),
         kind="deletion_requested",
     )
+
+
+def mfa_enabled_email(to: str) -> Email:
+    """Sent when a second factor is switched on.
+
+    An attacker who has the password and enrols their own authenticator has
+    locked the real owner out permanently. This message is the only chance the
+    owner gets to notice before that happens.
+    """
+
+    return Email(
+        to=to,
+        subject="Two-factor authentication is on",
+        text=(
+            "Two-factor authentication was switched on for your ClipForge "
+            "account. From now on, signing in needs a code from your "
+            "authenticator app as well as your password.\n\n"
+            "If this was not you, somebody else knows your password. Reset it "
+            "immediately and contact support — they can remove the factor "
+            "once they have confirmed who you are."
+        ),
+        kind="mfa_enabled",
+    )
+
+
+def mfa_disabled_email(to: str) -> Email:
+    """Sent when it is switched off. The more dangerous of the pair."""
+
+    return Email(
+        to=to,
+        subject="Two-factor authentication is off",
+        text=(
+            "Two-factor authentication was switched off for your ClipForge "
+            "account. Your password is now the only thing protecting it.\n\n"
+            "If this was not you, reset your password now and switch two-"
+            "factor authentication back on."
+        ),
+        kind="mfa_disabled",
+    )
+
+
+def recovery_code_used_email(to: str) -> Email:
+    """Sent when a recovery code is spent.
+
+    Worth a message of its own rather than folding into the sign-in notice: a
+    recovery code means somebody could not use the authenticator, which is
+    either a lost phone or a person who is not you.
+    """
+
+    return Email(
+        to=to,
+        subject="A recovery code was used to sign in",
+        text=(
+            "Somebody signed in to your ClipForge account using a recovery "
+            "code instead of your authenticator app. That code has now been "
+            "used and will not work again.\n\n"
+            "If this was you, no action is needed — though it is worth "
+            "generating a fresh set if you are running low.\n\n"
+            "If it was not you, reset your password and regenerate your "
+            "recovery codes straight away."
+        ),
+        kind="recovery_code_used",
+    )
+
+
+def new_device_email(to: str, label: str, when: str) -> Email:
+    """Sent the first time a device signs in.
+
+    The single most useful security email there is: it is the one a person
+    reads and immediately knows is wrong.
+    """
+
+    return Email(
+        to=to,
+        subject=f"New sign-in from {label}",
+        text=(
+            f"Your ClipForge account was signed in to from {label} on {when}."
+            f"\n\nIf that was you, nothing to do. If not, reset your password "
+            f"— and sign that device out from Settings."
+        ),
+        kind="new_device",
+    )

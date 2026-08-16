@@ -17,6 +17,7 @@ import os
 from dataclasses import dataclass, field
 
 from .passwords import ALGORITHM, PasswordPolicy
+from .totp import TotpConfig
 from .tokens import Keyring, SigningKey
 
 __all__ = ["AuthConfig", "ENV_PREFIX", "config_from_env", "MisconfiguredAuth"]
@@ -44,6 +45,14 @@ DEFAULT_RATE_LIMITS: dict[str, tuple[int, int]] = {
     "verify_resend": (5, 3600),
     "refresh": (120, 60),
     "change_password": (5, 900),
+    # A second factor is six digits, so the guessing budget is the *only*
+    # thing standing between an attacker with the password and the account.
+    # Ten tries per five minutes against a million codes is the difference
+    # between infeasible and a weekend's work.
+    "mfa_verify": (10, 300),
+    "mfa_enrol": (10, 3600),
+    "mfa_confirm": (10, 900),
+    "mfa_recovery_regen": (3, 3600),
 }
 
 
@@ -68,6 +77,12 @@ class AuthConfig:
     # -- lockout -----------------------------------------------------------
     max_failed_attempts: int = 10
     lockout_s: int = 900
+
+    # -- multi-factor --------------------------------------------------------
+    #: What an authenticator app shows above the code. The product name, not a
+    #: hostname: a user with entries for six services identifies them by name.
+    mfa_issuer: str = "ClipForge AI"
+    totp: TotpConfig = field(default_factory=TotpConfig)
 
     # -- policy ------------------------------------------------------------
     require_verified_email: bool = True
@@ -116,10 +131,28 @@ class AuthConfig:
                 "unverified email addresses can sign in, so anyone can hold "
                 "an account on an address they do not control"
             )
-        if self.password_policy.rounds < 10:
+        policy = self.password_policy
+        if self.password_algorithm != ALGORITHM:
             problems.append(
-                f"bcrypt cost is {self.password_policy.rounds}; production "
-                f"wants 12 or more"
+                f"passwords would be tagged {self.password_algorithm!r}; "
+                f"production writes {ALGORITHM!r}"
+            )
+        # OWASP's floor for Argon2id. Memory is the parameter checked hardest,
+        # because it is the one a GPU attack cannot amortise — halving it buys
+        # an attacker far more than halving the iteration count.
+        if policy.argon2_memory_kib < 19_456:
+            problems.append(
+                f"Argon2 memory is {policy.argon2_memory_kib} KiB; production "
+                f"wants at least 19456 (19 MiB)"
+            )
+        if policy.argon2_time_cost < 2:
+            problems.append(
+                f"Argon2 time cost is {policy.argon2_time_cost}; production "
+                f"wants at least 2"
+            )
+        if policy.argon2_hash_len < 32 or policy.argon2_salt_len < 16:
+            problems.append(
+                "Argon2 hash or salt length is below the 32/16-byte minimum"
             )
         if not self.rate_limits:
             problems.append("rate limiting is disabled")

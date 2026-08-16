@@ -24,10 +24,15 @@ db = ["psycopg[binary]>=3.2", "psycopg_pool>=3.2"]
 # via CLIPFORGE_FFMPEG); without it, thumbnails degrade to embedded artwork
 # only and non-ISO containers cannot be measured.
 acquire = ["yt-dlp>=2024.1"]
-# Authentication. Both are hard requirements of the auth package and there is
-# deliberately no pure-Python fallback for either: a weaker password hash that
-# activates when a dependency is missing is a weaker hash nobody notices.
-auth = ["bcrypt>=4.1", "PyJWT>=2.8"]
+# Authentication. All three are hard requirements and there is deliberately no
+# pure-Python fallback: a weaker password hash that activates when a dependency
+# is missing is a weaker hash nobody notices.
+# argon2-cffi hashes new passwords; bcrypt is still required and is not
+# optional — hashes written before the Argon2id migration are verified with
+# it, and dropping it would lock out every account that has not signed in
+# since. TOTP is implemented against the RFC in the standard library, so
+# there is no dependency for it.
+auth = ["argon2-cffi>=23.1", "bcrypt>=4.1", "PyJWT>=2.8"]
 # The HTTP API. starlette is pinned below 0.50 because FastAPI 0.141 does not
 # support the 1.x line, and the incompatibility is silent — routers register
 # without error and serve nothing.

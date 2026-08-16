@@ -31,6 +31,7 @@ and each is invisible in a feature test.
 
 from __future__ import annotations
 
+import base64
 import os
 import threading
 import time
@@ -58,6 +59,9 @@ from clipforge.auth import (
     normalise_email,
 )
 from clipforge.auth.config import config_from_env, describe_environment
+from clipforge.auth import mfa as mfa_mod
+from clipforge.auth import totp as totp_mod
+from clipforge.auth.totp import TotpConfig
 from clipforge.auth.tokens import new_refresh_token
 
 PASSWORD = "a perfectly ordinary long passphrase"
@@ -66,7 +70,7 @@ EMAIL = "dana@example.com"
 
 #: Cost 4 rather than 12. The only concession to speed in this file; the
 #: construction, the verification and the upgrade path are all unchanged.
-FAST = PasswordPolicy(rounds=4)
+FAST = PasswordPolicy.fast()
 
 
 def _config(**kwargs) -> AuthConfig:
@@ -143,7 +147,7 @@ class AuthFlows:
         identity = self.store.identity_by_email(EMAIL)
 
         self.assertNotIn(PASSWORD, identity.password_hash)
-        self.assertTrue(identity.password_hash.startswith("$2b$"))
+        self.assertTrue(identity.password_hash.startswith("$argon2id$"))
         self.assertNotIn(PASSWORD, str(identity.to_dict()))
         self.assertNotIn("password_hash", identity.to_dict())
 
@@ -353,13 +357,15 @@ class AuthFlows:
 
         self.register()
         before = self.store.identity_by_email(EMAIL).password_hash
-        self.assertIn("$04$", before)
+        self.assertIn("m=1024", before)
 
-        self.service.hasher = PasswordHasher(PasswordPolicy(rounds=6))
+        self.service.hasher = PasswordHasher(
+            PasswordPolicy.fast(argon2_memory_kib=2048)
+        )
         self.service.log_in(EMAIL, PASSWORD)
 
         after = self.store.identity_by_email(EMAIL).password_hash
-        self.assertIn("$06$", after)
+        self.assertIn("m=2048", after)
         self.assertNotEqual(before, after)
         # And the new hash still verifies the same password.
         self.assertTrue(self.service.hasher.verify(PASSWORD, after))
@@ -919,6 +925,7 @@ class PostgresAuthTest(AuthFlows, unittest.TestCase):
                 cursor.execute(
                     "TRUNCATE TABLE auth_audit_log, auth_rate_limits, "
                     "auth_tokens, auth_sessions, auth_memberships, "
+                    "auth_mfa_factors, auth_recovery_codes, auth_devices, "
                     "auth_identities CASCADE"
                 )
             connection.commit()
@@ -934,11 +941,53 @@ class PasswordTest(unittest.TestCase):
     def setUp(self) -> None:
         self.hasher = PasswordHasher(FAST)
 
-    def test_a_hash_is_real_bcrypt(self) -> None:
+    def test_a_hash_is_real_argon2id(self) -> None:
         stored = self.hasher.hash(PASSWORD)
-        self.assertRegex(stored, r"^\$2[aby]\$\d{2}\$")
+        self.assertRegex(stored, r"^\$argon2id\$v=19\$m=\d+,t=\d+,p=\d+\$")
         self.assertTrue(self.hasher.verify(PASSWORD, stored))
         self.assertFalse(self.hasher.verify(PASSWORD + "!", stored))
+
+    def test_a_bcrypt_hash_written_before_the_migration_still_verifies(self) -> None:
+        """Dropping bcrypt verification locks out every account that has not
+        signed in since the switch. This is the test that says it will not."""
+
+        import bcrypt
+
+        legacy = bcrypt.hashpw(
+            self.hasher.prepare(PASSWORD), bcrypt.gensalt(rounds=4)
+        ).decode()
+        self.assertTrue(self.hasher.verify(PASSWORD, legacy))
+        self.assertFalse(self.hasher.verify(PASSWORD + "!", legacy))
+
+    def test_a_bcrypt_hash_is_reported_stale_so_login_replaces_it(self) -> None:
+        import bcrypt
+
+        from clipforge.auth.passwords import LEGACY_BCRYPT
+
+        legacy = bcrypt.hashpw(
+            self.hasher.prepare(PASSWORD), bcrypt.gensalt(rounds=4)
+        ).decode()
+        self.assertTrue(self.hasher.needs_rehash(legacy, LEGACY_BCRYPT))
+
+    def test_the_scheme_is_read_from_the_hash_not_the_recorded_tag(self) -> None:
+        """A mislabelled row must still be able to sign in.
+
+        The tag is metadata and can be wrong after a bad migration; the hash
+        format is self-describing. Trusting the tag would mean a mislabelled
+        account is locked out for ever.
+        """
+
+        stored = self.hasher.hash(PASSWORD)
+        self.assertTrue(self.hasher.verify(PASSWORD, stored))
+        # Same hash, nonsense tag, still verifies.
+        self.assertTrue(self.hasher.needs_rehash(stored, "who-knows") is not None)
+        self.assertTrue(self.hasher.verify(PASSWORD, stored))
+
+    def test_an_unreadable_stored_hash_is_a_miss_not_a_crash(self) -> None:
+        """And it is logged: a damaged row is worth somebody's attention."""
+        with self.assertLogs("clipforge.auth.passwords", level="WARNING"):
+            self.assertFalse(self.hasher.verify(PASSWORD, "$argon2id$broken"))
+        self.assertFalse(self.hasher.verify(PASSWORD, "not-a-hash-at-all"))
 
     def test_the_same_password_hashes_differently_every_time(self) -> None:
         """Per-hash salt. Identical hashes would say which users share a
@@ -997,11 +1046,10 @@ class PasswordTest(unittest.TestCase):
     def test_needs_rehash_notices_a_raised_cost(self) -> None:
         from clipforge.auth.passwords import ALGORITHM
 
-        cheap = PasswordHasher(PasswordPolicy(rounds=4)).hash(PASSWORD)
-        dear = PasswordHasher(PasswordPolicy(rounds=6))
+        cheap = PasswordHasher(PasswordPolicy.fast()).hash(PASSWORD)
+        dear = PasswordHasher(PasswordPolicy.fast(argon2_memory_kib=4096))
         self.assertTrue(dear.needs_rehash(cheap, ALGORITHM))
         self.assertFalse(dear.needs_rehash(dear.hash(PASSWORD), ALGORITHM))
-        self.assertTrue(dear.needs_rehash(cheap, "some-older-scheme"))
 
 
 class TokenTest(unittest.TestCase):
@@ -1149,7 +1197,7 @@ class ProductionReadinessTest(unittest.TestCase):
             keyring=Keyring((SigningKey("k1", "x" * 40),)),
             keyring_is_ephemeral=False,
             require_verified_email=False,
-            password_policy=PasswordPolicy(rounds=4),
+            password_policy=PasswordPolicy.fast(),
             rate_limits={},
             access_ttl_s=86_400,
             reset_url="http://app.test/reset",
@@ -1158,8 +1206,8 @@ class ProductionReadinessTest(unittest.TestCase):
             config.require_production_ready()
 
         message = str(caught.exception)
-        for expected in ("unverified email", "bcrypt cost", "rate limiting",
-                         "cannot be revoked", "clear text"):
+        for expected in ("unverified email", "Argon2 memory", "Argon2 time",
+                         "rate limiting", "cannot be revoked", "clear text"):
             self.assertIn(expected, message)
 
     def test_the_environment_report_never_echoes_a_secret(self) -> None:
@@ -1238,6 +1286,529 @@ class ConcurrencyTest(unittest.TestCase):
 
         self.assertEqual(len(created), 1)
 
+
+
+# ---------------------------------------------------------------------------
+# TOTP, against the published RFC vectors
+# ---------------------------------------------------------------------------
+
+
+class TotpVectorTest(unittest.TestCase):
+    """RFC 6238 Appendix B and RFC 4226 Appendix D, verbatim.
+
+    The whole reason TOTP is implemented here rather than pulled from a
+    package: the standard ships test vectors, so this can be *proved* correct
+    instead of trusted because it is popular.
+    """
+
+    #: The RFCs' seeds are ASCII strings, base32'd here as the format requires.
+    SHA1 = base64.b32encode(b"12345678901234567890").decode().rstrip("=")
+    SHA256 = base64.b32encode(
+        b"12345678901234567890123456789012"
+    ).decode().rstrip("=")
+    SHA512 = base64.b32encode(
+        b"1234567890123456789012345678901234567890123456789012345678901234"
+    ).decode().rstrip("=")
+
+    RFC6238 = [
+        (59, "94287082", "sha1"), (1111111109, "07081804", "sha1"),
+        (1111111111, "14050471", "sha1"), (1234567890, "89005924", "sha1"),
+        (2000000000, "69279037", "sha1"), (20000000000, "65353130", "sha1"),
+        (59, "46119246", "sha256"), (1111111109, "68084774", "sha256"),
+        (20000000000, "77737706", "sha256"),
+        (59, "90693936", "sha512"), (1111111109, "25091201", "sha512"),
+        (20000000000, "47863826", "sha512"),
+    ]
+
+    #: RFC 4226 Appendix D, counters 0-9 with the SHA-1 seed.
+    RFC4226 = [
+        "755224", "287082", "359152", "969429", "338314",
+        "254676", "287922", "162583", "399871", "520489",
+    ]
+
+    def secret_for(self, algorithm: str) -> str:
+        return {"sha1": self.SHA1, "sha256": self.SHA256,
+                "sha512": self.SHA512}[algorithm]
+
+    def test_rfc_6238_appendix_b(self) -> None:
+        for at, expected, algorithm in self.RFC6238:
+            with self.subTest(at=at, algorithm=algorithm):
+                config = TotpConfig(digits=8, algorithm=algorithm)
+                self.assertEqual(
+                    totp_mod.totp(self.secret_for(algorithm), at=at,
+                                  config=config),
+                    expected,
+                )
+
+    def test_rfc_4226_appendix_d(self) -> None:
+        for counter, expected in enumerate(self.RFC4226):
+            with self.subTest(counter=counter):
+                self.assertEqual(totp_mod.hotp(self.SHA1, counter), expected)
+
+
+class TotpBehaviourTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.secret = totp_mod.generate_secret()
+
+    def test_a_generated_secret_is_unpadded_base32(self) -> None:
+        """Several authenticator apps reject `=` padding, silently."""
+        self.assertNotIn("=", self.secret)
+        self.assertTrue(self.secret.isupper() or self.secret.isalnum())
+
+    def test_the_current_code_verifies(self) -> None:
+        code = totp_mod.totp(self.secret, at=1000.0)
+        self.assertIsNotNone(
+            totp_mod.verify_totp(self.secret, code, at=1000.0)
+        )
+
+    def test_one_step_of_drift_is_tolerated(self) -> None:
+        code = totp_mod.totp(self.secret, at=1000.0)
+        self.assertIsNotNone(
+            totp_mod.verify_totp(self.secret, code, at=1029.0)
+        )
+
+    def test_beyond_the_drift_window_is_refused(self) -> None:
+        """Wider is a support convenience and a real weakening."""
+        code = totp_mod.totp(self.secret, at=1000.0)
+        self.assertIsNone(totp_mod.verify_totp(self.secret, code, at=1200.0))
+
+    def test_a_spent_counter_is_refused(self) -> None:
+        """Replay protection. Without it a shoulder-surfed code works for 90s."""
+        code = totp_mod.totp(self.secret, at=1000.0)
+        counter = totp_mod.verify_totp(self.secret, code, at=1000.0)
+        self.assertIsNotNone(counter)
+        self.assertIsNone(
+            totp_mod.verify_totp(self.secret, code, at=1000.0,
+                                 last_counter=counter)
+        )
+
+    def test_a_pasted_code_with_a_space_still_works(self) -> None:
+        """Apps display `123 456` and users paste the space."""
+        code = totp_mod.totp(self.secret, at=1000.0)
+        spaced = f"{code[:3]} {code[3:]}"
+        self.assertIsNotNone(
+            totp_mod.verify_totp(self.secret, spaced, at=1000.0)
+        )
+
+    def test_a_wrong_or_short_code_is_refused(self) -> None:
+        self.assertIsNone(totp_mod.verify_totp(self.secret, "000000", at=1.0))
+        self.assertIsNone(totp_mod.verify_totp(self.secret, "123", at=1.0))
+        self.assertIsNone(totp_mod.verify_totp(self.secret, "", at=1.0))
+
+    def test_the_provisioning_uri_names_the_issuer_twice(self) -> None:
+        """Apps disagree about which one they read."""
+        uri = totp_mod.provisioning_uri(self.secret, "dana@acme.com", "Acme")
+        self.assertTrue(uri.startswith("otpauth://totp/"))
+        self.assertIn("Acme%3Adana", uri)
+        self.assertIn("issuer=Acme", uri)
+        self.assertIn(f"secret={self.secret}", uri)
+
+    def test_a_malformed_secret_is_an_error_not_a_wrong_answer(self) -> None:
+        with self.assertRaises(ValueError):
+            totp_mod.totp("not base32 !!!", at=1.0)
+
+
+class RecoveryCodeFormatTest(unittest.TestCase):
+    def test_codes_avoid_the_characters_people_transcribe_wrong(self) -> None:
+        code = mfa_mod.format_recovery_code(b"\x01\x02\x03\x04\x05")
+        self.assertNotIn("O", code.replace("-", ""))
+        self.assertNotIn("I", code.replace("-", ""))
+        self.assertNotIn("0", code)
+        self.assertNotIn("1", code)
+        self.assertEqual(len(code), 11)     # 5 + hyphen + 5
+
+    def test_the_hyphen_is_cosmetic(self) -> None:
+        code = mfa_mod.format_recovery_code(b"\x01\x02\x03\x04\x05")
+        self.assertEqual(
+            mfa_mod.normalise_recovery_code(code),
+            mfa_mod.normalise_recovery_code(code.replace("-", "").lower()),
+        )
+
+
+class DeviceLabelTest(unittest.TestCase):
+    def test_common_agents_get_a_readable_name(self) -> None:
+        cases = {
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/120.0":
+                "Chrome on macOS",
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0) Safari/604.1":
+                "Safari on iPhone",
+            "Mozilla/5.0 (Windows NT 10.0) Firefox/121.0": "Firefox on Windows",
+            "curl/8.4.0": "curl",
+        }
+        for agent, expected in cases.items():
+            with self.subTest(agent=agent[:30]):
+                self.assertEqual(mfa_mod.device_label(agent), expected)
+
+    def test_an_unknown_agent_keeps_its_own_text(self) -> None:
+        """Labelling everything "Unknown" makes every API client identical."""
+        self.assertEqual(
+            mfa_mod.device_label("MyInternalBot/2.1"), "MyInternalBot/2.1"
+        )
+
+    def test_no_agent_is_named_as_such(self) -> None:
+        self.assertEqual(mfa_mod.device_label(""), "Unknown device")
+
+
+# ---------------------------------------------------------------------------
+# MFA over the service
+# ---------------------------------------------------------------------------
+
+
+class MfaFlowTest(unittest.TestCase):
+    """The whole second-factor life cycle, on a controlled clock."""
+
+    def setUp(self) -> None:
+        self.now = [datetime(2026, 8, 16, 12, 0, tzinfo=UTC)]
+        self.store = MemoryAuthStore()
+        self.service = AuthService(
+            self.store,
+            AccessTokenIssuer(Keyring((SigningKey("k1", "x" * 40),))),
+            config=AuthConfig(password_policy=FAST,
+                              require_verified_email=False),
+            hasher=PasswordHasher(FAST),
+            clock=lambda: self.now[0],
+        )
+        self.identity_id = self.service.sign_up(EMAIL, PASSWORD).identity_id
+        self.service.add_membership(
+            self.identity_id, "ten_a", "usr_a", "owner", "Acme"
+        )
+
+    def tick(self, seconds: int = 60) -> None:
+        self.now[0] += timedelta(seconds=seconds)
+
+    def code(self, secret: str) -> str:
+        return totp_mod.totp(secret, at=self.now[0].timestamp())
+
+    def enrol(self):
+        started = self.service.begin_enrolment(self.identity_id, label="iPhone")
+        _factor, codes = self.service.confirm_enrolment(
+            self.identity_id, started.factor_id, self.code(started.secret)
+        )
+        return started, codes
+
+    # -- enrolment ---------------------------------------------------------
+
+    def test_an_unconfirmed_factor_does_not_gate_login(self) -> None:
+        """Starting enrolment and closing the tab must not lock anyone out."""
+        self.service.begin_enrolment(self.identity_id)
+        self.assertFalse(self.service.mfa_required(self.identity_id))
+        self.assertTrue(self.service.log_in(EMAIL, PASSWORD).complete)
+
+    def test_confirming_requires_a_working_code(self) -> None:
+        started = self.service.begin_enrolment(self.identity_id)
+        with self.assertRaises(AuthError) as caught:
+            self.service.confirm_enrolment(
+                self.identity_id, started.factor_id, "000000"
+            )
+        self.assertEqual(caught.exception.code, "INVALID_CODE")
+        self.assertFalse(self.service.mfa_required(self.identity_id))
+
+    def test_confirming_switches_it_on_and_issues_recovery_codes(self) -> None:
+        _started, codes = self.enrol()
+        self.assertTrue(self.service.mfa_required(self.identity_id))
+        self.assertEqual(len(codes), mfa_mod.RECOVERY_CODE_COUNT)
+        self.assertEqual(len(set(codes)), mfa_mod.RECOVERY_CODE_COUNT)
+
+    def test_restarting_enrolment_does_not_pile_up_dead_factors(self) -> None:
+        for _ in range(3):
+            self.service.begin_enrolment(self.identity_id)
+        self.assertEqual(len(self.store.factors_for(self.identity_id)), 1)
+
+    def test_the_secret_is_never_in_the_factor_summary(self) -> None:
+        started = self.service.begin_enrolment(self.identity_id)
+        factor = self.store.factor(started.factor_id)
+        self.assertNotIn("secret", factor.to_dict())
+        self.assertNotIn(started.secret, str(factor.to_dict()))
+
+    # -- the challenge -----------------------------------------------------
+
+    def test_login_returns_a_challenge_instead_of_tokens(self) -> None:
+        """The password step must hand back no session at all."""
+        self.enrol()
+        self.tick()
+        result = self.service.log_in(EMAIL, PASSWORD)
+        self.assertFalse(result.complete)
+        self.assertIsNone(result.tokens)
+        self.assertIsNotNone(result.mfa)
+        self.assertEqual(self.service.sessions(self.identity_id), ())
+
+    def test_a_correct_code_completes_the_login(self) -> None:
+        started, _codes = self.enrol()
+        self.tick()
+        challenge = self.service.log_in(EMAIL, PASSWORD).mfa
+        done = self.service.complete_mfa(
+            challenge.challenge_token, self.code(started.secret),
+        )
+        self.assertTrue(done.complete)
+        self.assertEqual(done.tokens.tenant_id, "ten_a")
+
+    def test_the_session_records_that_the_factor_was_presented(self) -> None:
+        """"The account has MFA" and "this session passed it" differ."""
+        started, _codes = self.enrol()
+        self.tick()
+        challenge = self.service.log_in(EMAIL, PASSWORD).mfa
+        self.service.complete_mfa(
+            challenge.challenge_token, self.code(started.secret)
+        )
+        self.assertTrue(self.service.sessions(self.identity_id)[0].mfa_satisfied)
+
+    def test_a_wrong_code_does_not_burn_the_challenge(self) -> None:
+        """One mistyped digit must not mean signing in from scratch."""
+        started, _codes = self.enrol()
+        self.tick()
+        challenge = self.service.log_in(EMAIL, PASSWORD).mfa
+        with self.assertRaises(AuthError):
+            self.service.complete_mfa(challenge.challenge_token, "000000")
+        done = self.service.complete_mfa(
+            challenge.challenge_token, self.code(started.secret)
+        )
+        self.assertTrue(done.complete)
+
+    def test_a_code_cannot_be_replayed(self) -> None:
+        started, _codes = self.enrol()
+        self.tick()
+        first = self.service.log_in(EMAIL, PASSWORD).mfa
+        code = self.code(started.secret)
+        self.service.complete_mfa(first.challenge_token, code)
+
+        second = self.service.log_in(EMAIL, PASSWORD).mfa
+        with self.assertRaises(AuthError) as caught:
+            self.service.complete_mfa(second.challenge_token, code)
+        self.assertEqual(caught.exception.code, "INVALID_CODE")
+
+    def test_a_challenge_expires(self) -> None:
+        started, _codes = self.enrol()
+        self.tick()
+        challenge = self.service.log_in(EMAIL, PASSWORD).mfa
+        self.tick(mfa_mod.CHALLENGE_TTL_S + 10)
+        with self.assertRaises(AuthError) as caught:
+            self.service.complete_mfa(
+                challenge.challenge_token, self.code(started.secret)
+            )
+        self.assertEqual(caught.exception.code, "INVALID_CHALLENGE")
+
+    def test_a_challenge_is_single_use(self) -> None:
+        started, _codes = self.enrol()
+        self.tick()
+        challenge = self.service.log_in(EMAIL, PASSWORD).mfa
+        self.service.complete_mfa(
+            challenge.challenge_token, self.code(started.secret)
+        )
+        self.tick()
+        with self.assertRaises(AuthError) as caught:
+            self.service.complete_mfa(
+                challenge.challenge_token, self.code(started.secret)
+            )
+        self.assertEqual(caught.exception.code, "INVALID_CHALLENGE")
+
+    def test_a_forged_challenge_is_refused(self) -> None:
+        self.enrol()
+        with self.assertRaises(AuthError):
+            self.service.complete_mfa("not-a-real-challenge", "123456")
+
+    # -- recovery ----------------------------------------------------------
+
+    def test_a_recovery_code_completes_a_login(self) -> None:
+        _started, codes = self.enrol()
+        self.tick()
+        challenge = self.service.log_in(EMAIL, PASSWORD).mfa
+        done = self.service.complete_mfa(challenge.challenge_token, codes[0])
+        self.assertTrue(done.complete)
+        self.assertEqual(
+            self.service.recovery_codes_remaining(self.identity_id),
+            mfa_mod.RECOVERY_CODE_COUNT - 1,
+        )
+
+    def test_a_recovery_code_works_only_once(self) -> None:
+        _started, codes = self.enrol()
+        self.tick()
+        self.service.complete_mfa(
+            self.service.log_in(EMAIL, PASSWORD).mfa.challenge_token, codes[0]
+        )
+        self.tick()
+        with self.assertRaises(AuthError):
+            self.service.complete_mfa(
+                self.service.log_in(EMAIL, PASSWORD).mfa.challenge_token,
+                codes[0],
+            )
+
+    def test_regenerating_invalidates_the_old_printout(self) -> None:
+        _started, old = self.enrol()
+        fresh = self.service.regenerate_recovery_codes(self.identity_id)
+        self.assertEqual(len(fresh), mfa_mod.RECOVERY_CODE_COUNT)
+        self.assertFalse(set(old) & set(fresh))
+        self.tick()
+        with self.assertRaises(AuthError):
+            self.service.complete_mfa(
+                self.service.log_in(EMAIL, PASSWORD).mfa.challenge_token,
+                old[0],
+            )
+
+    def test_recovery_codes_are_not_stored_in_the_clear(self) -> None:
+        _started, codes = self.enrol()
+        stored = self.store.recovery_codes_for(self.identity_id)
+        for code in codes:
+            self.assertNotIn(code, [record.code_hash for record in stored])
+
+    def test_regenerating_without_mfa_is_refused(self) -> None:
+        with self.assertRaises(AuthError) as caught:
+            self.service.regenerate_recovery_codes(self.identity_id)
+        self.assertEqual(caught.exception.code, "MFA_NOT_ENABLED")
+
+    # -- turning it off ----------------------------------------------------
+
+    def test_disabling_removes_every_factor_and_code(self) -> None:
+        self.enrol()
+        self.assertEqual(self.service.disable_mfa(self.identity_id), 1)
+        self.assertFalse(self.service.mfa_required(self.identity_id))
+        self.assertEqual(
+            self.service.recovery_codes_remaining(self.identity_id), 0
+        )
+        self.tick()
+        self.assertTrue(self.service.log_in(EMAIL, PASSWORD).complete)
+
+    # -- notifications -----------------------------------------------------
+
+    def test_switching_it_on_and_off_both_send_a_warning(self) -> None:
+        """An attacker enrolling their own authenticator locks the owner out.
+        This email is the owner's only chance to notice."""
+
+        self.enrol()
+        self.service.disable_mfa(self.identity_id)
+        kinds = [d.kind for d in self.service.sender.deliveries]
+        self.assertIn("mfa_enabled", kinds)
+        self.assertIn("mfa_disabled", kinds)
+
+    def test_spending_a_recovery_code_sends_a_warning(self) -> None:
+        _started, codes = self.enrol()
+        self.tick()
+        self.service.complete_mfa(
+            self.service.log_in(EMAIL, PASSWORD).mfa.challenge_token, codes[0]
+        )
+        self.assertIn(
+            "recovery_code_used",
+            [d.kind for d in self.service.sender.deliveries],
+        )
+
+    # -- audit -------------------------------------------------------------
+
+    def test_the_audit_trail_distinguishes_totp_from_recovery(self) -> None:
+        _started, codes = self.enrol()
+        self.tick()
+        self.service.complete_mfa(
+            self.service.log_in(EMAIL, PASSWORD).mfa.challenge_token, codes[0]
+        )
+        details = [
+            event.detail for event in self.store.events_for(self.identity_id)
+            if event.kind is EventKind.MFA_SUCCEEDED
+        ]
+        self.assertIn("recovery code", details)
+
+    def test_no_secret_or_code_ever_reaches_the_audit_log(self) -> None:
+        started, codes = self.enrol()
+        self.tick()
+        self.service.complete_mfa(
+            self.service.log_in(EMAIL, PASSWORD).mfa.challenge_token, codes[0]
+        )
+        blob = " ".join(
+            str(event.to_dict())
+            for event in self.store.events_for(self.identity_id)
+        )
+        self.assertNotIn(started.secret, blob)
+        for code in codes:
+            self.assertNotIn(code, blob)
+
+
+# ---------------------------------------------------------------------------
+# Devices
+# ---------------------------------------------------------------------------
+
+
+CHROME = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/120.0"
+
+
+class DeviceTrackingTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.store = MemoryAuthStore()
+        self.service = AuthService(
+            self.store,
+            AccessTokenIssuer(Keyring((SigningKey("k1", "x" * 40),))),
+            config=AuthConfig(password_policy=FAST,
+                              require_verified_email=False),
+            hasher=PasswordHasher(FAST),
+        )
+        self.identity_id = self.service.sign_up(EMAIL, PASSWORD).identity_id
+        self.service.add_membership(
+            self.identity_id, "ten_a", "usr_a", "owner", "Acme"
+        )
+
+    def sign_in(self, device_id: str = "dev_1", agent: str = CHROME):
+        return self.service.log_in(
+            EMAIL, PASSWORD, device_id=device_id, user_agent=agent,
+        )
+
+    def test_signing_in_records_the_device(self) -> None:
+        self.sign_in()
+        devices = self.service.devices(self.identity_id)
+        self.assertEqual(len(devices), 1)
+        self.assertEqual(devices[0].label, "Chrome on macOS")
+
+    def test_the_first_sign_in_from_a_device_sends_a_warning(self) -> None:
+        """The single most useful security email there is."""
+        self.sign_in()
+        self.assertIn(
+            "new_device", [d.kind for d in self.service.sender.deliveries]
+        )
+
+    def test_returning_to_a_known_device_does_not_warn_again(self) -> None:
+        self.sign_in()
+        before = len(self.service.sender.deliveries)
+        self.sign_in()
+        self.assertEqual(len(self.service.sender.deliveries), before)
+
+    def test_first_seen_never_moves(self) -> None:
+        """It is what the alert is judged against; refreshing it silences it."""
+        self.sign_in()
+        first = self.service.devices(self.identity_id)[0].first_seen_at
+        self.sign_in()
+        self.assertEqual(
+            self.service.devices(self.identity_id)[0].first_seen_at, first
+        )
+
+    def test_a_second_device_is_a_second_row(self) -> None:
+        self.sign_in("dev_1")
+        self.sign_in("dev_2", agent="Mozilla/5.0 (iPhone) Safari/604.1")
+        labels = {d.label for d in self.service.devices(self.identity_id)}
+        self.assertEqual(labels, {"Chrome on macOS", "Safari on iPhone"})
+
+    def test_a_client_with_no_device_id_is_not_an_error(self) -> None:
+        """curl and CI jobs send no cookie. That is normal, not a failure."""
+        result = self.service.log_in(EMAIL, PASSWORD)
+        self.assertTrue(result.complete)
+        self.assertEqual(self.service.devices(self.identity_id), ())
+
+    def test_revoking_a_device_ends_its_sessions(self) -> None:
+        self.sign_in("dev_1")
+        self.sign_in("dev_2")
+        revoked = self.service.revoke_device(self.identity_id, "dev_1")
+        self.assertEqual(revoked, 1)
+        live = [s for s in self.service.sessions(self.identity_id) if s.active()]
+        self.assertEqual([s.device_id for s in live], ["dev_2"])
+
+    def test_a_revoked_device_stays_revoked_on_the_next_sign_in(self) -> None:
+        """Otherwise "sign this out" is undone by the thief simply retrying."""
+        self.sign_in("dev_1")
+        self.service.revoke_device(self.identity_id, "dev_1")
+        self.sign_in("dev_1")
+        device = self.store.device("dev_1")
+        self.assertFalse(device.active)
+
+    def test_another_identitys_device_cannot_be_revoked(self) -> None:
+        self.sign_in("dev_1")
+        other = self.service.sign_up("someone@else.example", PASSWORD)
+        with self.assertRaises(AuthError) as caught:
+            self.service.revoke_device(other.identity_id, "dev_1")
+        self.assertEqual(caught.exception.status, 404)
 
 if __name__ == "__main__":
     unittest.main()

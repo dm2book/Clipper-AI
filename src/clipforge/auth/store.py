@@ -24,13 +24,17 @@ import copy
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Protocol
+from typing import Protocol, Sequence
 
 from .types import (
     AuthEvent,
+    Device,
     Identity,
     IdentityStatus,
     Membership,
+    MfaFactor,
+    MfaKind,
+    RecoveryCode,
     Session,
     TokenKind,
     VerificationToken,
@@ -96,6 +100,39 @@ class AuthStore(Protocol):
         self, identity_id: str, kind: TokenKind, now: datetime
     ) -> int: ...
 
+    # -- multi-factor ------------------------------------------------------
+    def create_factor(self, factor: MfaFactor) -> MfaFactor: ...
+    def factor(self, factor_id: str) -> MfaFactor | None: ...
+    def factors_for(self, identity_id: str) -> tuple[MfaFactor, ...]: ...
+    def save_factor(self, factor: MfaFactor) -> MfaFactor: ...
+    def delete_factor(self, factor_id: str) -> bool: ...
+
+    def replace_recovery_codes(
+        self, identity_id: str, codes: Sequence[RecoveryCode]
+    ) -> None:
+        """Store a fresh set, discarding whatever was there.
+
+        Replace rather than append: a user who regenerates their codes expects
+        the printout in their desk drawer to stop working, and "add ten more"
+        quietly grows the number of live ways into the account.
+        """
+
+    def recovery_codes_for(self, identity_id: str) -> tuple[RecoveryCode, ...]: ...
+    def save_recovery_code(self, code: RecoveryCode) -> RecoveryCode: ...
+
+    # -- devices -----------------------------------------------------------
+    def upsert_device(self, device: Device) -> Device: ...
+    def device(self, device_id: str) -> Device | None: ...
+    def devices_for(self, identity_id: str) -> tuple[Device, ...]: ...
+
+    def set_device_revoked(self, device_id: str, when: datetime | None) -> bool:
+        """Revoke or un-revoke a device.
+
+        Separate from `upsert_device` because that one runs on every sign-in
+        and deliberately does not touch `revoked_at` — otherwise the next
+        login from a revoked device would quietly un-revoke it.
+        """
+
     # -- rate limiting -----------------------------------------------------
     def hit_rate_limit(
         self, key: str, action: str, window_s: int, now: datetime
@@ -126,6 +163,9 @@ class MemoryAuthStore:
         self._memberships: dict[str, list[Membership]] = {}
         self._sessions: dict[str, Session] = {}
         self._tokens: dict[str, VerificationToken] = {}
+        self._factors: dict[str, MfaFactor] = {}
+        self._recovery: dict[str, list[RecoveryCode]] = {}
+        self._devices: dict[str, Device] = {}
         self._buckets: dict[tuple[str, str], RateLimitBucket] = {}
         self._events: list[AuthEvent] = []
         self._lock = threading.RLock()
@@ -266,6 +306,94 @@ class MemoryAuthStore:
                     held.used_at = now
                     count += 1
             return count
+
+    # -- multi-factor ------------------------------------------------------
+
+    def create_factor(self, factor: MfaFactor) -> MfaFactor:
+        with self._lock:
+            self._factors[factor.factor_id] = copy.deepcopy(factor)
+        return factor
+
+    def factor(self, factor_id: str) -> MfaFactor | None:
+        with self._lock:
+            held = self._factors.get(factor_id)
+            return copy.deepcopy(held) if held else None
+
+    def factors_for(self, identity_id: str) -> tuple[MfaFactor, ...]:
+        with self._lock:
+            return tuple(
+                copy.deepcopy(f) for f in self._factors.values()
+                if f.identity_id == identity_id
+            )
+
+    def save_factor(self, factor: MfaFactor) -> MfaFactor:
+        with self._lock:
+            self._factors[factor.factor_id] = copy.deepcopy(factor)
+        return factor
+
+    def delete_factor(self, factor_id: str) -> bool:
+        with self._lock:
+            return self._factors.pop(factor_id, None) is not None
+
+    def replace_recovery_codes(
+        self, identity_id: str, codes: Sequence[RecoveryCode]
+    ) -> None:
+        with self._lock:
+            self._recovery[identity_id] = [copy.deepcopy(c) for c in codes]
+
+    def recovery_codes_for(self, identity_id: str) -> tuple[RecoveryCode, ...]:
+        with self._lock:
+            return tuple(
+                copy.deepcopy(c) for c in self._recovery.get(identity_id, [])
+            )
+
+    def save_recovery_code(self, code: RecoveryCode) -> RecoveryCode:
+        with self._lock:
+            held = self._recovery.setdefault(code.identity_id, [])
+            for index, existing in enumerate(held):
+                if existing.code_id == code.code_id:
+                    held[index] = copy.deepcopy(code)
+                    break
+            else:
+                held.append(copy.deepcopy(code))
+        return code
+
+    # -- devices -----------------------------------------------------------
+
+    def upsert_device(self, device: Device) -> Device:
+        with self._lock:
+            existing = self._devices.get(device.device_id)
+            if existing is not None:
+                # First-seen never moves. It is the fact a "new device" alert
+                # is judged against, and refreshing it would silence every
+                # future alert for that device.
+                device.first_seen_at = existing.first_seen_at
+                device.revoked_at = existing.revoked_at
+            self._devices[device.device_id] = copy.deepcopy(device)
+        return device
+
+    def device(self, device_id: str) -> Device | None:
+        with self._lock:
+            held = self._devices.get(device_id)
+            return copy.deepcopy(held) if held else None
+
+    def set_device_revoked(self, device_id: str, when: datetime | None) -> bool:
+        with self._lock:
+            held = self._devices.get(device_id)
+            if held is None:
+                return False
+            held.revoked_at = when
+            return True
+
+    def devices_for(self, identity_id: str) -> tuple[Device, ...]:
+        with self._lock:
+            return tuple(
+                copy.deepcopy(d) for d in sorted(
+                    (d for d in self._devices.values()
+                     if d.identity_id == identity_id),
+                    key=lambda d: d.last_seen_at, reverse=True,
+                )
+            )
 
     # -- rate limiting -----------------------------------------------------
 

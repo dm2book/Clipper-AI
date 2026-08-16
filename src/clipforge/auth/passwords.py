@@ -1,28 +1,44 @@
-"""Password hashing, and the three things people get wrong about it.
+"""Password hashing, and the things people get wrong about it.
 
-## bcrypt truncates at 72 bytes, and this one does not
+## Argon2id, with bcrypt kept for the hashes already in the database
 
-bcrypt ignores everything past the 72nd byte of its input. On older releases
-that happened silently, which turns a 100-character passphrase into a
-72-character one and makes the last 28 characters decorative. `bcrypt` 5 raises
-instead — better, but a `ValueError` on signup for a user with a long
-passphrase is still the wrong answer.
+New hashes are Argon2id at OWASP's floor — 19 MiB of memory, two passes, one
+lane. The reason to prefer it over bcrypt is **memory hardness**: bcrypt's cost
+is CPU time and its working set is 4 KiB, so a GPU or an FPGA runs thousands of
+guesses in parallel for very little silicon. Argon2id makes each guess pay for
+19 MiB, which is what actually constrains an attacker with a rack of hardware.
 
-So the password is SHA-256'd first and the digest is base64'd before it reaches
-bcrypt: a fixed 44-byte input, well under the limit, with the full entropy of
-the original preserved. The base64 matters as much as the hash — a raw digest
-can contain a NUL byte, and bcrypt truncates at the first one, which would
-quietly weaken roughly one hash in every 180.
+Measured on this machine: Argon2id at those parameters verifies in ~25 ms
+against ~275 ms for bcrypt cost 12. It is both stronger against parallel attack
+and eight times cheaper per login, which is unusual enough to be worth stating.
 
-This is a standard construction (`bcrypt(base64(sha256(password)))`) and it is
-recorded in the stored algorithm tag so a future change is detectable rather
-than a silent incompatibility.
+**Every bcrypt hash still verifies.** The scheme is chosen from the stored
+hash's own prefix rather than from the recorded algorithm tag, so a hash made
+before this change is checked with bcrypt whatever the metadata says, and
+`needs_rehash` then reports it as stale so `service.log_in` replaces it. The
+fleet migrates itself on the next sign-in and nobody is asked to reset
+anything. A flag day here would mean locking out every existing account.
+
+## bcrypt truncates at 72 bytes, and the legacy path does not
+
+bcrypt ignores everything past the 72nd byte of its input, which turns a
+100-character passphrase into a 72-character one and makes the rest
+decorative. So the legacy construction SHA-256's the password first and base64's
+the digest: a fixed 44-byte input, well under the limit, with the full entropy
+preserved. The base64 matters as much as the hash — a raw digest can contain a
+NUL, and bcrypt truncates at the first one, quietly weakening roughly one hash
+in 180.
+
+Argon2 has no such limit, so the pre-hash is **not** applied on the new path.
+Feeding it a digest instead of the password would be a second construction to
+document for no benefit, and `MAX_LENGTH` already bounds the denial-of-service
+side.
 
 ## Comparison is constant time, and so is the failure path
 
-`bcrypt.checkpw` is constant time with respect to the hash. It is *not* called
-at all when the email is unknown, and that difference is measurable from
-outside — a fast "no" means "no such account", a slow one means "wrong
+Both backends compare in constant time with respect to the hash. Neither is
+called at all when the email is unknown, and *that* difference is measurable
+from outside — a fast "no" means "no such account", a slow one means "wrong
 password". `verify_dummy()` exists to spend the same time on a miss, and
 `service.log_in` always calls one or the other.
 
@@ -39,21 +55,27 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
-import re
+import logging
 import unicodedata
 from dataclasses import dataclass
+
+log = logging.getLogger("clipforge.auth.passwords")
 
 __all__ = [
     "PasswordPolicy",
     "PasswordHasher",
     "WeakPassword",
     "ALGORITHM",
+    "LEGACY_BCRYPT",
     "MIN_LENGTH",
 ]
 
-#: The tag stored alongside every hash. Change it whenever the construction
+#: The tag stored alongside every new hash. Change it whenever the construction
 #: changes, never when only the cost changes — the cost is inside the hash.
-ALGORITHM = "bcrypt-sha256-b64"
+ALGORITHM = "argon2id"
+
+#: What the tag said before this. Still verified, never written.
+LEGACY_BCRYPT = "bcrypt-sha256-b64"
 
 MIN_LENGTH = 12
 #: Not a security limit — the construction above accepts any length — but an
@@ -79,10 +101,25 @@ class WeakPassword(Exception):
 class PasswordPolicy:
     min_length: int = MIN_LENGTH
     max_length: int = MAX_LENGTH
-    #: bcrypt work factor. 12 is roughly 250ms on a 2026 server core, which is
-    #: the usual balance between "slow for an attacker" and "not a login
-    #: latency complaint". Lower it in tests, never in production.
+    #: bcrypt work factor. Retained because hashes made under it still exist
+    #: and because `require_production_ready` still audits it, but nothing new
+    #: is hashed with bcrypt any more.
     rounds: int = 12
+
+    # -- Argon2id ----------------------------------------------------------
+    #
+    # OWASP's minimum recommended configuration: 19 MiB, two iterations, one
+    # degree of parallelism. Memory is the parameter that matters — it is what
+    # a GPU attack cannot amortise — so raise `argon2_memory_kib` before
+    # reaching for `argon2_time_cost`.
+
+    argon2_memory_kib: int = 19_456
+    argon2_time_cost: int = 2
+    argon2_parallelism: int = 1
+    #: Length of the derived key and of the random salt, both in bytes.
+    argon2_hash_len: int = 32
+    argon2_salt_len: int = 16
+
     #: Extra denied values — a breach corpus, the product name, a customer's
     #: own domain. Compared case-insensitively after normalisation.
     deny: frozenset[str] = frozenset()
@@ -90,6 +127,25 @@ class PasswordPolicy:
     #: with password "jsmith2026!" is guessed on the first try by anyone who
     #: has seen the address.
     reject_email_similarity: bool = True
+
+    @classmethod
+    def fast(cls, **overrides: object) -> "PasswordPolicy":
+        """Deliberately weak parameters, for tests only.
+
+        A suite that hashes a few thousand passwords at production cost spends
+        minutes doing it, and a slow suite is one people stop running. Named
+        rather than assembled inline so it is obvious at every call site that
+        this is not a configuration anyone should deploy.
+        """
+
+        settings: dict[str, object] = {
+            "rounds": 4,
+            "argon2_memory_kib": 1024,
+            "argon2_time_cost": 1,
+            "argon2_parallelism": 1,
+        }
+        settings.update(overrides)
+        return cls(**settings)  # type: ignore[arg-type]
 
     def check(self, password: str, email: str = "") -> None:
         """Raise `WeakPassword` if this password may not be used."""
@@ -152,21 +208,40 @@ def _is_a_run(value: str) -> bool:
 
 
 class PasswordHasher:
-    """bcrypt, with the pre-hash that makes it length-safe."""
+    """Argon2id for new hashes, bcrypt for the ones already stored."""
 
     def __init__(self, policy: PasswordPolicy | None = None) -> None:
         self.policy = policy or PasswordPolicy()
         try:
-            import bcrypt
+            import argon2
         except ImportError as error:                        # pragma: no cover
             raise RuntimeError(
-                "the `bcrypt` package is required for password hashing. "
+                "the `argon2-cffi` package is required for password hashing. "
                 "Install it with `pip install 'clipforge[auth]'`. There is "
                 "deliberately no pure-Python fallback: a weaker hash that "
                 "activates when a dependency is missing is a weaker hash "
                 "nobody notices in production."
             ) from error
+        try:
+            import bcrypt
+        except ImportError as error:                        # pragma: no cover
+            raise RuntimeError(
+                "the `bcrypt` package is still required. Hashes written "
+                "before the move to Argon2id are verified with it, and "
+                "dropping it would lock out every account that has not "
+                "signed in since."
+            ) from error
+
+        self._argon2 = argon2
         self._bcrypt = bcrypt
+        self._hasher = argon2.PasswordHasher(
+            time_cost=self.policy.argon2_time_cost,
+            memory_cost=self.policy.argon2_memory_kib,
+            parallelism=self.policy.argon2_parallelism,
+            hash_len=self.policy.argon2_hash_len,
+            salt_len=self.policy.argon2_salt_len,
+            type=argon2.Type.ID,
+        )
         #: A hash of a value nobody knows, used to spend realistic time on a
         #: login for an address that does not exist. Built once, because
         #: building it costs exactly as much as a real hash.
@@ -174,57 +249,114 @@ class PasswordHasher:
 
     # -- hashing -----------------------------------------------------------
 
-    def prepare(self, password: str) -> bytes:
-        """The bcrypt input: base64 of the SHA-256 of the password.
+    def normalise(self, password: str) -> str:
+        """NFKC, so two visually identical passwords are one password.
 
-        Fixed at 44 bytes, so bcrypt's 72-byte ceiling is unreachable, and
-        base64'd so the digest cannot contain a NUL that bcrypt would truncate
-        at.
+        A passphrase typed on a different keyboard layout can arrive in a
+        different Unicode composition. Without this the same characters hash
+        differently and the user cannot sign in.
         """
 
-        normalised = unicodedata.normalize("NFKC", password).encode()
-        return base64.b64encode(hashlib.sha256(normalised).digest())
+        return unicodedata.normalize("NFKC", password)
+
+    def prepare(self, password: str) -> bytes:
+        """The *legacy bcrypt* input: base64 of the SHA-256 of the password.
+
+        Kept only to verify hashes written before Argon2id. Fixed at 44 bytes,
+        so bcrypt's 72-byte ceiling is unreachable, and base64'd so the digest
+        cannot contain a NUL that bcrypt would truncate at.
+        """
+
+        return base64.b64encode(
+            hashlib.sha256(self.normalise(password).encode()).digest()
+        )
 
     def hash(self, password: str) -> str:
-        salt = self._bcrypt.gensalt(rounds=self.policy.rounds)
-        return self._bcrypt.hashpw(self.prepare(password), salt).decode()
+        """Argon2id. Always — bcrypt is never written again."""
+        return self._hasher.hash(self.normalise(password))
 
     def verify(self, password: str, stored: str) -> bool:
+        """Check a password against whichever scheme produced the hash.
+
+        Dispatch is on the stored hash's own prefix, not on the algorithm tag
+        recorded beside it. The hash format is self-describing and the tag is
+        metadata that can be absent or wrong after a bad migration; trusting
+        the tag would mean an account whose row was mislabelled can never sign
+        in again.
+        """
+
         if not stored:
             # No hash on the identity: an invited account that never set a
             # password. Still spend the time, so the answer is not fast.
             self.verify_dummy()
             return False
-        try:
-            return self._bcrypt.checkpw(self.prepare(password), stored.encode())
-        except (ValueError, TypeError):
-            # A malformed stored hash. Not a match, and not an exception the
-            # login path should have to handle.
-            return False
+
+        if stored.startswith("$argon2"):
+            try:
+                # argon2-cffi takes the hash first. Getting that backwards
+                # returns "wrong password" for every correct password, and a
+                # broad `except Exception` around it hides the mistake behind
+                # a plausible answer — which is exactly what happened while
+                # writing this. Hence the narrow excepts below.
+                return bool(self._hasher.verify(stored, self.normalise(password)))
+            except self._argon2.exceptions.VerifyMismatchError:
+                return False
+            except self._argon2.exceptions.VerificationError:
+                # Covers a corrupt or truncated hash. Still not a match, but
+                # worth a log line: it means a row in the database is damaged.
+                log.warning("argon2 could not verify a stored hash")
+                return False
+
+        if stored.startswith("$2"):
+            try:
+                return self._bcrypt.checkpw(self.prepare(password), stored.encode())
+            except (ValueError, TypeError):
+                return False
+
+        # An unrecognised format. Not a match, and not an exception the login
+        # path should have to handle.
+        self.verify_dummy()
+        return False
 
     def verify_dummy(self) -> bool:
         """Spend a verification's worth of time and return False.
 
         Called when the email is unknown. Without it the miss returns in
-        microseconds and the hit takes 250ms, which is a reliable oracle for
-        "does this address have an account here" — the exact question the rest
-        of this package works to keep unanswerable.
+        microseconds and the hit takes tens of milliseconds, which is a
+        reliable oracle for "does this address have an account here" — the
+        exact question the rest of this package works to keep unanswerable.
+
+        The dummy is Argon2id because that is what the overwhelming majority
+        of live hashes will be. A surviving bcrypt account still verifies an
+        order of magnitude slower, which leaks "this account has not signed in
+        since the migration" — not whether it exists. That window closes as the
+        fleet rehashes itself, and it is the price of not locking anyone out.
         """
 
-        self._bcrypt.checkpw(self.prepare("stopwatch"), self._dummy.encode())
+        try:
+            self._hasher.verify(self._dummy, self.normalise("stopwatch"))
+        except self._argon2.exceptions.VerificationError:
+            pass                                            # always, by design
         return False
 
     # -- upgrades ----------------------------------------------------------
 
     def needs_rehash(self, stored: str, algo: str) -> bool:
-        """Whether this hash was made by an older policy."""
+        """Whether this hash was made by an older scheme or a weaker policy.
 
-        if algo != ALGORITHM or not stored:
+        `service.log_in` calls this on every success and replaces the hash when
+        it answers True. That is the entire bcrypt migration: no flag day, no
+        forced resets, and the parameters keep pace with the hardware.
+        """
+
+        if not stored:
             return True
-        match = re.match(r"^\$2[aby]\$(\d{2})\$", stored)
-        if match is None:
+        if stored.startswith("$argon2"):
+            return bool(self._hasher.check_needs_rehash(stored))
+        if stored.startswith("$2"):
+            # Any surviving bcrypt hash is stale by definition now.
             return True
-        return int(match.group(1)) < self.policy.rounds
+        return True
 
     # -- token hashing -----------------------------------------------------
 

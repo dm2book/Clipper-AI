@@ -6,7 +6,7 @@
  * makes the types agree with nothing.
  *
  * Source: /workspace/clipper-ai/openapi.json
- * Schemas: 40
+ * Schemas: 49
  */
 
 export interface ActivityOut {
@@ -73,6 +73,17 @@ export interface DeleteAccountRequest {
   password: string;
 }
 
+export interface DeviceOut {
+  device_id: string;
+  label?: string;
+  user_agent?: string;
+  last_ip?: string;
+  first_seen_at: string;
+  last_seen_at: string;
+  active: boolean;
+  current?: boolean;
+}
+
 /** An address and nothing else. */
 export interface EmailRequest {
   email: string;
@@ -94,10 +105,13 @@ export interface LoginRequest {
   tenant_id?: string;
 }
 
+/** A completed sign-in, or a challenge. Never both. */
 export interface LoginResponse {
-  tokens: TokenPairOut;
-  memberships: MembershipOut[];
+  tokens?: TokenPairOut | null;
+  memberships?: MembershipOut[];
   unverified?: boolean;
+  mfa?: MfaChallengeOut | null;
+  csrf_token?: string;
 }
 
 export interface MembershipOut {
@@ -129,6 +143,56 @@ export interface MetricSeriesOut {
   label: string;
   unit?: string;
   points: SeriesPointOut[];
+}
+
+/** Returned instead of tokens when a second factor is owed. */
+export interface MfaChallengeOut {
+  challenge_token: string;
+  expires_at: string;
+  kinds?: string[];
+  recovery_available?: boolean;
+}
+
+export interface MfaConfirmRequest {
+  factor_id: string;
+  code: string;
+}
+
+export interface MfaConfirmResponse {
+  recovery_codes: string[];
+  message: string;
+}
+
+export interface MfaEnrolRequest {
+  label?: string;
+}
+
+/** Shown once. The secret is never readable again. */
+export interface MfaEnrolResponse {
+  factor_id: string;
+  secret: string;
+  otpauth_uri: string;
+}
+
+export interface MfaFactorOut {
+  factor_id: string;
+  kind: string;
+  label?: string;
+  active: boolean;
+  created_at: string;
+  last_used_at?: string | null;
+}
+
+export interface MfaStatusOut {
+  enabled: boolean;
+  factors?: MfaFactorOut[];
+  recovery_codes_remaining?: number;
+}
+
+export interface MfaVerifyRequest {
+  challenge_token: string;
+  code: string;
+  tenant_id?: string;
 }
 
 export interface OverviewResponse {

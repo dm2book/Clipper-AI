@@ -21,12 +21,15 @@ has to branch on three shapes gets two of them wrong.
 from __future__ import annotations
 
 import os
+import time
 import unittest
 from datetime import UTC, datetime, timedelta
 
 from fastapi.testclient import TestClient
 
+from clipforge.auth import totp as totp_mod
 from clipforge.api import create_app
+from clipforge.api.cookies import CookieConfig
 from clipforge.api.deps import Services
 from clipforge.auth import (
     AccessTokenIssuer,
@@ -72,7 +75,15 @@ def build(tenants=("ten_a",)) -> tuple[TestClient, Services]:
         _populate(database, tenant)
         _register(auth, f"{tenant}@example.com", tenant)
 
-    return TestClient(create_app(services)), services
+    app = create_app(services)
+    # TestClient talks http://testserver, and no HTTP client stores a `Secure`
+    # cookie from a plain-http origin — so with the production default nothing
+    # here would ever hold a cookie and every cookie test would pass vacuously
+    # or fail confusingly. This is the same setting a local dev deployment
+    # uses, set explicitly rather than through the environment so the suite
+    # does not depend on process state.
+    app.state.cookie_config = CookieConfig(secure=False)
+    return TestClient(app), services
 
 
 def _register(auth: AuthService, email: str, tenant: str, role: str = "owner"):
@@ -751,7 +762,15 @@ def build_self_service() -> tuple[TestClient, Services]:
             services, identity.identity_id, identity.email,
         ),
     )
-    return TestClient(create_app(services)), services
+    app = create_app(services)
+    # TestClient talks http://testserver, and no HTTP client stores a `Secure`
+    # cookie from a plain-http origin — so with the production default nothing
+    # here would ever hold a cookie and every cookie test would pass vacuously
+    # or fail confusingly. This is the same setting a local dev deployment
+    # uses, set explicitly rather than through the environment so the suite
+    # does not depend on process state.
+    app.state.cookie_config = CookieConfig(secure=False)
+    return TestClient(app), services
 
 
 class OnboardingTest(unittest.TestCase):
@@ -1070,6 +1089,390 @@ class EmailBackendTest(unittest.TestCase):
         with self.assertRaises(EmailConfigError):
             email_sender_from_env()
 
+
+
+# ---------------------------------------------------------------------------
+# Cookies, CSRF and MFA over HTTP
+# ---------------------------------------------------------------------------
+
+
+class CookieSessionTest(ApiTest):
+    """The refresh token lives in an HttpOnly cookie, not in script's reach."""
+
+    def login(self):
+        return self.client.post(
+            "/api/v1/auth/login",
+            json={"email": "ten_a@example.com", "password": PASSWORD},
+        )
+
+    def test_login_sets_the_three_cookies(self) -> None:
+        response = self.login()
+        self.assertEqual(response.status_code, 200, response.text)
+        names = set(response.cookies.keys())
+        self.assertTrue(
+            any("refresh" in n for n in names), names
+        )
+        self.assertTrue(any("device" in n for n in names), names)
+        self.assertTrue(any("csrf" in n for n in names), names)
+
+    def test_the_refresh_cookie_is_httponly_and_the_csrf_one_is_not(self) -> None:
+        """The whole double-submit scheme needs exactly this asymmetry."""
+        raw = self.login().headers.get_list("set-cookie")
+        refresh = next(c for c in raw if "refresh" in c)
+        csrf = next(c for c in raw if "csrf" in c)
+        self.assertIn("httponly", refresh.lower())
+        self.assertNotIn("httponly", csrf.lower())
+
+    def test_cookies_carry_samesite(self) -> None:
+        raw = self.login().headers.get_list("set-cookie")
+        self.assertTrue(
+            all("samesite" in c.lower() for c in raw if "clipforge" in c), raw
+        )
+
+    def test_the_access_token_is_never_a_cookie(self) -> None:
+        """It stays in the body so only two endpoints need CSRF protection."""
+        response = self.login()
+        raw = " ".join(response.headers.get_list("set-cookie"))
+        self.assertNotIn(response.json()["tokens"]["access_token"], raw)
+
+    def test_the_body_carries_a_csrf_token_matching_the_cookie(self) -> None:
+        response = self.login()
+        body = response.json()["csrf_token"]
+        self.assertTrue(body)
+        cookie = next(
+            v for k, v in response.cookies.items() if "csrf" in k
+        )
+        self.assertEqual(body, cookie)
+
+    def test_refresh_works_from_the_cookie_with_a_csrf_header(self) -> None:
+        token = self.login().json()["csrf_token"]
+        response = self.client.post(
+            "/api/v1/auth/refresh", headers={"X-CSRF-Token": token},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["access_token"])
+
+    def test_refresh_from_the_cookie_without_the_header_is_refused(self) -> None:
+        """This is the CSRF attack: the browser sends the cookie by itself."""
+        self.login()
+        response = self.client.post("/api/v1/auth/refresh")
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()["error"]["code"], "CSRF_FAILED")
+
+    def test_a_wrong_csrf_header_is_refused(self) -> None:
+        self.login()
+        response = self.client.post(
+            "/api/v1/auth/refresh", headers={"X-CSRF-Token": "not-the-token"},
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_refresh_with_the_token_in_the_body_needs_no_csrf(self) -> None:
+        """A caller that supplies the token cannot be a cross-site forgery —
+        the attacker's page could not have read it to send it."""
+
+        refresh = self.login().json()["tokens"]["refresh_token"]
+        fresh = TestClient(self.client.app)          # no cookie jar
+        response = fresh.post(
+            "/api/v1/auth/refresh", json={"refresh_token": refresh},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+    def test_refresh_rotates_the_cookie(self) -> None:
+        """Leaving a spent token in the cookie logs the browser out next time."""
+        first = self.login()
+        before = next(v for k, v in first.cookies.items() if "refresh" in k)
+        self.client.post(
+            "/api/v1/auth/refresh",
+            headers={"X-CSRF-Token": first.json()["csrf_token"]},
+        )
+        after = next(
+            v for k, v in self.client.cookies.items() if "refresh" in k
+        )
+        self.assertNotEqual(before, after)
+
+    def test_logout_clears_the_session_cookies_but_keeps_the_device(self) -> None:
+        """Keeping the device is what stops a new-device alert on every login."""
+        token = self.login().json()["csrf_token"]
+        response = self.client.post(
+            "/api/v1/auth/logout", headers={"X-CSRF-Token": token},
+        )
+        self.assertEqual(response.status_code, 204)
+        raw = " ".join(response.headers.get_list("set-cookie"))
+        self.assertIn("refresh", raw)                # a deletion is a Set-Cookie
+        self.assertNotIn("device", raw)
+
+    def test_refresh_with_nothing_at_all_is_a_401(self) -> None:
+        fresh = TestClient(self.client.app)
+        response = fresh.post(
+            "/api/v1/auth/refresh", headers={"X-CSRF-Token": "x"},
+        )
+        self.assertIn(response.status_code, (401, 403))
+
+
+class MfaEndpointTest(ApiTest):
+    """Enrol, challenge and complete, over HTTP only."""
+
+    def enrol(self) -> tuple[str, list[str]]:
+        started = self.client.post(
+            "/api/v1/auth/mfa/enrol", json={"label": "iPhone"},
+            headers=self.auth(),
+        )
+        self.assertEqual(started.status_code, 200, started.text)
+        body = started.json()
+        # Confirm with the *previous* step's code. Replay protection records
+        # the counter that was spent, so confirming with the current code
+        # would leave the very next login unable to use it — correct
+        # behaviour, and an unhelpful way to set up a login test.
+        confirmed = self.client.post(
+            "/api/v1/auth/mfa/confirm",
+            json={"factor_id": body["factor_id"],
+                  "code": totp_mod.totp(body["secret"],
+                                        at=time.time() - 30)},
+            headers=self.auth(),
+        )
+        self.assertEqual(confirmed.status_code, 200, confirmed.text)
+        return body["secret"], confirmed.json()["recovery_codes"]
+
+    def test_status_starts_disabled(self) -> None:
+        body = self.get("/api/v1/auth/mfa").json()
+        self.assertFalse(body["enabled"])
+        self.assertEqual(body["factors"], [])
+
+    def test_enrolment_returns_a_secret_and_a_qr_uri(self) -> None:
+        response = self.client.post(
+            "/api/v1/auth/mfa/enrol", json={"label": "iPhone"},
+            headers=self.auth(),
+        )
+        body = response.json()
+        self.assertTrue(body["secret"])
+        self.assertTrue(body["otpauth_uri"].startswith("otpauth://totp/"))
+
+    def test_enrolment_alone_does_not_enable_anything(self) -> None:
+        self.client.post("/api/v1/auth/mfa/enrol", json={},
+                         headers=self.auth())
+        self.assertFalse(self.get("/api/v1/auth/mfa").json()["enabled"])
+
+    def test_confirming_enables_it_and_returns_recovery_codes(self) -> None:
+        _secret, codes = self.enrol()
+        self.assertEqual(len(codes), 10)
+        status = self.get("/api/v1/auth/mfa").json()
+        self.assertTrue(status["enabled"])
+        self.assertEqual(status["recovery_codes_remaining"], 10)
+
+    def test_the_status_endpoint_never_returns_the_secret(self) -> None:
+        secret, _codes = self.enrol()
+        self.assertNotIn(secret, self.get("/api/v1/auth/mfa").text)
+
+    def test_login_then_returns_a_challenge_and_no_tokens(self) -> None:
+        self.enrol()
+        response = self.client.post(
+            "/api/v1/auth/login",
+            json={"email": "ten_a@example.com", "password": PASSWORD},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertIsNone(body["tokens"])
+        self.assertIsNotNone(body["mfa"])
+        self.assertIn("totp", body["mfa"]["kinds"])
+
+    def test_a_challenge_sets_no_session_cookie(self) -> None:
+        """Half a login must leave no credential behind."""
+        self.enrol()
+        response = TestClient(self.client.app).post(
+            "/api/v1/auth/login",
+            json={"email": "ten_a@example.com", "password": PASSWORD},
+        )
+        raw = " ".join(response.headers.get_list("set-cookie"))
+        self.assertNotIn("refresh", raw)
+
+    def test_the_second_step_completes_the_login(self) -> None:
+        secret, _codes = self.enrol()
+        challenge = self.client.post(
+            "/api/v1/auth/login",
+            json={"email": "ten_a@example.com", "password": PASSWORD},
+        ).json()["mfa"]["challenge_token"]
+
+        response = self.client.post(
+            "/api/v1/auth/mfa/verify",
+            json={"challenge_token": challenge,
+                  "code": totp_mod.totp(secret)},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["tokens"]["access_token"])
+
+    def test_a_recovery_code_works_at_the_second_step(self) -> None:
+        _secret, codes = self.enrol()
+        challenge = self.client.post(
+            "/api/v1/auth/login",
+            json={"email": "ten_a@example.com", "password": PASSWORD},
+        ).json()["mfa"]["challenge_token"]
+        response = self.client.post(
+            "/api/v1/auth/mfa/verify",
+            json={"challenge_token": challenge, "code": codes[0]},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+    def test_a_wrong_code_is_401(self) -> None:
+        self.enrol()
+        challenge = self.client.post(
+            "/api/v1/auth/login",
+            json={"email": "ten_a@example.com", "password": PASSWORD},
+        ).json()["mfa"]["challenge_token"]
+        response = self.client.post(
+            "/api/v1/auth/mfa/verify",
+            json={"challenge_token": challenge, "code": "000000"},
+        )
+        self.assertEqual(response.status_code, 401)
+
+    def test_disabling_needs_the_password(self) -> None:
+        self.enrol()
+        wrong = self.client.post(
+            "/api/v1/auth/mfa/disable", json={"password": "not-it"},
+            headers=self.auth(),
+        )
+        self.assertEqual(wrong.status_code, 401)
+        right = self.client.post(
+            "/api/v1/auth/mfa/disable", json={"password": PASSWORD},
+            headers=self.auth(),
+        )
+        self.assertEqual(right.status_code, 200, right.text)
+        self.assertFalse(self.get("/api/v1/auth/mfa").json()["enabled"])
+
+    def test_regenerating_codes_needs_the_password(self) -> None:
+        _secret, old = self.enrol()
+        response = self.client.post(
+            "/api/v1/auth/mfa/recovery-codes", json={"password": PASSWORD},
+            headers=self.auth(),
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        fresh = response.json()["recovery_codes"]
+        self.assertFalse(set(old) & set(fresh))
+
+    def test_every_mfa_endpoint_refuses_an_anonymous_caller(self) -> None:
+        for path, payload in (
+            ("/api/v1/auth/mfa", None),
+            ("/api/v1/auth/mfa/enrol", {}),
+            ("/api/v1/auth/mfa/confirm", {"factor_id": "x", "code": "1"}),
+            ("/api/v1/auth/mfa/disable", {"password": PASSWORD}),
+        ):
+            with self.subTest(path=path):
+                response = (
+                    self.client.get(path) if payload is None
+                    else self.client.post(path, json=payload)
+                )
+                self.assertEqual(response.status_code, 401)
+
+
+class DeviceEndpointTest(ApiTest):
+    def test_a_signed_in_browser_appears_in_the_device_list(self) -> None:
+        self.client.post(
+            "/api/v1/auth/login",
+            json={"email": "ten_a@example.com", "password": PASSWORD},
+            headers={"user-agent": "Mozilla/5.0 (Windows NT 10.0) Firefox/121"},
+        )
+        devices = self.get("/api/v1/auth/devices").json()
+        self.assertEqual(len(devices), 1)
+        self.assertEqual(devices[0]["label"], "Firefox on Windows")
+
+    def test_the_current_device_is_marked(self) -> None:
+        self.client.post(
+            "/api/v1/auth/login",
+            json={"email": "ten_a@example.com", "password": PASSWORD},
+        )
+        devices = self.get("/api/v1/auth/devices").json()
+        self.assertTrue(devices[0]["current"])
+
+    def test_revoking_a_device_reports_the_sessions_it_ended(self) -> None:
+        self.client.post(
+            "/api/v1/auth/login",
+            json={"email": "ten_a@example.com", "password": PASSWORD},
+        )
+        device_id = self.get("/api/v1/auth/devices").json()[0]["device_id"]
+        response = self.client.post(
+            f"/api/v1/auth/devices/{device_id}/revoke", headers=self.auth(),
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIn("signed out", response.json()["message"])
+
+    def test_a_device_belonging_to_someone_else_is_a_404(self) -> None:
+        response = self.client.post(
+            "/api/v1/auth/devices/dev_not_yours/revoke", headers=self.auth(),
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_the_device_list_needs_a_session(self) -> None:
+        self.assertEqual(
+            self.client.get("/api/v1/auth/devices").status_code, 401
+        )
+
+
+class RbacUnchangedTest(ApiTest):
+    """The brief said not to break RBAC. This is what says it did not.
+
+    `require_role` and the role ladder are untouched by the MFA work, and
+    these assertions fail loudly if a later change to the auth package
+    disturbs the transport-level gate.
+    """
+
+    def test_the_role_ladder_is_unchanged(self) -> None:
+        from clipforge.api.deps import _ROLE_ORDER
+
+        self.assertEqual(
+            _ROLE_ORDER,
+            ("viewer", "analyst", "editor", "operator", "admin", "owner"),
+        )
+
+    def test_an_owner_still_reaches_an_operator_endpoint(self) -> None:
+        response = self.client.post(
+            "/api/v1/sources", json={"url": "https://example.com/x"},
+            headers=self.auth(),
+        )
+        # 503 because no acquisition worker is configured — the point is that
+        # the role gate let the request through to reach that answer.
+        self.assertNotIn(response.status_code, (401, 403))
+
+    def test_a_viewer_is_still_refused(self) -> None:
+        client, services = build()
+        self.addCleanup(services.close)
+        _register(services.auth, "viewer@example.com", "ten_a", role="viewer")
+        token = client.post(
+            "/api/v1/auth/login",
+            json={"email": "viewer@example.com", "password": PASSWORD},
+        ).json()["tokens"]["access_token"]
+        response = client.post(
+            "/api/v1/sources", json={"url": "https://example.com/x"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_mfa_does_not_change_the_role_in_the_token(self) -> None:
+        """A second factor proves who you are, not what you may do."""
+        before = self.client.post(
+            "/api/v1/auth/login",
+            json={"email": "ten_a@example.com", "password": PASSWORD},
+        ).json()["memberships"][0]["role"]
+
+        started = self.client.post(
+            "/api/v1/auth/mfa/enrol", json={}, headers=self.auth(),
+        ).json()
+        self.client.post(
+            "/api/v1/auth/mfa/confirm",
+            json={"factor_id": started["factor_id"],
+                  "code": totp_mod.totp(started["secret"],
+                                        at=time.time() - 30)},
+            headers=self.auth(),
+        )
+        challenge = self.client.post(
+            "/api/v1/auth/login",
+            json={"email": "ten_a@example.com", "password": PASSWORD},
+        ).json()["mfa"]["challenge_token"]
+        after = self.client.post(
+            "/api/v1/auth/mfa/verify",
+            json={"challenge_token": challenge,
+                  "code": totp_mod.totp(started["secret"])},
+        ).json()["memberships"][0]["role"]
+
+        self.assertEqual(before, after)
 
 if __name__ == "__main__":
     unittest.main()

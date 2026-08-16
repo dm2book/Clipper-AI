@@ -44,6 +44,7 @@ from typing import Any, Callable
 
 from . import email as email_mod
 from .config import AuthConfig
+from .mfa import MfaMixin, device_label
 from .passwords import PasswordHasher, WeakPassword
 from .store import AuthStore, DuplicateEmail
 from .tokens import AccessTokenIssuer, InvalidToken, new_opaque_token, new_refresh_token
@@ -85,15 +86,29 @@ class SignUpResult:
 
 @dataclass(slots=True)
 class LoginResult:
-    tokens: TokenPair
+    """The outcome of a password step, which is not always a session.
+
+    When a second factor is owed, `tokens` is None and `mfa` carries the
+    challenge. Modelled as one result type rather than two so a caller that
+    forgets about MFA gets an obvious `None` where it wanted a token, instead
+    of a plausible-looking session that skipped a factor.
+    """
+
+    tokens: TokenPair | None
     identity: Identity
     memberships: tuple[Membership, ...] = ()
     #: True when the account exists but has not confirmed its address, and the
     #: deployment allows unverified sign-in. The UI should nag.
     unverified: bool = False
+    #: Set when the password was right and a second factor is still required.
+    mfa: Any = None
+
+    @property
+    def complete(self) -> bool:
+        return self.tokens is not None
 
 
-class AuthService:
+class AuthService(MfaMixin):
     """Every authentication flow, over an `AuthStore`."""
 
     def __init__(
@@ -232,6 +247,7 @@ class AuthService:
         tenant_id: str = "",
         ip: str = "",
         user_agent: str = "",
+        device_id: str = "",
     ) -> LoginResult:
         """Exchange an email and password for a token pair.
 
@@ -317,6 +333,19 @@ class AuthService:
         identity = self.store.save_identity(identity)
 
         self._clear_limit("login_email", address)
+
+        # The password was right. If a second factor is owed, stop here and
+        # hand back a challenge — no session, no tokens. Anything else makes
+        # the factor advisory, because a client that skips the second call
+        # would already be signed in.
+        if self.mfa_required(identity.identity_id):
+            challenge = self._issue_challenge(identity, now, ip=ip)
+            return LoginResult(
+                tokens=None, identity=identity,
+                memberships=self.store.memberships(identity.identity_id),
+                unverified=not identity.verified, mfa=challenge,
+            )
+
         memberships = self.store.memberships(identity.identity_id)
 
         # A verified person with nowhere to work. Provisioning happens here,
@@ -342,7 +371,8 @@ class AuthService:
         chosen = self._choose_membership(memberships, tenant_id)
 
         tokens = self._start_session(
-            identity, chosen, now, ip=ip, user_agent=user_agent
+            identity, chosen, now, ip=ip, user_agent=user_agent,
+            device_id=device_id,
         )
         self._audit(EventKind.LOGIN_SUCCEEDED, identity_id=identity.identity_id,
                     email=address, ip=ip, user_agent=user_agent,
@@ -418,13 +448,20 @@ class AuthService:
         *,
         ip: str,
         user_agent: str,
+        device_id: str = "",
+        mfa_satisfied: bool = False,
     ) -> TokenPair:
+        if device_id:
+            self._record_device(identity, device_id, now, ip=ip,
+                                user_agent=user_agent)
         refresh = new_refresh_token()
         session = Session(
             session_id=f"ses_{uuid.uuid4().hex[:16]}",
             identity_id=identity.identity_id,
             token_hash=self.hasher.hash_token(refresh),
             tenant_id=membership.tenant_id if membership else "",
+            device_id=device_id,
+            mfa_satisfied=mfa_satisfied,
             ip=ip,
             user_agent=user_agent[:400],
             issued_at=now,
@@ -565,6 +602,86 @@ class AuthService:
     def sessions(self, identity_id: str) -> tuple[Session, ...]:
         """Every session, for a "where am I signed in" screen."""
         return self.store.sessions_for(identity_id)
+
+    # -- devices -----------------------------------------------------------
+
+    def _record_device(
+        self, identity: Identity, device_id: str, now: datetime, *,
+        ip: str, user_agent: str,
+    ) -> None:
+        """Touch the device row, and warn on one that has never been seen.
+
+        The email is the point of the whole feature. A sign-in from a device
+        the owner does not recognise is the earliest signal a stolen password
+        gives off, and it is often the only one.
+        """
+
+        from .types import Device
+
+        known = self.store.device(device_id)
+        label = device_label(user_agent)
+        self.store.upsert_device(Device(
+            device_id=device_id,
+            identity_id=identity.identity_id,
+            label=label,
+            user_agent=user_agent[:400],
+            last_ip=ip,
+            first_seen_at=known.first_seen_at if known else now,
+            last_seen_at=now,
+            revoked_at=known.revoked_at if known else None,
+        ))
+        if known is not None:
+            return
+
+        self._audit(EventKind.DEVICE_FIRST_SEEN,
+                    identity_id=identity.identity_id, email=identity.email,
+                    ip=ip, user_agent=user_agent, detail=label)
+        try:
+            self._send(email_mod.new_device_email(
+                identity.email, label, now.strftime("%d %B %Y at %H:%M UTC"),
+            ))
+        except Exception:                                   # noqa: BLE001
+            # A notice about a sign-in that has already happened must not fail
+            # the sign-in.
+            log.warning("could not send a new-device notice to %s",
+                        identity.identity_id)
+
+    def devices(self, identity_id: str):
+        """Every device that has signed in, most recent first."""
+        return self.store.devices_for(identity_id)
+
+    def revoke_device(
+        self, identity_id: str, device_id: str, *, ip: str = "",
+    ) -> int:
+        """Sign out one device and stop its sessions refreshing.
+
+        Revoking the device row alone would not do it: the sessions already
+        issued keep refreshing on their own tokens, so the phone stays signed
+        in and the user watches a button do nothing.
+        """
+
+        now = self.clock()
+        device = self.store.device(device_id)
+        if device is None or device.identity_id != identity_id:
+            raise AuthError("NOT_FOUND", "No such device.", status=404)
+
+        # `upsert_device` deliberately never touches `revoked_at` — otherwise
+        # the next sign-in from a revoked device would quietly un-revoke it —
+        # so the revocation goes through its own call.
+        self.store.set_device_revoked(device_id, now)
+
+        revoked = 0
+        for session in self.store.sessions_for(identity_id):
+            if session.device_id != device_id or not session.active(now):
+                continue
+            session.revoked_at = now
+            session.revoked_reason = "device signed out"
+            self.store.save_session(session)
+            revoked += 1
+
+        self._audit(EventKind.DEVICE_REVOKED, identity_id=identity_id,
+                    ip=ip, detail=f"{device.label}: {revoked} session(s)")
+        return revoked
 
     def authenticate(self, access_token: str) -> Principal:
         """Verify an access token. The request path's entry point.

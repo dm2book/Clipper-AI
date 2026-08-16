@@ -21,15 +21,19 @@ The window roll is in the same statement for the same reason.
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Sequence
 
 from .store import DuplicateEmail
 from .types import (
     AuthEvent,
+    Device,
     EventKind,
     Identity,
     IdentityStatus,
     Membership,
+    MfaFactor,
+    MfaKind,
+    RecoveryCode,
     Session,
     TokenKind,
     VerificationToken,
@@ -195,19 +199,20 @@ class PostgresAuthStore:
     _SESSION_COLUMNS = (
         "id, identity_id, token_hash, previous_hash, tenant_id, user_agent, "
         "ip, issued_at, expires_at, absolute_expires_at, revoked_at, "
-        "revoked_reason, rotations"
+        "revoked_reason, rotations, device_id, mfa_satisfied"
     )
 
     def create_session(self, session: Session) -> Session:
         self._run(
             f"INSERT INTO auth_sessions ({self._SESSION_COLUMNS}) "
-            f"VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            f"VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
             (
                 session.session_id, session.identity_id, session.token_hash,
                 session.previous_hash or None, session.tenant_id or None,
                 session.user_agent, _inet(session.ip), session.issued_at,
                 session.expires_at, session.absolute_expires_at,
                 session.revoked_at, session.revoked_reason, session.rotations,
+                session.device_id or None, session.mfa_satisfied,
             ),
         )
         return session
@@ -237,10 +242,11 @@ class PostgresAuthStore:
         self._run(
             "UPDATE auth_sessions SET token_hash=%s, previous_hash=%s, "
             "tenant_id=%s, expires_at=%s, revoked_at=%s, revoked_reason=%s, "
-            "rotations=%s WHERE id=%s",
+            "rotations=%s, mfa_satisfied=%s WHERE id=%s",
             (session.token_hash, session.previous_hash or None,
              session.tenant_id or None, session.expires_at, session.revoked_at,
-             session.revoked_reason, session.rotations, session.session_id),
+             session.revoked_reason, session.rotations, session.mfa_satisfied,
+             session.session_id),
         )
         return session
 
@@ -298,6 +304,140 @@ class PostgresAuthStore:
             "WHERE identity_id=%s AND kind=%s AND used_at IS NULL",
             (now, identity_id, kind.value),
         )
+
+    # -- multi-factor ------------------------------------------------------
+
+    _FACTOR_COLUMNS = (
+        "id, identity_id, kind, label, secret, created_at, confirmed_at, "
+        "last_used_at, last_counter"
+    )
+
+    def create_factor(self, factor: MfaFactor) -> MfaFactor:
+        self._run(
+            f"INSERT INTO auth_mfa_factors ({self._FACTOR_COLUMNS}) "
+            f"VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            (factor.factor_id, factor.identity_id, factor.kind.value,
+             factor.label, factor.secret, factor.created_at,
+             factor.confirmed_at, factor.last_used_at, factor.last_counter),
+        )
+        return factor
+
+    def factor(self, factor_id: str) -> MfaFactor | None:
+        row = self._one(
+            f"SELECT {self._FACTOR_COLUMNS} FROM auth_mfa_factors WHERE id = %s",
+            (factor_id,),
+        )
+        return _factor(row) if row else None
+
+    def factors_for(self, identity_id: str) -> tuple[MfaFactor, ...]:
+        rows = self._all(
+            f"SELECT {self._FACTOR_COLUMNS} FROM auth_mfa_factors "
+            f"WHERE identity_id = %s ORDER BY created_at",
+            (identity_id,),
+        )
+        return tuple(_factor(row) for row in rows)
+
+    def save_factor(self, factor: MfaFactor) -> MfaFactor:
+        self._run(
+            "UPDATE auth_mfa_factors SET label=%s, secret=%s, confirmed_at=%s, "
+            "last_used_at=%s, last_counter=%s WHERE id=%s",
+            (factor.label, factor.secret, factor.confirmed_at,
+             factor.last_used_at, factor.last_counter, factor.factor_id),
+        )
+        return factor
+
+    def delete_factor(self, factor_id: str) -> bool:
+        return self._run(
+            "DELETE FROM auth_mfa_factors WHERE id = %s", (factor_id,)
+        ) > 0
+
+    def replace_recovery_codes(
+        self, identity_id: str, codes: Sequence[RecoveryCode]
+    ) -> None:
+        # One transaction: a crash between the delete and the insert would
+        # leave an account with MFA enabled and no way back in.
+        with self._connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "DELETE FROM auth_recovery_codes WHERE identity_id = %s",
+                    (identity_id,),
+                )
+                for code in codes:
+                    cursor.execute(
+                        "INSERT INTO auth_recovery_codes "
+                        "(id, identity_id, code_hash, created_at, used_at, "
+                        "used_ip) VALUES (%s,%s,%s,%s,%s,%s)",
+                        (code.code_id, code.identity_id, code.code_hash,
+                         code.created_at, code.used_at, _inet(code.used_ip)),
+                    )
+
+    def recovery_codes_for(self, identity_id: str) -> tuple[RecoveryCode, ...]:
+        rows = self._all(
+            "SELECT id, identity_id, code_hash, created_at, used_at, used_ip "
+            "FROM auth_recovery_codes WHERE identity_id = %s ORDER BY created_at",
+            (identity_id,),
+        )
+        return tuple(
+            RecoveryCode(
+                code_id=row[0], identity_id=row[1], code_hash=row[2],
+                created_at=row[3], used_at=row[4], used_ip=_text(row[5]),
+            )
+            for row in rows
+        )
+
+    def save_recovery_code(self, code: RecoveryCode) -> RecoveryCode:
+        self._run(
+            "UPDATE auth_recovery_codes SET used_at=%s, used_ip=%s WHERE id=%s",
+            (code.used_at, _inet(code.used_ip), code.code_id),
+        )
+        return code
+
+    # -- devices -----------------------------------------------------------
+
+    def upsert_device(self, device: Device) -> Device:
+        """Insert, or touch what is already there.
+
+        `first_seen_at` is deliberately excluded from the update. It is the
+        fact a "new device" alert is judged against, so refreshing it on every
+        sign-in would silence every future alert for that device.
+        """
+
+        self._run(
+            "INSERT INTO auth_devices (id, identity_id, label, user_agent, "
+            "last_ip, first_seen_at, last_seen_at, revoked_at) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s) "
+            "ON CONFLICT (id) DO UPDATE SET "
+            "label = EXCLUDED.label, user_agent = EXCLUDED.user_agent, "
+            "last_ip = EXCLUDED.last_ip, last_seen_at = EXCLUDED.last_seen_at",
+            (device.device_id, device.identity_id, device.label,
+             device.user_agent, _inet(device.last_ip), device.first_seen_at,
+             device.last_seen_at, device.revoked_at),
+        )
+        return device
+
+    def device(self, device_id: str) -> Device | None:
+        row = self._one(
+            "SELECT id, identity_id, label, user_agent, last_ip, "
+            "first_seen_at, last_seen_at, revoked_at FROM auth_devices "
+            "WHERE id = %s",
+            (device_id,),
+        )
+        return _device(row) if row else None
+
+    def set_device_revoked(self, device_id: str, when: datetime | None) -> bool:
+        return self._run(
+            "UPDATE auth_devices SET revoked_at = %s WHERE id = %s",
+            (when, device_id),
+        ) > 0
+
+    def devices_for(self, identity_id: str) -> tuple[Device, ...]:
+        rows = self._all(
+            "SELECT id, identity_id, label, user_agent, last_ip, "
+            "first_seen_at, last_seen_at, revoked_at FROM auth_devices "
+            "WHERE identity_id = %s ORDER BY last_seen_at DESC",
+            (identity_id,),
+        )
+        return tuple(_device(row) for row in rows)
 
     # -- rate limiting -----------------------------------------------------
 
@@ -433,6 +573,23 @@ def _session(row: tuple) -> Session:
         user_agent=row[5] or "", ip=_text(row[6]), issued_at=row[7],
         expires_at=row[8], absolute_expires_at=row[9], revoked_at=row[10],
         revoked_reason=row[11] or "", rotations=row[12] or 0,
+        device_id=row[13] or "", mfa_satisfied=bool(row[14]),
+    )
+
+
+def _factor(row: tuple) -> MfaFactor:
+    return MfaFactor(
+        factor_id=row[0], identity_id=row[1], kind=MfaKind(row[2]),
+        label=row[3] or "", secret=row[4] or "", created_at=row[5],
+        confirmed_at=row[6], last_used_at=row[7], last_counter=row[8],
+    )
+
+
+def _device(row: tuple) -> Device:
+    return Device(
+        device_id=row[0], identity_id=row[1], label=row[2] or "",
+        user_agent=row[3] or "", last_ip=_text(row[4]),
+        first_seen_at=row[5], last_seen_at=row[6], revoked_at=row[7],
     )
 
 

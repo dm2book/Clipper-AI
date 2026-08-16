@@ -81,11 +81,88 @@ class TokenPairOut(BaseModel):
     tenant_id: str = ""
 
 
+class MfaChallengeOut(BaseModel):
+    """Returned instead of tokens when a second factor is owed."""
+
+    challenge_token: str
+    expires_at: datetime
+    kinds: list[str] = Field(default_factory=list)
+    recovery_available: bool = False
+
+
 class LoginResponse(BaseModel):
-    tokens: TokenPairOut
-    memberships: list[MembershipOut]
+    """A completed sign-in, or a challenge. Never both.
+
+    `tokens` is null when `mfa` is set. Modelled as one nullable field rather
+    than two response shapes so a client that ignores MFA gets an obvious null
+    where it wanted a token, instead of a 200 it misreads as success.
+    """
+
+    tokens: TokenPairOut | None = None
+    memberships: list[MembershipOut] = Field(default_factory=list)
     #: True when the address is registered but unconfirmed. The UI nags.
     unverified: bool = False
+    mfa: MfaChallengeOut | None = None
+    #: The double-submit CSRF token, also set as a readable cookie. In the body
+    #: too so a client need not parse cookies to find it.
+    csrf_token: str = ""
+
+
+class MfaVerifyRequest(BaseModel):
+    challenge_token: str
+    #: A TOTP code or a recovery code. The server decides which.
+    code: str
+    tenant_id: str = ""
+
+
+class MfaEnrolRequest(BaseModel):
+    label: str = ""
+
+
+class MfaEnrolResponse(BaseModel):
+    """Shown once. The secret is never readable again."""
+
+    factor_id: str
+    secret: str
+    otpauth_uri: str
+
+
+class MfaConfirmRequest(BaseModel):
+    factor_id: str
+    code: str
+
+
+class MfaConfirmResponse(BaseModel):
+    #: Displayed once and then unrecoverable — they are stored hashed.
+    recovery_codes: list[str]
+    message: str
+
+
+class MfaFactorOut(BaseModel):
+    factor_id: str
+    kind: str
+    label: str = ""
+    active: bool
+    created_at: datetime
+    last_used_at: datetime | None = None
+
+
+class MfaStatusOut(BaseModel):
+    enabled: bool
+    factors: list[MfaFactorOut] = Field(default_factory=list)
+    recovery_codes_remaining: int = 0
+
+
+class DeviceOut(BaseModel):
+    device_id: str
+    label: str = ""
+    user_agent: str = ""
+    last_ip: str = ""
+    first_seen_at: datetime
+    last_seen_at: datetime
+    active: bool
+    #: True for the device making this request, so the UI can say "this one".
+    current: bool = False
 
 
 class RefreshRequest(BaseModel):
