@@ -19,23 +19,34 @@ worker.run()
 
 Or `clipforge-worker --tenants ten_acme`.
 
+Each handler names its own successor, so one worker drains the whole chain:
+`discover_sources` → `transcribe` → `detect_clips` → `render_video` →
+`publish_upload` → `verify_upload` → `collect_metrics`. Nothing between those
+arrows is queued by hand — see `chain` for the edges and `runtime` for why the
+successor is written in the same transaction as the predecessor's success.
+
 | Module | Responsibility |
 |---|---|
 | `types.py` | What a handler is given and may answer. |
 | `runtime.py` | Claim, heartbeat, retry, reap, shut down cleanly. |
-| `handlers.py` | The five kinds, over the engines that already existed. |
+| `handlers.py` | One per job kind, over the engines that already existed. |
+| `selection.py` | Transcript → clip row → booked posts → a queued render. |
+| `chain.py` | What follows what, and the dedupe keys that make it safe. |
 | `services.py` | What this host can actually do, and why not otherwise. |
 | `monitor.py` | Depth, oldest, dead letters, stale leases. |
 | `main.py` | The entrypoint. |
 """
 
+from . import chain
 from .handlers import (
     acquisition_handler,
     analytics_handler,
     default_handlers,
     publish_handler,
     render_handler,
+    selection_handler,
     transcription_handler,
+    verification_handler,
 )
 from .monitor import KindDepth, QueueSnapshot, requeue_dead, snapshot
 from .runtime import Worker, WorkerConfig, backoff_seconds
@@ -46,6 +57,7 @@ from .types import (
     Fatal,
     Handler,
     JobContext,
+    JobSpec,
     Outcome,
     Retry,
     WorkerStats,
@@ -57,6 +69,7 @@ __all__ = [
     "Fatal",
     "Handler",
     "JobContext",
+    "JobSpec",
     "KindDepth",
     "Outcome",
     "QueueSnapshot",
@@ -68,12 +81,15 @@ __all__ = [
     "acquisition_handler",
     "analytics_handler",
     "backoff_seconds",
+    "chain",
     "default_handlers",
     "describe",
     "publish_handler",
     "render_handler",
     "requeue_dead",
+    "selection_handler",
     "services_from_env",
     "snapshot",
     "transcription_handler",
+    "verification_handler",
 ]

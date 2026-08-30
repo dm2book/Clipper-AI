@@ -52,7 +52,10 @@ with no live transport.
 - **Worker runtime** (`src/clipforge/worker/`) — the process that drains the
   queue. Leased claims, heartbeats, retry with jittered backoff, a dead-letter
   state, crash recovery through lease expiry, graceful shutdown, and idempotent
-  handlers for acquisition, transcription, render, publish and analytics.
+  handlers for acquisition, transcription, clip selection, render, publish,
+  verification and analytics. Each handler queues its own successor in the
+  transaction that records its success, so the chain from a submitted source
+  to a verified post runs with nobody driving it.
 - **Rendering** (`src/clipforge/render/`) — executes the gameplay engine's
   filtergraph, burns captions in, and checks the output is what the plan
   asked for. Real 1080x1920 60fps MP4s.
@@ -1865,10 +1868,126 @@ collection, which has no live source to collect from.
 |---|---|
 | `types.py` | What a handler is given and may answer. |
 | `runtime.py` | Claim, heartbeat, retry, reap, shut down cleanly. |
-| `handlers.py` | The five kinds, over the engines that already existed. |
+| `handlers.py` | One per job kind, over the engines that already existed. |
+| `selection.py` | Transcript → clip row → booked posts → a queued render. |
+| `chain.py` | What follows what, and the dedupe keys that make it safe. |
 | `services.py` | What this host can do, and why not otherwise. |
 | `monitor.py` | Depth, oldest, dead letters, stale leases. |
 | `main.py` | The entrypoint. |
+
+## The pipeline chains itself
+
+Every stage worked and the pipeline did not. Acquisition wrote a source and
+stopped; transcription wrote a transcript and stopped; clip selection existed
+only inside one process's memory; a rendered file pointed at nothing that
+would publish it. The stages were connected by a person opening a queue
+console, and "source → clip selection → scheduled" was where it ended.
+
+Now each handler names its own successor:
+
+```
+discover_sources → transcribe → detect_clips → render_video
+                 → publish_upload → verify_upload → collect_metrics
+```
+
+### The successor is written in the same transaction as the success
+
+`Outcome.follow_on` carries the next job's spec; `Worker._record` queues it
+inside the transaction that marks this job succeeded. Two transactions would
+leave a window, and a crash inside it is a pipeline that halts with every row
+claiming success — the exact failure chaining exists to remove. The cost is
+that a successor the queue refuses rolls the success back and the job is
+retried, redoing work that already worked. That is the right side to fail on:
+handlers are idempotent by requirement, so a repeat is wasted time, while a
+dropped successor is a clip that silently never posts.
+
+Every dedupe key is built in `chain.py` and nowhere else. `render:<clip_id>`
+queued twice is one render, because the second `enqueue` resolves to the first
+row — which is what makes the whole chain safe to replay after a reaped lease.
+
+### Clip selection, made durable
+
+`worker/selection.py` runs the same factory pipeline and then commits what it
+produced: a `clips` row with the moment's scores, every generated hook and the
+caption track; one `uploads` row per connected platform; and a `render_video`
+job. Running it twice does nothing twice — and the guard matters more here
+than elsewhere, because the pipeline is *not* idempotent by construction. Its
+first stage refuses a source the channel has already used, so a naive second
+run returns BLOCKED, emits no follow-on, and stops the chain with every row
+saying success.
+
+### Draft is what stops an unrendered post publishing
+
+A booked post whose file does not exist must not be claimable. The calendar's
+`due()` ignores `DRAFT`, so selection books there and the **render** promotes
+the row to `SCHEDULED` — pointing the asset at the file it just wrote, in the
+same breath. Not a timing convention: the state machine will not let a
+publisher reach the post before its bytes exist.
+
+The publish job is then queued to fire at the slot the calendar chose, not the
+moment ffmpeg finishes. Cadence and spacing are decisions the calendar already
+made, and a render finishing early is not a reason to overrule them and post a
+channel's whole backlog at once.
+
+### Verification can take a post back
+
+The last link is a read, and the only step that can downgrade a `published`
+post to `needs_attention`. Every platform accepts a file and can reject the
+video afterwards — YouTube on a rights claim, TikTok on moderation, Instagram
+on an expired container — and none of them tells the uploader. Two passes:
+one past the transcode window, one hours later for the late decisions. An
+outage is a `Retry`, never a rejection: treating "we could not ask" as "it is
+not there" would have the system re-upload videos that are already live.
+
+Writing this found two more real defects in the seams it connects:
+
+- **TikTok was going to be verified by the wrong id.** Its status endpoint is
+  keyed on the `publish_id` from init, while the id it returns on completion
+  is the public post id. Asking about the second gets a truthful "no such
+  publish", which would have marked live videos `needs_attention`. The publish
+  id survives on the attempt's `remote_ref`, and that is what is used now.
+- **`media_path_for` could not use its own fallback.**
+  `transcriptions.for_source` returns one record, not a tuple, so the
+  fallback path — a source transcribed on one host and rendered on another —
+  would have raised `TypeError` the first time it was needed.
+
+**Credentials are encrypted now, or publishing is unavailable.**
+`DurableTokenStore` always took `seal`/`unseal` and nothing in the repository
+supplied them, so no durable token store could be built.
+`publish/sealing.py` is the reference implementation — AES-256-GCM, fresh
+nonce per call, a version prefix so a future rotation can read what this one
+wrote. `CLIPFORGE_TOKEN_KEY` unset is a refusal, not a fallback to plaintext:
+a store that silently writes unencrypted refresh tokens is discovered in a
+database dump.
+
+**A gameplay bed is not optional for four niches.** Business, motivation, AI
+and history all composite one, and the compose stage blocks a source outright
+when the library has none — so a worker started with no
+`WorkerServices.gameplay_library` produces no clips at all for them, rather
+than plainer ones. `describe()` reports the bed count for that reason.
+
+### Testing it
+
+`tests/test_pipeline_chain.py`. Each test enqueues **one** job and then never
+touches the queue again: everything after that — the clip row, the booked
+upload, the render, the publish, the read-back — has to arrive because a
+handler queued its own successor. A test that had to enqueue a second job
+would be proving the opposite of what it claims.
+
+The end-to-end case runs a real transcript through a real ffmpeg render to a
+scripted TikTok and back, and asserts the row at every stage: the clip, the
+upload's `draft` → `scheduled` → `published`, the verification, and the
+metrics job queued behind it. A separate case makes the platform reject the
+video on the read-back and asserts the upload lands in `needs_attention` with
+nothing queued to measure a video that is not there.
+
+**What this still does not prove.** No upload has reached a live platform from
+this build. The transport under test is `RecordingTransport` answering
+TikTok's protocol by endpoint; `CLIPFORGE_PUBLISH_TRANSPORT=http` builds the
+real client and no credentials exist here. Acquisition over the network and
+metric collection are likewise untested against anything live — the chain ends
+by queueing `collect_metrics`, which fails with the documented reason because
+`RecordedSource` is the only metric source in this build.
 
 ## Rendering
 

@@ -31,6 +31,16 @@ If a heartbeat comes back False the lease has been lost — another worker owns
 this job now. The runtime stops the current job rather than racing: two
 workers writing the same render is exactly what leases exist to prevent.
 
+## A finished job queues the next one, or is not finished
+
+`Outcome.follow_on` is enqueued inside the same transaction that marks the job
+succeeded, so the chain cannot break in the middle. The cost is that a
+follow-on the queue refuses — an unknown job kind, say — rolls the success back
+and the job is retried, redoing work that already succeeded. That is the right
+side to fail on: handlers are idempotent by requirement, so a repeat is
+wasted time, while a dropped successor is a clip that silently never posts and
+a `jobs` table that says everything is fine.
+
 ## Shutdown finishes the job in hand
 
 SIGTERM stops the claim loop and lets the running handler finish. A worker
@@ -52,11 +62,12 @@ import socket
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Callable, Mapping, Sequence
 
 from ..store.records import utcnow
+from . import chain
 from .types import Disposition, Handler, JobContext, Outcome, WorkerStats
 
 log = logging.getLogger("clipforge.worker")
@@ -325,6 +336,7 @@ class Worker:
         self, tenant_id: str, job: Any, outcome: Outcome, elapsed: float,
     ) -> None:
         now = self.clock()
+        followed = 0
         try:
             with self.database.unit_of_work(tenant_id) as uow:
                 if outcome.disposition is Disposition.DONE:
@@ -332,7 +344,17 @@ class Worker:
                     if outcome.detail:
                         result.setdefault("detail", outcome.detail)
                     result.setdefault("elapsed_s", round(elapsed, 3))
+                    # In this transaction, not after it. A crash between
+                    # "succeeded" and "successor queued" is a pipeline that
+                    # halts with every row claiming success — the one failure
+                    # mode chaining exists to remove.
+                    chained = chain.enqueue(
+                        uow, tenant_id, outcome.follow_on, now
+                    )
+                    if chained:
+                        result["follow_on"] = chained
                     uow.jobs.succeed(job.id, result, now)
+                    followed = len(chained)
                 elif outcome.disposition is Disposition.RETRY:
                     delay = outcome.after_s or backoff_seconds(job.attempts + 1)
                     uow.jobs.fail(
@@ -351,6 +373,7 @@ class Worker:
             return
 
         self.stats.record(job.kind, outcome, elapsed, now)
+        self.stats.chained += followed
         if outcome.disposition is Disposition.FATAL or (
             job.attempts + 1 >= job.max_attempts
             and outcome.disposition is Disposition.RETRY

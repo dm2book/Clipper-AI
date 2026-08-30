@@ -248,7 +248,7 @@ class RenderEngine:
             self._fail(job, str(error), retry=False)
             return RenderResult(render_id, RenderState.FAILED, error=str(error))
 
-        video = self._persist(request, result)
+        video = self.persist(request, result)
         result.video_id = video.id
         with self.database.unit_of_work(self.tenant_id) as uow:
             uow.jobs.succeed(job.id, result.to_dict(), self.clock())
@@ -464,13 +464,18 @@ class RenderEngine:
 
     # -- persistence -------------------------------------------------------
 
-    def _persist(self, request: RenderRequest, result: RenderResult) -> VideoRecord:
+    def persist(self, request: RenderRequest, result: RenderResult) -> VideoRecord:
         """Record the rendered asset.
 
         A `videos` row rather than a field on the clip, because one clip is
         legitimately rendered more than once — a re-render after a caption
         fix, a per-platform variant — and the upload has to reference the
         exact file that was sent.
+
+        Public because `render()` is public and does not call it: a caller
+        driving a render directly — which is what the worker's handler does —
+        otherwise produces a file with no durable record of what it is. That
+        was reachable only through `run()`, the queue path the worker replaced.
         """
 
         probe = result.probe

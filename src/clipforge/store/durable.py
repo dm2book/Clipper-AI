@@ -329,7 +329,17 @@ class PersistentCalendar(ContentCalendar, _TenantBound):
             for post in posts:
                 uow.uploads.save(
                     to_upload_record(
-                        post, tenant_id=self.tenant_id, channel_id=self.channel_id
+                        post,
+                        tenant_id=self.tenant_id,
+                        channel_id=self.channel_id,
+                        # Read off the spec rather than passed in. The
+                        # publishing engine has no notion of clips or renders,
+                        # so the producer puts the ids in the spec's metadata
+                        # and they survive the round trip through the table —
+                        # which is what lets a finished render find the uploads
+                        # waiting on it instead of scanning every row.
+                        clip_id=post.spec.metadata.get("clip_id") or None,
+                        video_id=post.spec.metadata.get("video_id") or None,
                     )
                 )
 

@@ -10,6 +10,13 @@ The factories take `(database, tenant_id)` because every engine here is
 tenant-scoped and a worker serves many tenants. Building one engine per
 process and reusing it across tenants is how one customer's clip ends up in
 another customer's workspace.
+
+`publisher_factory` takes a channel as well, and is the reason the plain
+`publisher` is now a fallback. A bare `PublishingSystem()` has an empty
+in-memory calendar: it cannot see a single row that clip selection booked, and
+a publish job against one drains happily while reporting "0 of 0". The durable
+build reads the calendar, the accounts and the credentials out of the database
+for one channel, which is the only shape that can actually publish anything.
 """
 
 from __future__ import annotations
@@ -21,7 +28,12 @@ from typing import Any, Callable
 
 log = logging.getLogger("clipforge.worker.services")
 
-__all__ = ["WorkerServices", "services_from_env", "describe"]
+__all__ = [
+    "WorkerServices",
+    "services_from_env",
+    "describe",
+    "durable_publisher_factory",
+]
 
 
 @dataclass
@@ -33,10 +45,33 @@ class WorkerServices:
     render_factory: Callable[[Any, str], Any] | None = None
     analytics_factory: Callable[[Any, str], Any] | None = None
     publisher: Any = None
+    #: `(database, tenant_id, channel_id) -> PublishingSystem`, backed by the
+    #: store. Preferred over `publisher` wherever a job names a channel.
+    publisher_factory: Callable[[Any, str, str], Any] | None = None
     transport: Any = None
     metric_source: Any = None
     face_tracker: Any = None
+    #: `gameplay.GameplayAsset` beds available to composite behind a talking
+    #: head. Four of the seven niche profiles ask for one — business,
+    #: motivation, AI and history — and clip selection blocks a source outright
+    #: when its channel wants a bed and the library has none. An empty library
+    #: is therefore not a cosmetic downgrade for those channels; it is no
+    #: clips at all, which is why it is a first-class service rather than a
+    #: render-time detail.
+    gameplay_library: tuple = ()
     storage: Any = None
+    #: How far ahead clip selection books its first post. On the services
+    #: rather than in `selection` so a deployment — or a test — can shorten
+    #: it; the publish job is queued to fire at the booked slot, so this is
+    #: also the delay between a render finishing and the post going out.
+    lead_time_s: float = 6 * 3600.0
+    #: When to read a published post back from the platform, as seconds after
+    #: publishing. Two passes — see `chain` for why one is not enough.
+    verify_first_s: float = 15 * 60.0
+    verify_second_s: float = 6 * 3600.0
+    #: When to take the first metric reading. Too early and every platform
+    #: honestly reports zeros for a video nobody has been shown yet.
+    metrics_delay_s: float = 3600.0
     #: Why something is absent, keyed by service name. Reported by `describe`
     #: and by the monitoring endpoint, because "publish jobs keep dying" is
     #: answered by this dictionary and by nothing else.
@@ -142,10 +177,16 @@ def services_from_env(*, want_vision: bool = True) -> WorkerServices:
 
     # -- publishing --------------------------------------------------------
     try:
-        from ..publish import PublishingSystem
+        from ..publish.sealing import sealer_from_env
 
-        services.publisher = PublishingSystem()
+        services.publisher_factory = durable_publisher_factory(
+            sealer_from_env()
+        )
     except Exception as error:                              # noqa: BLE001
+        # Not fatal, and not silently downgraded to plaintext either. Without
+        # a key the durable token store cannot be built, so publishing is
+        # unavailable and says why — which is the honest state of a deployment
+        # that has not configured one.
         services.unavailable["publisher"] = f"{type(error).__name__}: {error}"
 
     if os.environ.get("CLIPFORGE_PUBLISH_TRANSPORT", "").lower() == "http":
@@ -190,6 +231,47 @@ def services_from_env(*, want_vision: bool = True) -> WorkerServices:
     return services
 
 
+def durable_publisher_factory(
+    sealer: Any, config: Any = None
+) -> Callable[[Any, str, str], Any]:
+    """Build a channel's publishing system out of the database.
+
+    The calendar is restored on every call rather than cached. A worker holding
+    a stale index would claim posts another worker has already published, and
+    the cost of the read is one indexed query against a bounded window.
+    """
+
+    from ..publish import PublishConfig, PublishingSystem
+    from ..store.durable import (
+        DurableAccountBook,
+        DurableSeriesBook,
+        DurableTokenStore,
+        PersistentCalendar,
+    )
+
+    def build(database: Any, tenant_id: str, channel_id: str) -> Any:
+        return PublishingSystem(
+            config=config or PublishConfig(
+                worker_id=os.environ.get("HOSTNAME", "worker")
+            ),
+            token_store=DurableTokenStore(
+                database, tenant_id,
+                seal=sealer.seal, unseal=sealer.unseal,
+            ),
+            accounts=DurableAccountBook(
+                database, tenant_id, channel_id=channel_id
+            ),
+            calendar=PersistentCalendar.restore(
+                database, tenant_id, channel_id=channel_id
+            ),
+            series=DurableSeriesBook(
+                database, tenant_id, channel_id=channel_id
+            ),
+        )
+
+    return build
+
+
 def describe(services: WorkerServices) -> dict[str, Any]:
     """A readable summary, for the log line a worker prints on startup."""
 
@@ -197,9 +279,13 @@ def describe(services: WorkerServices) -> dict[str, Any]:
         "acquisition": services.acquisition_factory is not None,
         "transcription": services.transcription_factory is not None,
         "render": services.render_factory is not None,
-        "publish": services.transport is not None,
+        "publish": (
+            services.transport is not None
+            and services.publisher_factory is not None
+        ),
         "analytics": services.metric_source is not None,
         "vision": services.face_tracker is not None,
+        "gameplay_beds": len(services.gameplay_library),
         "storage": services.storage is not None,
         "unavailable": dict(services.unavailable),
     }

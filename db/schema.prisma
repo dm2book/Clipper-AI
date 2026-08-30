@@ -599,6 +599,11 @@ enum JobKind {
   build_captions
   render_video
   publish_upload
+  /// Reading a post back from the platform after publishing. A separate kind
+  /// rather than part of publishing because it runs on its own schedule —
+  /// minutes later for a transcode, hours later for the moderation and rights
+  /// decisions that arrive long after an upload looked successful.
+  verify_upload
   collect_metrics
   refresh_token
   weekly_report

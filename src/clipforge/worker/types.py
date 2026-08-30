@@ -20,6 +20,20 @@ recording success, and have the lease reaped and the job handed to somebody
 else. Every handler in this package therefore has to be safe to run twice, and
 each one says in its own docstring *how* — usually a unique index or a
 state check, never "it probably will not happen".
+
+## A handler also says what happens next
+
+`Done(..., follow_on=[...])` carries the jobs that this one's success makes
+possible, and the runtime queues them **in the same transaction** that marks
+this job succeeded. That is the difference between a pipeline and a pile of
+stages: before it, a render finished and nothing published, because the only
+thing that could queue the publish was a person.
+
+Atomicity matters more than it looks here. Marking a job done and queueing its
+successor in two transactions leaves a window between them, and a crash inside
+that window is a chain that stops with every row it left behind saying
+"succeeded". One transaction means both facts are true or neither is, and
+"neither" is a retry the queue already knows how to do.
 """
 
 from __future__ import annotations
@@ -27,7 +41,7 @@ from __future__ import annotations
 import enum
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Protocol
+from typing import Any, Protocol, Sequence
 
 __all__ = [
     "Outcome",
@@ -36,9 +50,38 @@ __all__ = [
     "Retry",
     "Fatal",
     "JobContext",
+    "JobSpec",
     "Handler",
     "WorkerStats",
 ]
+
+
+@dataclass(frozen=True, slots=True)
+class JobSpec:
+    """A job a handler wants queued once it has succeeded.
+
+    Not a `JobRecord`: a handler has no business minting ids or knowing which
+    tenant it is serving, and the runtime knows both. This is the intent —
+    what kind of work, over what payload — and `chain.enqueue` turns it into a
+    row.
+
+    `dedupe_key` is the field that must not be left empty. It is what makes a
+    chain safe to re-run: a render job retried after a crash chains to the
+    publish job that is already queued rather than a second one, because the
+    key resolves to the existing row. `chain` derives every key in one place
+    for exactly that reason.
+    """
+
+    kind: str
+    payload: dict[str, Any] = field(default_factory=dict)
+    dedupe_key: str = ""
+    #: Seconds before the successor becomes claimable. Verification uses it:
+    #: asking YouTube about a video it is still transcoding gets a truthful
+    #: "processing" and tells you nothing.
+    delay_s: float = 0.0
+    priority: int = 100
+    channel_id: str = ""
+    max_attempts: int = 8
 
 
 class Disposition(str, enum.Enum):
@@ -60,14 +103,25 @@ class Outcome:
     #: Seconds to wait before the next attempt. Only read for `RETRY`; zero
     #: means "use the runtime's backoff", which is almost always right.
     after_s: float = 0.0
+    #: What this job's success makes possible. Queued by the runtime in the
+    #: same transaction that records the success, and only on `DONE` — a
+    #: failed render must not launch a publish of the file it did not write.
+    follow_on: tuple[JobSpec, ...] = ()
 
     @property
     def ok(self) -> bool:
         return self.disposition is Disposition.DONE
 
 
-def Done(detail: str = "", **result: Any) -> Outcome:      # noqa: N802
-    return Outcome(Disposition.DONE, detail, result or None)
+def Done(                                                  # noqa: N802
+    detail: str = "",
+    *,
+    follow_on: Sequence[JobSpec] = (),
+    **result: Any,
+) -> Outcome:
+    return Outcome(
+        Disposition.DONE, detail, result or None, 0.0, tuple(follow_on)
+    )
 
 
 def Retry(detail: str, after_s: float = 0.0) -> Outcome:   # noqa: N802
@@ -140,6 +194,9 @@ class WorkerStats:
     retried: int = 0
     dead: int = 0
     reaped: int = 0
+    #: Successors queued by finished jobs. A chain that has stopped shows up
+    #: here as a flat line while `done` keeps climbing.
+    chained: int = 0
     #: Wall time inside handlers, so "slow" can be told from "idle".
     busy_s: float = 0.0
     started_at: datetime | None = None
@@ -165,6 +222,7 @@ class WorkerStats:
             "retried": self.retried,
             "dead": self.dead,
             "reaped": self.reaped,
+            "chained": self.chained,
             "busy_s": round(self.busy_s, 3),
             "started_at": self.started_at.isoformat() if self.started_at else None,
             "last_job_at": (
