@@ -1,0 +1,107 @@
+# Solana sniper — configuration.
+# Copy to config.yaml. Secrets are read from the environment (${VAR}); put
+# them in .env, never in this file.
+
+log_level: INFO
+
+rpc:
+  # A paid RPC (Helius, QuickNode, Triton) is effectively required: public
+  # endpoints throttle logsSubscribe and refuse getProgramAccounts.
+  http_url: ${RPC_HTTP_URL}
+  ws_url: ${RPC_WS_URL}
+  requests_per_second: 10
+
+detection:
+  resolver_workers: 4
+  queue_size: 1000
+  stale_after_s: 300
+  sources:
+    # Log patterns identify the pool-creation instruction. Verify them against
+    # a recent launch on an explorer if a DEX upgrades its program.
+    - name: raydium_amm_v4
+      program_id: 675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8
+      log_contains: ["initialize2"]
+    - name: raydium_cpmm
+      program_id: CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C
+      log_contains: ["Instruction: Initialize"]
+    - name: pumpswap
+      program_id: pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA
+      log_contains: ["Instruction: CreatePool"]
+    # pump.fun bonding-curve launches: very high volume, no AMM pool yet.
+    - name: pumpfun
+      program_id: 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P
+      log_contains: ["Instruction: Create"]
+      enabled: false
+
+analysis:
+  workers: 3
+  recheck_interval_s: 20      # re-check a watched token this often
+  watch_window_s: 1800        # give up on a token after 30 minutes
+  holders_method: rpc         # or helius_das when using a Helius RPC
+
+filters:
+  min_liquidity_usd: 25000
+  min_holders: 100
+  max_top10_pct: 40           # strictly less than
+  require_mint_authority_revoked: true
+  require_freeze_authority_revoked: true
+  forbidden_extensions: [permanentDelegate, transferHook, transferFeeConfig,
+                         nonTransferable, defaultAccountState, pausableConfig]
+  max_roundtrip_loss_pct: 10  # buy+sell quote for the trade size; higher = hidden tax
+  exclude_program_owned_from_top10: true
+  denylist_mints: []
+  rugcheck:
+    enabled: true
+    reject_levels: [danger]
+    max_score_normalised: 50
+
+trading:
+  mode: paper                 # paper = real data, simulated trades. Switch to live deliberately.
+  trade_size_usd: 20
+  max_open_positions: 3
+  max_buys_per_hour: 6
+  max_daily_loss_usd: 60
+  min_sol_reserve: 0.05       # SOL always left for fees
+  buy_slippage_bps: 500
+  sell_slippage_bps: 1500
+  priority_level: veryHigh
+  priority_fee_max_lamports: 1000000   # 0.001 SOL cap per transaction
+
+exits:
+  stop_loss_pct: 20
+  take_profit_pct: 50
+  take_profit_sell_fraction: 0.5      # sell half at +50%, trail the rest
+  trailing_stop_pct: 15
+  trailing_activate_after_tp: true
+  max_hold_minutes: 0                 # 0 = no time limit
+  monitor_interval_s: 5
+  max_sell_failures: 5
+
+jupiter:
+  base_url: https://lite-api.jup.ag/swap/v1
+  api_key: ${JUPITER_API_KEY:-}
+  trading_rps: 1.0
+  analysis_rps: 0.5
+
+telegram:
+  enabled: true
+  bot_token: ${TELEGRAM_BOT_TOKEN}
+  notify_chat_id: ${TELEGRAM_CHAT_ID}
+  allowed_chat_ids:
+    - ${TELEGRAM_CHAT_ID}
+  commands_enabled: true
+  notify_on_detected: false
+  notify_on_rejected: false
+  notify_on_passed: true
+
+database:
+  url: ${DATABASE_URL}
+
+wallet:
+  private_key: ${SOLANA_PRIVATE_KEY:-}
+  keypair_path: ${SOLANA_KEYPAIR_PATH:-}
+
+health:
+  enabled: true
+  host: 0.0.0.0
+  port: 8080

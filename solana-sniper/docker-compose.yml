@@ -1,0 +1,40 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: sniper
+      POSTGRES_DB: sniper
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sniper -d sniper"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # No published port: only the bot can reach the database.
+
+  bot:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file: .env
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      # For SOLANA_KEYPAIR_PATH=/run/secrets/wallet.json:
+      # - ./secrets/wallet.json:/run/secrets/wallet.json:ro
+    ports:
+      - "127.0.0.1:8080:8080"   # health endpoint, localhost only
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: ["no-new-privileges:true"]
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options: { max-size: "20m", max-file: "5" }
+
+volumes:
+  pgdata:
