@@ -1,6 +1,6 @@
 # Signal Radar — Architectuur
 
-> Status: **ontwerp, nog geen implementatie.**
+> Status: **fase 1 (MVP) gebouwd in TypeScript** — zie README.md.
 > Doel: nieuwe tokens vroeg detecteren en **objectieve, meetbare** afwijkende
 > marktactiviteit signaleren via Discord.
 
@@ -91,95 +91,62 @@ containers draaien (`ingest`, `tracker`, `signals`, `notifier`).
 
 ## B. Tech stack
 
+> Gewijzigd t.o.v. het eerste ontwerp (Python): op verzoek is de MVP in
+> **TypeScript/Node.js** gebouwd. De architectuur is verder ongewijzigd.
+
 | Laag | Keuze | Waarom |
 |---|---|---|
-| Taal | **Python 3.12**, `asyncio` | I/O-gebonden werk met veel gelijktijdige verbindingen; sterk ecosysteem voor Solana (`solders`); sluit aan op de bestaande `solana-sniper`-code (detector, tx-parsing en rate limiter zijn herbruikbaar). |
-| HTTP | `httpx` (async, HTTP/2) | Connection pooling, timeouts per request. |
-| WebSocket | `websockets` | Bewezen in de sniper-bot. |
-| Validatie | `pydantic` v2 | Elk provider-antwoord wordt gevalideerd tegen een model; schemawijzigingen worden direct zichtbaar in plaats van stille fouten. |
-| Config | YAML + pydantic; secrets via env | Zelfde patroon als de sniper-bot. Scoringconfig in een apart, geversioneerd bestand. |
-| Database | **PostgreSQL 16** | Transactioneel, JSONB voor bewijs en ruwe rapporten, native range partitioning voor tijdreeksen. TimescaleDB is een optie als volumes groeien, geen vereiste. |
-| DB-driver | `asyncpg` | Snel; geen ORM nodig voor dit schema. |
-| Migraties | Genummerde SQL-bestanden + `schema_migrations` | Transparant, geen extra tooling. |
-| Cache | Fase 1: in-proces TTL-cache. Fase 2+: **Redis 7** | Redis pas wanneer er meerdere processen zijn die cache en cooldowns moeten delen. |
-| Metrics | `prometheus-client` + Grafana | Standaard. |
-| Logging | stdlib `logging` met JSON-formatter | Zoals in de sniper-bot. |
-| Tests | `pytest`, `pytest-asyncio`, `respx` (HTTP-mocks) | Contracttests draaien tegen *opgenomen* echte provider-antwoorden. |
-| Kwaliteit | `ruff`, `mypy --strict` op `core/`, `signals/` en `scoring/` | De rekenkern moet typeveilig zijn. |
-| Deployment | Docker Compose op een Linux-VPS | Postgres (en later Redis) op het interne netwerk. |
+| Taal / runtime | **TypeScript** (strict, `noUncheckedIndexedAccess`) op **Node.js ≥ 22.9** | I/O-gebonden werk met veel gelijktijdige verbindingen; native `fetch`, `AbortSignal.any`, `--env-file`. |
+| HTTP | native `fetch` achter een eigen `HttpClient` | Timeouts, retry met jitter, Retry-After, circuit breaker en schemavalidatie op één plek. |
+| WebSocket | `ws` | Standaard, met ping/pong-heartbeat. |
+| Validatie | `zod` v4 | Elk providerantwoord en de hele configuratie worden gevalideerd. |
+| Config | Environment variables (`.env`, `--env-file`) | Eén bron, met validatie die per variabele meldt wat er mis is. |
+| Database | **PostgreSQL 16** via `pg` | Transactioneel; JSONB voor bewijs; `SKIP LOCKED` als work queue. |
+| Migraties | Genummerde SQL-bestanden + `schema_migrations` + advisory lock | Transparant, geen extra tooling. |
+| Cache | `Cache`-interface: in-memory LRU, of **Redis 7** (`ioredis`) als `REDIS_URL` gezet is | Redis-uitval verslechtert naar cache-misses, nooit naar fouten. |
+| Solana | `bs58` + `@noble/curves` (on-curve-check) | Klein; geen volledige web3-SDK nodig voor read-only RPC. |
+| Metrics / logs | `prom-client`, `pino` (JSON) | Standaard, met redactie van secrets. |
+| Tests | `vitest`; integratietests tegen echte PostgreSQL/Redis | Pure kern met unit-tests; pijplijn end-to-end met mock-providers. |
+| Deployment | Docker (multi-stage, non-root) + Docker Compose | Postgres/Redis op het interne netwerk. |
 
 ---
 
-## C. Folderstructuur
+## C. Folderstructuur (zoals gebouwd)
 
 ```
 signal-radar/
-├── README.md
-├── pyproject.toml
-├── Dockerfile
-├── docker-compose.yml
-├── .env.example
-├── config/
-│   ├── config.example.yaml          # providers, limieten, tiers, alertregels
-│   └── scoring.v1.yaml              # gewichten + normalisatiedrempels (geversioneerd)
-├── migrations/
-│   └── 0001_init.sql
-├── docs/
-│   ├── ARCHITECTURE.md              # dit document
-│   ├── PROVIDERS.md                 # per provider: endpoints, status, limieten, veldmapping
-│   └── SIGNALS.md                   # exacte definitie van elk signaal
-├── src/radar/
-│   ├── __main__.py
-│   ├── app.py                       # supervisor: start/stop taken, graceful shutdown
-│   ├── settings.py
-│   ├── core/                        # domein, geen I/O
-│   │   ├── models.py                # Token, Pool, MarketSnapshot, SafetyReport, HolderSnapshot, Trade, Signal, Score, Alert
-│   │   └── errors.py                # fouttaxonomie (§J)
-│   ├── infra/
-│   │   ├── db.py                    # pool, migraties, instance lock
-│   │   ├── repositories.py          # alle SQL
-│   │   ├── cache.py                 # TTL-cache + single-flight
-│   │   ├── ratelimit.py             # token buckets, prioriteiten, AIMD
-│   │   ├── circuit.py               # circuit breaker
-│   │   ├── http.py                  # gedeelde client, retries, Retry-After
-│   │   ├── logging.py
-│   │   └── metrics.py
+├── README.md · package.json · tsconfig*.json · vitest.config.ts
+├── Dockerfile · docker-compose.yml · .env.example
+├── migrations/0001_init.sql
+├── scripts/record-fixtures.ts         # neemt echte provider-antwoorden op
+├── docs/ARCHITECTURE.md · docs/PROVIDERS.md
+├── src/
+│   ├── index.ts                       # startpunt, signalen, graceful shutdown
+│   ├── app.ts                         # composition root
+│   ├── cli/migrate.ts
+│   ├── config/env.ts
+│   ├── core/                          # puur domein: token, marketSnapshot, safety, holders,
+│   │                                  #   signals, scoring, alertRules, alerts, errors, types
+│   ├── infra/                         # db, http, retry, rateLimiter, circuitBreaker, cache,
+│   │                                  #   concurrency, metrics, logger, redact
 │   ├── providers/
-│   │   ├── base.py                  # interfaces (Protocols) + capabilities
-│   │   ├── registry.py              # keuze + fallback per capability
-│   │   ├── solana_rpc/              # client, launches (logsSubscribe), holders, txparse
-│   │   ├── dexscreener.py
-│   │   ├── rugcheck.py
-│   │   ├── goplus.py
-│   │   ├── birdeye.py               # fase 2, optioneel
-│   │   └── helius_stream.py         # fase 3
-│   ├── pipeline/
-│   │   ├── ingest.py
-│   │   ├── enrich.py
-│   │   └── tracker.py               # tiers + snapshot-scheduling
-│   ├── signals/
-│   │   ├── base.py                  # Signal-type, venster-helpers
-│   │   ├── market.py                # volume spike, tx-groei, mcap-verandering, liquidity growth
-│   │   ├── safety.py                # veiligheidsgate uit meerdere rapporten
-│   │   ├── holders.py               # holdergroei, concentratie (fase 2)
-│   │   ├── flow.py                  # kopers/verkopers, unieke kopers (fase 3)
-│   │   ├── whales.py                # fase 3
-│   │   └── smart_wallets.py         # fase 4
-│   ├── scoring/
-│   │   └── engine.py
-│   ├── alerts/
-│   │   ├── rules.py                 # NEW_TOKEN, MOMENTUM, LIQUIDITY_DROP; cooldown/escalatie
-│   │   ├── formatter.py             # Discord-embeds, sanitizing
-│   │   └── discord.py               # outbox-sender
-│   ├── wallets/                     # fase 4
-│   │   └── performance.py
-│   └── api/
-│       └── health.py
+│   │   ├── interfaces.ts              # TokenDiscovery-, MarketData-, Safety-, Holder-,
+│   │   │                              #   Wallet- en NotificationProvider
+│   │   ├── solana/                    # rpcClient, discovery, mintInfo, onchainSafety, holders,
+│   │   │                              #   txParse, pubkey, constants
+│   │   ├── dexscreener/marketData.ts
+│   │   ├── rugcheck/safety.ts · goplus/safety.ts
+│   │   ├── discord/webhook.ts · discord/formatter.ts · console/notification.ts
+│   │   └── wallet/unconfigured.ts     # WalletProvider: nog niet gekoppeld (fase 4)
+│   ├── repositories/                  # tokens, snapshots, enrichment, alerts (alle SQL)
+│   ├── services/                      # discovery, marketData, enrichment, signal,
+│   │                                  #   notification, maintenance
+│   ├── workers/scheduler.ts
+│   └── http/healthServer.ts
 └── tests/
-    ├── unit/
-    ├── contract/                    # mappers tegen opgenomen provider-antwoorden
-    ├── integration/                 # met echte PostgreSQL
-    └── fixtures/providers/<provider>/*.json
+    ├── unit/ · integration/
+    ├── support/                       # mocks + factories (alleen voor tests, synthetisch)
+    └── fixtures/recorded/             # opgenomen echte antwoorden (via record-fixtures)
 ```
 
 ---
@@ -268,7 +235,7 @@ interface AlertSink             -> send(Alert) -> message_id
   `has_m5_volume`, `has_unique_buyers` …) en een **status** (`verified`,
   `beta`, `unverified`) uit config. De `registry` kiest per capability een
   primaire provider plus fallbacks.
-- Alle domeinmodellen (`core/models.py`) zijn provider-neutraal. Mappers
+- Alle domeinmodellen (`src/core/`) zijn provider-neutraal. Mappers
   (`provider → domein`) zijn de enige plek die providervelden kent en hebben
   elk een contracttest.
 - **Genormaliseerde veiligheidsvlaggen** (vaste namen, los van de provider):
@@ -363,7 +330,7 @@ score = clamp( Σ_i  w_i · s_i  −  Σ_j p_j , 0, 100 )
 ```
 
 - `s_i ∈ [0,1]`: genormaliseerde sterkte van component *i*, **stuksgewijs
-  lineair** tussen `floor` (0) en `full` (1) uit `scoring.vN.yaml`. Geen
+  lineair** tussen `floor` (0) en `full` (1) uit een geversioneerde spec (`SCORING_V1` in `src/core/scoring.ts`). Geen
   machine learning en geen verborgen factoren.
 - `w_i`: gewicht, samen 100.
 - `p_j`: expliciete aftrekposten (bijv. safety `WARN`, hoge concentratie).
@@ -372,8 +339,8 @@ score = clamp( Σ_i  w_i · s_i  −  Σ_j p_j , 0, 100 )
 - **Confidence** = som van de gewichten van componenten *met* data ÷ 100.
   Onder de `min_confidence` (standaard 0,7) geen alert, of alleen met het
   label "onvolledige data".
-- `scoring_version` wordt bij elke score opgeslagen. Een nieuwe versie is een
-  nieuw bestand, zodat oude alerts reproduceerbaar blijven.
+- `scoring_version` wordt bij elke score opgeslagen. Een wijziging is een
+  nieuwe spec met een nieuwe versie, zodat oude alerts reproduceerbaar blijven.
 
 ### G.2 Signaaldefinities (fase 1–2)
 
@@ -493,7 +460,7 @@ Deze staan zichtbaar in de alert ("⚠️ 62% van het volume komt van 3 wallets"
 
 ## J. Foutafhandeling
 
-| Klasse (`core/errors.py`) | Voorbeelden | Gedrag |
+| Klasse (`src/core/errors.ts`) | Voorbeelden | Gedrag |
 |---|---|---|
 | `TransientError` | timeout, verbinding verbroken, 5xx | Retry met exponentiële backoff en jitter (max. 3–4). Alleen voor idempotente GET's. |
 | `RateLimited` | 429 | Wachten volgens header, AIMD-verlaging, telt niet mee voor de circuit breaker |
@@ -577,84 +544,14 @@ pijplijn-latency, providergezondheid, tiers en alertvolume.
 
 ---
 
-## Fase 1 — exact te maken bestanden
+## Fase 1 — status
 
-```
-signal-radar/
-├── README.md
-├── pyproject.toml
-├── Dockerfile
-├── docker-compose.yml
-├── .env.example
-├── .gitignore
-├── config/config.example.yaml
-├── config/scoring.v1.yaml
-├── migrations/0001_init.sql
-├── docs/PROVIDERS.md
-├── docs/SIGNALS.md
-├── scripts/record_fixtures.py            # neemt echte provider-antwoorden op (op de VPS, met netwerk)
-├── src/radar/__init__.py
-├── src/radar/__main__.py
-├── src/radar/app.py
-├── src/radar/settings.py
-├── src/radar/core/__init__.py
-├── src/radar/core/models.py
-├── src/radar/core/errors.py
-├── src/radar/infra/__init__.py
-├── src/radar/infra/db.py
-├── src/radar/infra/repositories.py
-├── src/radar/infra/cache.py
-├── src/radar/infra/ratelimit.py
-├── src/radar/infra/circuit.py
-├── src/radar/infra/http.py
-├── src/radar/infra/logging.py
-├── src/radar/infra/metrics.py
-├── src/radar/providers/__init__.py
-├── src/radar/providers/base.py
-├── src/radar/providers/registry.py
-├── src/radar/providers/solana_rpc/__init__.py
-├── src/radar/providers/solana_rpc/client.py
-├── src/radar/providers/solana_rpc/launches.py
-├── src/radar/providers/solana_rpc/holders.py
-├── src/radar/providers/solana_rpc/txparse.py
-├── src/radar/providers/dexscreener.py
-├── src/radar/providers/rugcheck.py
-├── src/radar/providers/goplus.py
-├── src/radar/pipeline/__init__.py
-├── src/radar/pipeline/ingest.py
-├── src/radar/pipeline/enrich.py
-├── src/radar/pipeline/tracker.py
-├── src/radar/signals/__init__.py
-├── src/radar/signals/base.py
-├── src/radar/signals/market.py
-├── src/radar/signals/safety.py
-├── src/radar/scoring/__init__.py
-├── src/radar/scoring/engine.py
-├── src/radar/alerts/__init__.py
-├── src/radar/alerts/rules.py
-├── src/radar/alerts/formatter.py
-├── src/radar/alerts/discord.py
-├── src/radar/api/__init__.py
-├── src/radar/api/health.py
-├── tests/conftest.py
-├── tests/unit/test_signals_market.py
-├── tests/unit/test_safety_gate.py
-├── tests/unit/test_scoring.py
-├── tests/unit/test_alert_rules.py
-├── tests/unit/test_formatter.py          # sanitizing: @everyone, markdown, zero-width, lengte
-├── tests/unit/test_ratelimit.py
-├── tests/unit/test_circuit.py
-├── tests/unit/test_txparse.py
-├── tests/contract/test_dexscreener_mapper.py
-├── tests/contract/test_rugcheck_mapper.py
-├── tests/contract/test_goplus_mapper.py
-├── tests/fixtures/providers/dexscreener/   # opgenomen echte antwoorden
-├── tests/fixtures/providers/rugcheck/
-├── tests/fixtures/providers/goplus/
-└── tests/integration/test_pipeline.py    # echte Postgres, nep-providers: launch → alert
-```
+Gebouwd, met de structuur uit §C. Zie de README voor wat werkt en wat
+ontbreekt, en `docs/PROVIDERS.md` voor wat nog tegen live-data geverifieerd
+moet worden.
 
-**Volgorde binnen fase 1**: `core` + `infra` → provider-interfaces en
-fixtures opnemen → mappers + contracttests → migratie + repositories →
-ingest → tracker/snapshots → enrich → signals → scoring → rules → Discord →
-integratietest → shadow mode.
+Afwijkingen van het ontwerp in de MVP:
+
+- **`market_snapshots` is (nog) niet gepartitioneerd.** Retentie loopt via een dagelijkse DELETE met index op `observed_at`. Partitioneren kan zodra het volume daarom vraagt.
+- **Scores en signalen worden alleen opgeslagen bij een alert** (ook `SUPPRESSED`). Een doorlopende scorehistorie volgt in fase 2, met downsampling.
+- **Geen apart ops-kanaal.** Systeemproblemen zijn zichtbaar via `/ready`, `/metrics` en de logs.
