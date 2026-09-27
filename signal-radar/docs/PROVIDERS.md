@@ -80,7 +80,7 @@ documentatie en in de code als `SYNTHETIC` gemarkeerd.
 | Wat | Waarom nodig | Richting |
 |---|---|---|
 | `WalletProvider` | Wallets met aantoonbare historie volgen (fase 4) | Helius Enhanced Transactions of de eigen `trades`-tabel (fase 3) |
-| Trade stream (nieuwe interface) | Unieke kopers, koop- vs. verkoopvolume, whale-trades (fase 3) | Helius Enhanced WebSocket / LaserStream (⚠️ beschikbaarheid per abonnement) |
+| Trade stream | Unieke kopers/verkopers, wash-trading-heuristiek en extreme-trade-filter in de Momentum Engine: de engine en de tabel `trades` staan klaar, alleen de databron ontbreekt (fase 3) | Helius Enhanced WebSocket / LaserStream (⚠️ beschikbaarheid per abonnement) |
 | Helius DAS `getTokenAccounts` | Holders tellen zonder `getProgramAccounts` | Tweede `HolderProvider` |
 | Birdeye | Fallback voor launches en marktdata | `new_listing` + WebSocket (⚠️ afhankelijk van het pakket) |
 | Jupiter quote | Verhandelbaarheid (verkoopbaarheid) als extra veiligheidscheck | ⚠️ base-URL/versie verifiëren |

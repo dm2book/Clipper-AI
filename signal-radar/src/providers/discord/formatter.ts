@@ -84,7 +84,7 @@ export function renderAlert(p: AlertPayload, username: string): DiscordWebhookBo
   const title =
     p.type === 'NEW_TOKEN'
       ? `🆕 Nieuwe token: ${symbol}`
-      : `📈 Uitzonderlijke activiteit: ${symbol} — score ${p.score?.value.toFixed(0) ?? '?'}/100`;
+      : `📈 Uitzonderlijke activiteit: ${symbol} — Momentum Score ${p.score?.value.toFixed(0) ?? '?'}/100`;
 
   const fields: DiscordEmbed['fields'] = [];
   const add = (name: string, value: string, inline = true) =>
@@ -110,14 +110,20 @@ export function renderAlert(p: AlertPayload, username: string): DiscordWebhookBo
   add(`Veiligheid: ${p.safety.verdict}`, [providers, reasons].filter(Boolean).join('\n'), false);
 
   if (p.score) {
+    add('Redenen', p.score.reasons.map((r) => `• ${sanitize(r, 120)}`).join('\n') || '—', false);
     const lines = p.score.components
-      .filter((c) => c.available)
-      .map((c) => `${c.points >= c.weight / 2 ? '▲' : '·'} ${c.label}: ${sanitize(c.detail, 90)} → ${c.points.toFixed(1)}/${c.weight}`);
+      .filter((c) => c.points > 0)
+      .map((c) => `${c.label}: ${c.points.toFixed(1)}/${c.weight}`);
     const missing = p.score.components.filter((c) => !c.available).map((c) => c.label);
     if (missing.length) lines.push(`Geen data: ${missing.join(', ')}`);
     for (const pen of p.score.penalties) lines.push(`− ${sanitize(pen.reason, 90)}: −${pen.points}`);
-    lines.push(`Betrouwbaarheid: ${(p.score.confidence * 100).toFixed(0)}% van de gewichten had data · ${p.score.version}`);
+    lines.push(
+      `Betrouwbaarheid ${(p.score.confidence * 100).toFixed(0)}% (datadekking, geen kans) · venster ${p.score.window} · ${p.score.version}`,
+    );
     add('Score-opbouw', lines.join('\n'), false);
+    if (p.score.warnings.length) {
+      add('Let op', p.score.warnings.slice(0, 5).map((w) => `• ${sanitize(w, 140)}`).join('\n'), false);
+    }
   }
 
   add(

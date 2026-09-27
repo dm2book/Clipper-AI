@@ -5,6 +5,7 @@ import type { Logger } from '../infra/logger.js';
 import type { Metrics } from '../infra/metrics.js';
 import { deleteHolderSnapshotsBefore, deleteProviderErrorsBefore } from '../repositories/enrichment.js';
 import { deleteSnapshotsBefore } from '../repositories/snapshots.js';
+import { deleteTradesBefore } from '../repositories/trades.js';
 import { archiveTokens, countByTier, updateTiers } from '../repositories/tokens.js';
 
 /** Tiering, archiving and data retention. */
@@ -29,7 +30,10 @@ export class MaintenanceService {
     const cutoff = new Date(Date.now() - retentionDays * 86_400_000);
     const snapshots = await deleteSnapshotsBefore(db, cutoff);
     const holders = await deleteHolderSnapshotsBefore(db, cutoff);
+    const trades = await deleteTradesBefore(db, cutoff);
     const providerErrors = await deleteProviderErrorsBefore(db, new Date(Date.now() - 14 * 86_400_000));
-    if (snapshots || holders || providerErrors) logger.info({ snapshots, holders, providerErrors }, 'old data removed');
+    if (snapshots || holders || trades || providerErrors) {
+      logger.info({ snapshots, holders, trades, providerErrors }, 'old data removed');
+    }
   }
 }

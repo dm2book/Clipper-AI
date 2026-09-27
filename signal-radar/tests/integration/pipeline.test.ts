@@ -10,6 +10,7 @@ import { PermanentError, RateLimitedError, TransientError } from '../../src/core
 import type { Pool } from '../../src/infra/db.js';
 import { silentLogger } from '../../src/infra/logger.js';
 import { Metrics } from '../../src/infra/metrics.js';
+import type { MomentumThresholds } from '../../src/momentum/thresholds.js';
 import { getAlert } from '../../src/repositories/alerts.js';
 import { insertSnapshot } from '../../src/repositories/snapshots.js';
 import { getToken } from '../../src/repositories/tokens.js';
@@ -32,7 +33,11 @@ import {
 const config = loadConfig(baseEnv());
 const logger = silentLogger();
 
-function wire(pool: Pool, alertOverrides: Partial<typeof config.alerts> = {}) {
+function wire(
+  pool: Pool,
+  alertOverrides: Partial<typeof config.alerts> = {},
+  momentumOverrides: Partial<MomentumThresholds> = {},
+) {
   const metrics = new Metrics();
   const discovery = new MockDiscoveryProvider();
   const market = new MockMarketDataProvider();
@@ -43,6 +48,7 @@ function wire(pool: Pool, alertOverrides: Partial<typeof config.alerts> = {}) {
   const signals = new SignalService({
     db: pool,
     alerts: { ...config.alerts, ...alertOverrides },
+    momentum: { defaults: { ...config.momentum.defaults, ...momentumOverrides }, overrides: {} },
     minExternalSafety: 1,
     logger,
     metrics,
@@ -172,48 +178,54 @@ describe.skipIf(!hasDatabase)('pipeline (real database, mock providers)', () => 
     expect(token!.nextSnapshotAt.getTime()).toBeGreaterThan(Date.now() + 5_000);
   });
 
-  it('raises a MOMENTUM alert with its evidence and honours the cooldown', async () => {
-    const w = wire(pool);
+  it('raises a MOMENTUM alert from the engine, stores its evidence and honours the cooldown', async () => {
+    // No trade stream: unique buyers cannot be measured, so the score is lower;
+    // this test accepts 50 instead of 60 to exercise the full path.
+    const w = wire(pool, {}, { minScore: 50 });
     await w.services.discovery.start();
     const t = makeDiscovered({ createdAtChain: new Date(Date.now() - 40 * 60_000) }); // too old for NEW_TOKEN
     await w.discovery.emit(t);
-    w.holders.counts.set(t.address, 400);
-    await pool.query(`INSERT INTO holder_snapshots (chain, token_address, observed_at, holder_count, top10_pct, method)
-                      VALUES ('solana', $1, now() - interval '6 minutes', 150, 20, 'test')`, [t.address]);
-    // 15 and 5 minutes ago: a quiet market
-    for (const [min, liq, cap, vol, tx] of [
-      [15, 20_000, 100_000, 1_000, 10],
-      [5, 22_000, 110_000, 1_500, 12],
+    const ago = (m: number) => new Date(Date.now() - m * 60_000);
+    // Provider snapshots with cumulative 24h totals (SYNTHETIC)
+    for (const [m, vol, buys, sells, extra] of [
+      [15, 0, 0, 0, {}],
+      [10, 4_400, 25, 5, {}],
+      [5, 14_400, 60, 15, { liquidityUsd: 50_000, marketCapUsd: 200_000 }],
     ] as const) {
       await insertSnapshot(
         pool,
-        makeSnapshot({
-          tokenAddress: t.address,
-          observedAt: new Date(Date.now() - min * 60_000),
-          liquidityUsd: liq,
-          marketCapUsd: cap,
-          volumeUsd: { m5: vol },
-          txns: { m5: { buys: tx / 2, sells: tx / 2 } },
-        }),
+        makeSnapshot({ tokenAddress: t.address, observedAt: ago(m), volumeUsd: { h24: vol }, txns: { h24: { buys, sells } }, ...extra }),
       );
     }
-    // now: unusual activity
+    await pool.query(
+      `INSERT INTO holder_snapshots (chain, token_address, observed_at, holder_count, top10_pct, method)
+       VALUES ('solana', $1, $2, 100, 20, 'test')`,
+      [t.address, ago(5)],
+    );
+    w.holders.counts.set(t.address, 137);
     w.market.markets.set(t.address, () => ({
-      liquidityUsd: 60_000,
-      marketCapUsd: 400_000,
-      volumeUsd: { m5: 20_000, h1: 25_000 },
-      txns: { m5: { buys: 90, sells: 30 } },
+      liquidityUsd: 62_000,
+      marketCapUsd: 230_000,
+      volumeUsd: { h24: 67_200 },
+      txns: { h24: { buys: 180, sells: 60 } },
     }));
     await w.services.enrichment.enrich((await getToken(pool, 'solana', t.address))!, signal);
     await w.services.market.runOnce(signal);
 
-    const { rows } = await pool.query(`SELECT a.type, a.status, a.score, a.payload, s.components
-                                       FROM alerts a JOIN scores s ON s.id = a.score_id`);
+    const { rows } = await pool.query(
+      `SELECT a.type, a.status, a.score, a.payload, m.signal_type, m.triggered_rules, m.payload AS engine
+       FROM alerts a JOIN momentum_signals m ON m.id = a.momentum_signal_id`,
+    );
     expect(rows).toHaveLength(1);
-    expect(rows[0]).toMatchObject({ type: 'MOMENTUM', status: 'PENDING' });
-    expect(Number(rows[0].score)).toBeGreaterThanOrEqual(60);
-    const signals = await pool.query('SELECT type FROM signals ORDER BY type');
-    expect(signals.rows.map((r) => r.type)).toContain('volume_spike');
+    expect(rows[0]).toMatchObject({ type: 'MOMENTUM', status: 'PENDING', signal_type: 'MOMENTUM' });
+    expect(rows[0].triggered_rules).toEqual(expect.arrayContaining(['volume_spike', 'tx_spike', 'holder_growth', 'liquidity_growth']));
+    expect(Number(rows[0].score)).toBeGreaterThanOrEqual(50);
+    const reasons: string[] = rows[0].payload.score.reasons;
+    expect(reasons.join('\n')).toMatch(/volume \+42\d%/);
+    expect(reasons.join('\n')).toMatch(/holder growth \+37%/);
+    expect(rows[0].payload.score.warnings.join()).toMatch(/geen trade-data/);
+    expect(rows[0].engine.metrics['5m'].flowSource).toBe('provider_h24_delta');
+    expect(rows[0].engine.disclaimer).toMatch(/Geen voorspelling/);
 
     // same activity a moment later: inside the cooldown, no escalation -> no second alert
     await makeDue(pool);

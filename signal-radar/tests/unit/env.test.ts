@@ -6,7 +6,7 @@ describe('loadConfig', () => {
   it('applies the documented defaults, including the requested alert filters', () => {
     const c = loadConfig(baseEnv());
     expect(c.alerts.newToken).toEqual({ maxAgeMinutes: 10, minLiquidityUsd: 20_000, minHolders: 50 });
-    expect(c.alerts.momentum.minScore).toBe(60);
+    expect(c.momentum.defaults.minScore).toBe(60);
     expect(c.solana.discoverySources).toEqual(['raydium_amm_v4', 'raydium_cpmm', 'pumpswap']);
     expect(c.redisUrl).toBeNull();
     expect(c.discord.webhookUrl).toBeNull();

@@ -323,6 +323,16 @@ sinds het laatst verwerkte slot.
 
 ## G. Scoring-architectuur
 
+> **Bijgewerkt:** de v1-score hieronder is vervangen door de **Momentum
+> Detection Engine** (`src/momentum/`, volledig beschreven in
+> [`MOMENTUM.md`](MOMENTUM.md)). Die werkt met 5 vensters (1m–1u), 9 regels
+> met drempels per chain/tokentype, filters tegen false positives en een
+> score van `Σ gewicht × (0,5 + 0,5 × sterkte) − aftrek`. Migratie
+> `0002_momentum_engine.sql` verving de tabellen `scores`/`signals` door
+> `momentum_signals` en voegde `trades` toe. De principes hieronder (meten in
+> plaats van voorspellen, ontbrekende data is nooit PASS, geversioneerde
+> spec) gelden onverminderd.
+
 ### G.1 Opbouw
 
 ```

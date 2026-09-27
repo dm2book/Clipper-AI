@@ -23,10 +23,10 @@ Ontwerp: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) · Status per databron: 
 | Veiligheid: RugCheck en GoPlus | ✅ gebouwd · ⚠️ nog niet tegen een live-antwoord getest |
 | Holders en top-10-concentratie (RPC) | ✅ |
 | Volume-spike, transactiegroei, market-cap-verandering, liquiditeitsgroei, aandeel aankopen, holdergroei | ✅ |
-| Transparante Signal Score (v1) | ✅ |
+| Momentum Detection Engine: 5 vensters, 9 regels, filters tegen false positives, uitlegbare score | ✅ ([docs/MOMENTUM.md](docs/MOMENTUM.md)) |
 | NEW TOKEN- en MOMENTUM-alerts naar Discord (outbox, retries, rate limits) | ✅ |
 | Realtime monitoring in tiers (15 s → 60 s → 5 min → archief) | ✅ |
-| Unieke kopers, koop- vs. verkoopvolume, whale-trades | ❌ fase 3 (trade stream nodig) |
+| Unieke kopers/verkopers, wash-trading, extreme-trade-filter | ✅ in de engine · ❌ databron (trade stream, fase 3) nog niet gekoppeld |
 | Wallets met aantoonbare historie volgen | ❌ fase 4 (`WalletProvider` bestaat als interface, niet gekoppeld) |
 
 ## Snel starten (lokaal)
@@ -87,43 +87,46 @@ logsSubscribe ─▶ nieuwe pool ─▶ getTransaction ─▶ tokens (HOT)
 - veiligheid PASS (of WARN, instelbaar),
 - marktdata niet ouder dan 60 s.
 
-**MOMENTUM.** Alle voorwaarden moeten gelden:
-- Signal Score ≥ 60,
-- minstens 3 componenten met sterkte ≥ 0,5,
-- minstens 70% van de gewichten had data,
-- liquiditeit ≥ $20.000,
-- veiligheid in orde.
+**MOMENTUM.** Dit komt uit de **Momentum Detection Engine** ([`docs/MOMENTUM.md`](docs/MOMENTUM.md)). De engine meet over de vensters 1m, 5m, 15m, 30m en 1u de veranderingen in:
+- prijs, market cap, liquiditeit en holders;
+- volume, transacties, buys/sells en unieke kopers/verkopers;
+- de acceleraties van volume en transacties.
+
+Negen regels met instelbare drempels leveren een transparante score op. De alert gaat alleen uit als:
+- de engine `MOMENTUM` meldt: score ≥ 60, minstens 3 regels getriggerd, confidence ≥ 0,7, en geen blokkerend filter;
+- de veiligheid in orde is;
+- de marktdata vers is.
+
+Filters tegen false positives:
+- liquiditeitsvloer, minimum holders, minimum volume, minimum transacties en minimum unieke kopers;
+- wash-trading-heuristiek;
+- uitsluiting van extreme losse trades.
 
 Cooldown van 15 min per token. Daarbinnen komt er alleen een nieuwe alert als de score minstens 15 punten hoger is.
 
 Globaal gaan er maximaal `ALERTS_MAX_PER_HOUR` alerts uit. Alerts boven die limiet worden als `SUPPRESSED` vastgelegd, met reden.
 
-### Signal Score (v1)
+### Momentum Score (voorbeeld, berekend op synthetische testdata)
 
 ```
-score = clamp( Σ gewicht × sterkte − aftrek , 0, 100 )
-sterkte = clamp( (meting − ondergrens) / (volle waarde − ondergrens), 0, 1 )
+Momentum Score: 66 (MOMENTUM, confidence 1)
+Reasons:
+* volume +428% (5m: $52.8k vs $10.0k)
+* transactions +267% (5m: 165 vs 45)
+* holder growth +37% (5m: 100 → 137)
+* unique buyers +111% (5m: 74 vs 35)
+* liquidity +24% (5m: $50.0k → $62.0k)
+…
 ```
 
-| Component | Gewicht | Ondergrens → volle waarde |
-|---|---|---|
-| Volume-spike 5m (t.o.v. het vorige, niet-overlappende 5m-venster) | 25 | 2× → 8× |
-| Transactiegroei 5m | 15 | 1,5× → 5× |
-| Liquiditeitsgroei (15m, anders 5m) | 20 | +10% → +100% |
-| Market-cap-verandering (nooit gemengd met FDV) | 15 | +20% → +200% |
-| Aandeel aankopen 5m (aantallen) | 10 | 55% → 75% |
-| Holdergroei per 5m | 15 | +10 → +100 |
+```
+punten = getriggerd ? gewicht × (0,5 + 0,5 × sterkte) : 0
+score  = clamp(Σ punten − Σ aftrek, 0, 100)
+```
 
-**Aftrek:** veiligheid WARN −10, top-10 ≥ 40% −15, liquiditeit ≥ 20% gedaald in 5 min −20.
+Elke regel staat met waarde, drempel, gewicht en punten in de output. De score meet **hoe uitzonderlijk de huidige activiteit is**. Het is geen voorspelling en geen rendementsbelofte.
 
-Onder absolute minima telt een meting niet mee, zodat "10× van $5" geen signaal is:
-- volume minstens $5k in 5m,
-- minstens 30 transacties,
-- minstens $5k liquiditeitsgroei.
-
-Ontbrekende data verlaagt de "betrouwbaarheid" en wordt in de alert genoemd.
-
-De score meet **hoe uitzonderlijk de activiteit is**, niet de kans op een stijging. Wie de gewichten wil aanpassen, maakt een nieuwe versie (`src/core/scoring.ts`).
+⚠️ **Unieke kopers/verkopers en wash-trading** vragen per-trade data. Die trade stream is nog niet gekoppeld (fase 3). Tot dan meet de engine volume en transacties uit de 24u-totalen van de provider (exact voor tokens jonger dan 24 u). Dat de rest niet gemeten wordt, staat in de alert.
 
 ## Configuratie
 

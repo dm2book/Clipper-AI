@@ -15,7 +15,7 @@ describe.skipIf(!hasDatabase)('database schema and migrations', () => {
   it('is idempotent', async () => {
     expect(await migrate(pool, silentLogger())).toEqual([]);
     const { rows } = await pool.query('SELECT name FROM schema_migrations');
-    expect(rows.map((r) => r.name)).toEqual(['0001_init.sql']);
+    expect(rows.map((r) => r.name)).toEqual(['0001_init.sql', '0002_momentum_engine.sql']);
   });
 
   it('creates every table the services use', async () => {
@@ -26,14 +26,14 @@ describe.skipIf(!hasDatabase)('database schema and migrations', () => {
       'alerts',
       'holder_snapshots',
       'market_snapshots',
+      'momentum_signals',
       'pools',
       'provider_errors',
       'safety_reports',
       'schema_migrations',
-      'scores',
-      'signals',
       'system_state',
       'tokens',
+      'trades',
     ]);
   });
 

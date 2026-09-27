@@ -12,6 +12,7 @@ import {
   markSnapshotMissing,
   updateTiers,
 } from '../../src/repositories/tokens.js';
+import { deleteTradesBefore, insertTrades, tradesSince } from '../../src/repositories/trades.js';
 import { freshDatabase, hasDatabase } from '../support/db.js';
 import { makeDiscovered, makeSnapshot } from '../support/factories.js';
 
@@ -130,5 +131,23 @@ describe.skipIf(!hasDatabase)('token and snapshot repositories', () => {
     await pool.query(`UPDATE tokens SET next_snapshot_at = now() - interval '1 minute'`);
     const claimed = await claimDueForSnapshot(pool, 'solana', 10, 60);
     expect(claimed.map((t) => t.tier).sort()).toEqual(['HOT', 'WARM', 'WARM']);
+  });
+
+  it('stores trades idempotently and returns them for the engine', async () => {
+    const t = makeDiscovered();
+    await insertDiscoveredToken(pool, t);
+    const base = { chain: 'solana' as const, tokenAddress: t.address, poolAddress: null, source: 'test' };
+    const trades = [
+      { ...base, signature: 's1', ixIndex: 0, wallet: 'w1', side: 'buy' as const, valueUsd: 120.5, at: new Date(Date.now() - 60_000) },
+      { ...base, signature: 's1', ixIndex: 1, wallet: 'w2', side: 'sell' as const, valueUsd: 80, at: new Date(Date.now() - 30_000) },
+    ];
+    expect(await insertTrades(pool, trades)).toBe(2);
+    expect(await insertTrades(pool, trades)).toBe(0); // same signature + instruction: ignored
+    const back = await tradesSince(pool, 'solana', t.address, new Date(Date.now() - 120_000));
+    expect(back.map((x) => [x.wallet, x.side, x.valueUsd])).toEqual([
+      ['w1', 'buy', 120.5],
+      ['w2', 'sell', 80],
+    ]);
+    expect(await deleteTradesBefore(pool, new Date(Date.now() - 45_000))).toBe(1);
   });
 });

@@ -75,23 +75,30 @@ describe('renderAlert', () => {
         score: {
           value: 72.5,
           confidence: 0.85,
-          version: 'v1',
+          version: 'momentum-v1',
+          window: '5m',
           components: [
-            { type: 'volume_spike', label: 'Volume-spike 5m', points: 25, weight: 25, available: true, detail: '$15k vs $1.9k (8.0×)' },
-            { type: 'holder_growth', label: 'Holdergroei', points: 0, weight: 15, available: false, detail: 'geen data' },
+            { type: 'volume_spike', label: 'Volume-spike', points: 14.3, weight: 20, available: true, detail: 'volume +428%' },
+            { type: 'buyer_growth', label: 'Groei unieke kopers', points: 0, weight: 15, available: false, detail: 'geen data' },
           ],
-          penalties: [{ reason: 'top-10 bezit ≥ 40%', points: 15 }],
+          penalties: [{ reason: 'liquidity -25% in 5m', points: 20 }],
+          reasons: ['volume +428% (5m: $52.8k vs $10.0k)', 'transactions +267% (5m: 165 vs 45)'],
+          warnings: ['unieke kopers/verkopers en wash-trading niet gemeten: geen trade-data'],
         },
       }),
       'Signal Radar',
     );
     const embed = body.embeds[0];
-    expect(embed.title).toContain('score 73/100');
+    expect(embed.title).toContain('Momentum Score 73/100');
+    const reasons = embed.fields.find((f) => f.name === 'Redenen')!.value;
+    expect(reasons).toContain('volume +428%');
+    expect(reasons).toContain('transactions +267%');
     const breakdown = embed.fields.find((f) => f.name === 'Score-opbouw')!.value;
-    expect(breakdown).toContain('Volume-spike 5m');
-    expect(breakdown).toContain('25.0/25');
-    expect(breakdown).toContain('Geen data: Holdergroei');
-    expect(breakdown).toContain('−15');
+    expect(breakdown).toContain('Volume-spike: 14.3/20');
+    expect(breakdown).toContain('Geen data: Groei unieke kopers');
+    expect(breakdown).toContain('−20');
+    expect(breakdown).toContain('datadekking, geen kans');
+    expect(embed.fields.find((f) => f.name === 'Let op')!.value).toContain('geen trade\\-data');
   });
 
   it('stays within Discord limits with hostile input', () => {

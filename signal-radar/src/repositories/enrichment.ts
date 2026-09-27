@@ -87,11 +87,17 @@ interface HolderRow {
 }
 
 /** Newest first. */
-export async function recentHolderSnapshots(db: Queryable, chain: Chain, address: string, since: Date): Promise<HolderSnapshot[]> {
+export async function recentHolderSnapshots(
+  db: Queryable,
+  chain: Chain,
+  address: string,
+  since: Date,
+  limit = 500,
+): Promise<HolderSnapshot[]> {
   const { rows } = await db.query<HolderRow>(
     `SELECT * FROM holder_snapshots WHERE chain = $1 AND token_address = $2 AND observed_at >= $3
-     ORDER BY observed_at DESC LIMIT 100`,
-    [chain, address, since],
+     ORDER BY observed_at DESC LIMIT $4`,
+    [chain, address, since, limit],
   );
   return rows.map((r) => ({
     chain: r.chain,

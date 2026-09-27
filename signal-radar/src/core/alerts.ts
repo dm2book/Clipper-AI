@@ -45,14 +45,21 @@ export interface AlertPayload {
     reasons: string[];
     providers: { provider: string; verdict: SafetyVerdict }[];
   };
-  score: {
-    value: number;
-    confidence: number;
-    version: string;
-    components: { type: string; label: string; points: number; weight: number; available: boolean; detail: string }[];
-    penalties: { reason: string; points: number }[];
-  } | null;
+  score: ScoreSummary | null;
   gates: GateResult[];
+}
+
+/** The explainable score of the Momentum Detection Engine, as sent with an alert. */
+export interface ScoreSummary {
+  value: number;
+  confidence: number;
+  version: string;
+  window: string;
+  components: { type: string; label: string; points: number; weight: number; available: boolean; detail: string }[];
+  penalties: { reason: string; points: number }[];
+  /** One line per triggered rule, e.g. "volume +428% (5m: $52.8k vs $10.0k)". */
+  reasons: string[];
+  warnings: string[];
 }
 
 export function dedupeKey(type: AlertType, chain: Chain, address: string, suffix?: string | number): string {
@@ -78,13 +85,7 @@ export interface PayloadInput {
   };
   holders: { holderCount: number; holderCountCapped: boolean; top10Pct: number | null; observedAt: Date } | null;
   safety: { verdict: SafetyVerdict; reasons: string[]; providers: { provider: string; verdict: SafetyVerdict }[] };
-  score: {
-    score: number;
-    confidence: number;
-    version: string;
-    components: { type: string; label: string; points: number; weight: number; available: boolean; detail: string }[];
-    penalties: { reason: string; points: number }[];
-  } | null;
+  score: ScoreSummary | null;
   gates: GateResult[];
 }
 
@@ -125,22 +126,7 @@ export function buildAlertPayload(i: PayloadInput): AlertPayload {
       reasons: i.safety.reasons,
       providers: i.safety.providers.map((p) => ({ provider: p.provider, verdict: p.verdict })),
     },
-    score: i.score
-      ? {
-          value: i.score.score,
-          confidence: i.score.confidence,
-          version: i.score.version,
-          components: i.score.components.map((c) => ({
-            type: c.type,
-            label: c.label,
-            points: c.points,
-            weight: c.weight,
-            available: c.available,
-            detail: c.detail,
-          })),
-          penalties: i.score.penalties,
-        }
-      : null,
+    score: i.score,
     gates: i.gates,
   };
 }

@@ -4,6 +4,7 @@
  * the variables but never echoes their values (they may be secrets).
  */
 import { z } from 'zod';
+import { DEFAULT_THRESHOLDS, parseOverrides, resolveThresholds, type ThresholdConfig } from '../momentum/thresholds.js';
 
 export interface TierIntervals {
   HOT: number;
@@ -26,12 +27,6 @@ export interface TierSettings {
 
 export interface AlertSettings {
   newToken: { maxAgeMinutes: number; minLiquidityUsd: number; minHolders: number };
-  momentum: {
-    minScore: number;
-    minActiveComponents: number;
-    minLiquidityUsd: number;
-    minConfidence: number;
-  };
   safetyAllowWarn: boolean;
   cooldownMinutes: number;
   escalationPoints: number;
@@ -66,6 +61,8 @@ export interface AppConfig {
   safety: { minExternalPasses: number };
   discord: { webhookUrl: string | null; username: string };
   alerts: AlertSettings;
+  /** Momentum Detection Engine thresholds (defaults + per chain/token-type overrides). */
+  momentum: ThresholdConfig;
   tiers: TierSettings;
   enrichConcurrency: number;
   retentionDays: number;
@@ -151,10 +148,43 @@ export const envSchema = z.object({
   NEW_TOKEN_MAX_AGE_MINUTES: num(1).default(10),
   NEW_TOKEN_MIN_LIQUIDITY_USD: num(0).default(20_000),
   NEW_TOKEN_MIN_HOLDERS: int(0).default(50),
-  MOMENTUM_MIN_SCORE: num(0).max(100).default(60),
-  MOMENTUM_MIN_ACTIVE_COMPONENTS: int(1).default(3),
-  MOMENTUM_MIN_LIQUIDITY_USD: num(0).default(20_000),
-  MOMENTUM_MIN_CONFIDENCE: num(0).max(1).default(0.7),
+  // Momentum Detection Engine (src/momentum/thresholds.ts documents each value)
+  MOMENTUM_PRIMARY_WINDOW: z.enum(['1m', '5m', '15m', '30m', '1h']).default(DEFAULT_THRESHOLDS.primaryWindow),
+  VOLUME_SPIKE_THRESHOLD: num(1).default(DEFAULT_THRESHOLDS.volumeSpikePct),
+  TX_SPIKE_THRESHOLD: num(1).default(DEFAULT_THRESHOLDS.txSpikePct),
+  BUYER_GROWTH_THRESHOLD: num(1).default(DEFAULT_THRESHOLDS.buyerGrowthPct),
+  HOLDER_GROWTH_THRESHOLD: num(1).default(DEFAULT_THRESHOLDS.holderGrowthPct),
+  LIQUIDITY_GROWTH_THRESHOLD: num(1).default(DEFAULT_THRESHOLDS.liquidityGrowthPct),
+  MARKET_CAP_CHANGE_THRESHOLD: num(1).default(DEFAULT_THRESHOLDS.marketCapChangePct),
+  BUY_SHARE_THRESHOLD: num(0.5).max(1).default(DEFAULT_THRESHOLDS.buyShare),
+  VOLUME_ACCELERATION_THRESHOLD: num(1).default(DEFAULT_THRESHOLDS.volumeAccelerationPct),
+  TX_ACCELERATION_THRESHOLD: num(1).default(DEFAULT_THRESHOLDS.txAccelerationPct),
+  MIN_LIQUIDITY: num(0).default(DEFAULT_THRESHOLDS.minLiquidityUsd),
+  MIN_HOLDERS: int(0).default(DEFAULT_THRESHOLDS.minHolders),
+  MIN_WINDOW_VOLUME_USD: num(0).default(DEFAULT_THRESHOLDS.minWindowVolumeUsd),
+  MIN_WINDOW_TRANSACTIONS: int(0).default(DEFAULT_THRESHOLDS.minWindowTransactions),
+  MIN_UNIQUE_BUYERS: int(0).default(DEFAULT_THRESHOLDS.minUniqueBuyers),
+  SINGLE_TRADE_MAX_SHARE: num(0.01).max(1).default(DEFAULT_THRESHOLDS.singleTradeMaxShare),
+  SINGLE_TRADE_MEDIAN_MULTIPLE: num(1).default(DEFAULT_THRESHOLDS.singleTradeMedianMultiple),
+  WASH_MAX_TOP_WALLETS_SHARE: num(0).max(1).default(DEFAULT_THRESHOLDS.washMaxTopWalletsShare),
+  WASH_MAX_ROUND_TRIP_SHARE: num(0).max(1).default(DEFAULT_THRESHOLDS.washMaxRoundTripShare),
+  WASH_MAX_TX_PER_WALLET: num(1).default(DEFAULT_THRESHOLDS.washMaxTransactionsPerWallet),
+  LIQUIDITY_DROP_THRESHOLD: num(1).default(DEFAULT_THRESHOLDS.liquidityDropPct),
+  MOMENTUM_REQUIRE_TRADE_DATA: z.stringbool().default(DEFAULT_THRESHOLDS.requireTradeData),
+  MOMENTUM_MIN_SCORE: num(0).max(100).default(DEFAULT_THRESHOLDS.minScore),
+  MOMENTUM_MIN_TRIGGERED_RULES: int(1).max(9).default(DEFAULT_THRESHOLDS.minTriggeredRules),
+  MOMENTUM_MIN_CONFIDENCE: num(0).max(1).default(DEFAULT_THRESHOLDS.minConfidence),
+  MOMENTUM_THRESHOLD_OVERRIDES: z
+    .string()
+    .transform((s, ctx) => {
+      try {
+        return parseOverrides(s);
+      } catch (err) {
+        ctx.addIssue({ code: 'custom', message: (err as Error).message });
+        return z.NEVER;
+      }
+    })
+    .optional(),
   ALERT_COOLDOWN_MINUTES: num(0).default(15),
   ALERT_ESCALATION_POINTS: num(0).default(15),
   ALERTS_MAX_PER_HOUR: int(1).default(30),
@@ -210,7 +240,7 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): AppConfig {
     throw new ConfigError(['ARCHIVE_AFTER_HOURS: must be later than TIER_WARM_MINUTES']);
   }
 
-  return {
+  const config: AppConfig = {
     nodeEnv: e.NODE_ENV,
     logLevel: e.LOG_LEVEL,
     runMigrationsOnStart: e.RUN_MIGRATIONS_ON_START,
@@ -251,18 +281,44 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): AppConfig {
         minLiquidityUsd: e.NEW_TOKEN_MIN_LIQUIDITY_USD,
         minHolders: e.NEW_TOKEN_MIN_HOLDERS,
       },
-      momentum: {
-        minScore: e.MOMENTUM_MIN_SCORE,
-        minActiveComponents: e.MOMENTUM_MIN_ACTIVE_COMPONENTS,
-        minLiquidityUsd: e.MOMENTUM_MIN_LIQUIDITY_USD,
-        minConfidence: e.MOMENTUM_MIN_CONFIDENCE,
-      },
       safetyAllowWarn: e.SAFETY_ALLOW_WARN,
       cooldownMinutes: e.ALERT_COOLDOWN_MINUTES,
       escalationPoints: e.ALERT_ESCALATION_POINTS,
       maxPerHour: e.ALERTS_MAX_PER_HOUR,
       marketDataMaxAgeSec: e.MARKET_DATA_MAX_AGE_SECONDS,
       holdersMaxAgeSec: e.HOLDERS_MAX_AGE_SECONDS,
+    },
+    momentum: {
+      defaults: {
+        ...DEFAULT_THRESHOLDS,
+        primaryWindow: e.MOMENTUM_PRIMARY_WINDOW,
+        volumeSpikePct: e.VOLUME_SPIKE_THRESHOLD,
+        txSpikePct: e.TX_SPIKE_THRESHOLD,
+        buyerGrowthPct: e.BUYER_GROWTH_THRESHOLD,
+        holderGrowthPct: e.HOLDER_GROWTH_THRESHOLD,
+        liquidityGrowthPct: e.LIQUIDITY_GROWTH_THRESHOLD,
+        marketCapChangePct: e.MARKET_CAP_CHANGE_THRESHOLD,
+        buyShare: e.BUY_SHARE_THRESHOLD,
+        buyShareFull: Math.max(DEFAULT_THRESHOLDS.buyShareFull, Math.min(1, e.BUY_SHARE_THRESHOLD + 0.2)),
+        volumeAccelerationPct: e.VOLUME_ACCELERATION_THRESHOLD,
+        txAccelerationPct: e.TX_ACCELERATION_THRESHOLD,
+        minLiquidityUsd: e.MIN_LIQUIDITY,
+        minHolders: e.MIN_HOLDERS,
+        minWindowVolumeUsd: e.MIN_WINDOW_VOLUME_USD,
+        minWindowTransactions: e.MIN_WINDOW_TRANSACTIONS,
+        minUniqueBuyers: e.MIN_UNIQUE_BUYERS,
+        singleTradeMaxShare: e.SINGLE_TRADE_MAX_SHARE,
+        singleTradeMedianMultiple: e.SINGLE_TRADE_MEDIAN_MULTIPLE,
+        washMaxTopWalletsShare: e.WASH_MAX_TOP_WALLETS_SHARE,
+        washMaxRoundTripShare: e.WASH_MAX_ROUND_TRIP_SHARE,
+        washMaxTransactionsPerWallet: e.WASH_MAX_TX_PER_WALLET,
+        liquidityDropPct: e.LIQUIDITY_DROP_THRESHOLD,
+        requireTradeData: e.MOMENTUM_REQUIRE_TRADE_DATA,
+        minScore: e.MOMENTUM_MIN_SCORE,
+        minTriggeredRules: e.MOMENTUM_MIN_TRIGGERED_RULES,
+        minConfidence: e.MOMENTUM_MIN_CONFIDENCE,
+      },
+      overrides: e.MOMENTUM_THRESHOLD_OVERRIDES ?? {},
     },
     tiers: {
       hotMinutes: e.TIER_HOT_MINUTES,
@@ -292,4 +348,17 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): AppConfig {
     health: { host: e.HEALTH_HOST, port: e.HEALTH_PORT },
     shutdownTimeoutMs: e.SHUTDOWN_TIMEOUT_MS,
   };
+
+  // Every threshold layer must resolve to a valid profile, checked now rather
+  // than on the first token of an affected chain/type.
+  try {
+    resolveThresholds(config.momentum, 'solana', null);
+    for (const key of Object.keys(config.momentum.overrides)) {
+      const [chain, tokenType] = key.split(':');
+      resolveThresholds(config.momentum, chain!, tokenType ?? null);
+    }
+  } catch (err) {
+    throw new ConfigError([`momentum thresholds: ${(err as Error).message}`]);
+  }
+  return config;
 }

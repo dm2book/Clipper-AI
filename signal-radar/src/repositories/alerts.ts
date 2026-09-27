@@ -1,8 +1,7 @@
 import type { AlertPayload, AlertType } from '../core/alerts.js';
-import type { ScoreResult } from '../core/scoring.js';
-import type { Measurement } from '../core/signals.js';
 import type { Chain } from '../core/types.js';
 import { date, num, type PoolClient, type Queryable } from '../infra/db.js';
+import type { MomentumSignal } from '../momentum/engine.js';
 
 export type AlertStatus = 'PENDING' | 'SENT' | 'FAILED' | 'SUPPRESSED';
 
@@ -71,9 +70,9 @@ export async function countAlertsSince(db: Queryable, since: Date): Promise<numb
 }
 
 /**
- * Stores the score, the signals that were active, and the alert in one
- * transaction: an alert never exists without its evidence. Returns the alert
- * id, or null when the dedupe key already existed.
+ * Stores the engine output (if any) and the alert in one transaction: an
+ * alert never exists without its evidence. Returns the alert id, or null
+ * when the dedupe key already existed.
  */
 export async function createAlertWithEvidence(
   client: PoolClient,
@@ -85,63 +84,44 @@ export async function createAlertWithEvidence(
     status: 'PENDING' | 'SUPPRESSED';
     suppressedReason: string | null;
     payload: AlertPayload;
-    score: ScoreResult | null;
-    measurements: readonly Measurement[];
-    detectorVersion: string;
-    now: Date;
+    momentum: MomentumSignal | null;
   },
 ): Promise<number | null> {
   await client.query('BEGIN');
   try {
-    let scoreId: number | null = null;
-    if (a.score) {
+    let signalId: number | null = null;
+    if (a.momentum) {
+      const m = a.momentum;
       const { rows } = await client.query<{ id: string }>(
-        `INSERT INTO scores (chain, token_address, computed_at, score, confidence, scoring_version, components, penalties)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
+        `INSERT INTO momentum_signals (chain, token_address, evaluated_at, signal_type, engine_version, primary_window,
+                                       profile, score, confidence, triggered_rules, payload)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id`,
         [
           a.chain,
           a.tokenAddress,
-          a.now,
-          a.score.score,
-          a.score.confidence,
-          a.score.version,
-          JSON.stringify(a.score.components),
-          JSON.stringify(a.score.penalties),
+          m.timestamp,
+          m.signalType,
+          m.engineVersion,
+          m.primaryWindow,
+          m.profile,
+          m.score,
+          m.confidence,
+          m.triggeredRules.map((r) => r.id),
+          JSON.stringify(m),
         ],
       );
-      scoreId = Number(rows[0]!.id);
-      const strengths = new Map(a.score.components.map((c) => [c.type, c.strength]));
-      for (const m of a.measurements.filter((x) => x.available)) {
-        await client.query(
-          `INSERT INTO signals (chain, token_address, score_id, type, detected_at, window_label, value, baseline, metric, strength, evidence, detector_version)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
-          [
-            a.chain,
-            a.tokenAddress,
-            scoreId,
-            m.type,
-            a.now,
-            m.window,
-            m.value,
-            m.baseline,
-            m.metric,
-            strengths.get(m.type) ?? null,
-            JSON.stringify({ ...m.evidence, detail: m.detail, qualifies: m.qualifies }),
-            a.detectorVersion,
-          ],
-        );
-      }
+      signalId = Number(rows[0]!.id);
     }
     const { rows } = await client.query<{ id: string }>(
-      `INSERT INTO alerts (chain, token_address, type, score_id, score, dedupe_key, status, suppressed_reason, payload)
+      `INSERT INTO alerts (chain, token_address, type, momentum_signal_id, score, dedupe_key, status, suppressed_reason, payload)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
        ON CONFLICT (dedupe_key) DO NOTHING RETURNING id`,
       [
         a.chain,
         a.tokenAddress,
         a.type,
-        scoreId,
-        a.score?.score ?? null,
+        signalId,
+        a.momentum?.score ?? null,
         a.dedupeKey,
         a.status,
         a.suppressedReason,

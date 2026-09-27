@@ -8,7 +8,7 @@ import type { GateResult } from './alerts.js';
 import type { HolderSnapshot } from './holders.js';
 import { snapshotAgeMs, type MarketSnapshot } from './marketSnapshot.js';
 import type { SafetySummary } from './safety.js';
-import type { ScoreResult } from './scoring.js';
+import type { MomentumSignal } from '../momentum/engine.js';
 import type { TokenAge } from './token.js';
 
 export interface Decision {
@@ -74,47 +74,43 @@ export function evaluateNewToken(input: NewTokenInput, cfg: AlertSettings): Deci
 export interface MomentumInput {
   now: Date;
   snapshot: MarketSnapshot;
-  score: ScoreResult;
+  /** Output of the Momentum Detection Engine for this token. */
+  signal: MomentumSignal;
   safety: SafetySummary;
   /** The last MOMENTUM alert for this token, if any. */
   lastAlert: { createdAt: Date; score: number | null } | null;
 }
 
-/** MOMENTUM: score and breadth thresholds, with cooldown and escalation. */
+/**
+ * MOMENTUM alert: the engine must report MOMENTUM (score, rule breadth,
+ * confidence and false-positive filters are its job); on top of that the
+ * alert needs passing safety, fresh data, and must respect the cooldown
+ * unless the score escalates.
+ */
 export function evaluateMomentum(input: MomentumInput, cfg: AlertSettings): Decision {
-  const { now, snapshot, score, safety, lastAlert } = input;
-  const m = cfg.momentum;
-  const liq = snapshot.liquidityUsd;
+  const { now, snapshot, signal, safety, lastAlert } = input;
+  const blocked = signal.filters.filter((f) => f.blocking).map((f) => f.id);
   const gates: GateResult[] = [
+    {
+      name: 'momentum-engine',
+      passed: signal.signalType === 'MOMENTUM',
+      detail:
+        `${signal.signalType}: score ${signal.score}, ${signal.triggeredRules.length} regels, ` +
+        `confidence ${signal.confidence}${blocked.length ? `, geblokkeerd door ${blocked.join(', ')}` : ''}`,
+    },
     safetyGate(safety, cfg.safetyAllowWarn),
-    {
-      name: 'liquiditeit',
-      passed: liq !== null && liq >= m.minLiquidityUsd,
-      detail: liq === null ? 'onbekend' : `$${Math.round(liq)} (min $${m.minLiquidityUsd})`,
-    },
     freshnessGate(snapshot, now, cfg.marketDataMaxAgeSec),
-    {
-      name: 'datadekking',
-      passed: score.confidence >= m.minConfidence,
-      detail: `${(score.confidence * 100).toFixed(0)}% van de gewichten had data (min ${(m.minConfidence * 100).toFixed(0)}%)`,
-    },
-    { name: 'score', passed: score.score >= m.minScore, detail: `${score.score} (min ${m.minScore})` },
-    {
-      name: 'breedte',
-      passed: score.activeComponents >= m.minActiveComponents,
-      detail: `${score.activeComponents} actieve componenten (min ${m.minActiveComponents})`,
-    },
   ];
   if (lastAlert) {
     const sinceMin = (now.getTime() - lastAlert.createdAt.getTime()) / 60_000;
     const inCooldown = sinceMin < cfg.cooldownMinutes;
-    const escalates = lastAlert.score !== null && score.score >= lastAlert.score + cfg.escalationPoints;
+    const escalates = lastAlert.score !== null && signal.score >= lastAlert.score + cfg.escalationPoints;
     gates.push({
       name: 'cooldown',
       passed: !inCooldown || escalates,
       detail: inCooldown
         ? escalates
-          ? `escalatie: ${score.score} ≥ ${lastAlert.score} + ${cfg.escalationPoints}`
+          ? `escalatie: ${signal.score} ≥ ${lastAlert.score} + ${cfg.escalationPoints}`
           : `vorige alert ${sinceMin.toFixed(1)} min geleden (cooldown ${cfg.cooldownMinutes} min)`
         : 'buiten cooldown',
     });

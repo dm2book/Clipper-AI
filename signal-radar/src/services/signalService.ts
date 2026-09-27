@@ -1,16 +1,17 @@
 import type { AlertSettings } from '../config/env.js';
 import { evaluateMomentum, evaluateNewToken, type Decision } from '../core/alertRules.js';
-import { buildAlertPayload, dedupeKey, type AlertType, type GateResult } from '../core/alerts.js';
+import { buildAlertPayload, dedupeKey, type AlertType, type GateResult, type ScoreSummary } from '../core/alerts.js';
 import type { HolderSnapshot } from '../core/holders.js';
 import type { MarketSnapshot } from '../core/marketSnapshot.js';
 import { aggregateSafety, type SafetySummary } from '../core/safety.js';
-import { SCORING_V1, computeScore, type ScoreResult, type ScoringSpec } from '../core/scoring.js';
-import { DETECTOR_VERSION, liquidityChange5mPct, measureAll, type Measurement } from '../core/signals.js';
 import { tokenAge, type Token, type TokenAge } from '../core/token.js';
 import { KeyedMutex } from '../infra/concurrency.js';
 import type { Pool } from '../infra/db.js';
 import type { Logger } from '../infra/logger.js';
 import type { Metrics } from '../infra/metrics.js';
+import { detectMomentum, type MomentumSignal } from '../momentum/engine.js';
+import type { TradeData } from '../momentum/flow.js';
+import { resolveThresholds, type ThresholdConfig } from '../momentum/thresholds.js';
 import { alertExists, countAlertsSince, createAlertWithEvidence, lastAlert } from '../repositories/alerts.js';
 import { latestSafetyReports, recentHolderSnapshots } from '../repositories/enrichment.js';
 import { latestSnapshot, recentSnapshots } from '../repositories/snapshots.js';
@@ -18,31 +19,56 @@ import { latestSnapshot, recentSnapshots } from '../repositories/snapshots.js';
 export interface SignalServiceDeps {
   db: Pool;
   alerts: AlertSettings;
+  momentum: ThresholdConfig;
   minExternalSafety: number;
   logger: Logger;
   metrics: Metrics;
-  spec?: ScoringSpec;
   clock?: () => Date;
+  /**
+   * Per-trade data for a token, or null when no trade stream covers it. Not
+   * connected yet (roadmap phase 3): the engine then uses market snapshots
+   * and reports unique buyers/sellers and wash checks as "not measured".
+   */
+  tradeData?: (token: Token, since: Date) => Promise<TradeData | null>;
 }
 
 export interface Evaluation {
   skipped?: string;
   newToken?: Decision;
   momentum?: Decision;
-  score?: ScoreResult;
+  signal?: MomentumSignal;
   alertIds: number[];
 }
 
-const HISTORY_MS = 20 * 60_000;
+/** Enough history for the 1h window's before-previous interval, plus tolerance. */
+const LOOKBACK_MS = 3 * 3_600_000 + 15 * 60_000;
 
-/** Measures signals, scores them and turns eligible decisions into alerts. */
+export function toScoreSummary(s: MomentumSignal): ScoreSummary {
+  return {
+    value: s.score,
+    confidence: s.confidence,
+    version: s.engineVersion,
+    window: s.primaryWindow,
+    components: s.rules.map((r) => ({
+      type: r.id,
+      label: r.label,
+      points: r.points,
+      weight: r.weight,
+      available: r.available,
+      detail: r.detail,
+    })),
+    penalties: s.penalties.map((p) => ({ reason: p.reason, points: p.points })),
+    reasons: s.reasons,
+    warnings: s.warnings,
+  };
+}
+
+/** Runs the Momentum Detection Engine and turns eligible decisions into alerts. */
 export class SignalService {
   private readonly mutex = new KeyedMutex();
-  private readonly spec: ScoringSpec;
   private readonly clock: () => Date;
 
   constructor(private readonly deps: SignalServiceDeps) {
-    this.spec = deps.spec ?? SCORING_V1;
     this.clock = deps.clock ?? (() => new Date());
   }
 
@@ -58,32 +84,51 @@ export class SignalService {
   }
 
   private async evaluateLocked(token: Token, snapshot: MarketSnapshot): Promise<Evaluation> {
-    const { db, alerts } = this.deps;
+    const { db, alerts, logger } = this.deps;
     const now = this.clock();
-    const needed = Math.min(alerts.newToken.minLiquidityUsd, alerts.momentum.minLiquidityUsd);
+    const { thresholds, profile } = resolveThresholds(this.deps.momentum, token.chain, snapshot.dexId);
+    const needed = Math.min(alerts.newToken.minLiquidityUsd, thresholds.minLiquidityUsd);
     // Cheap exit: without enough liquidity no alert can pass its gates.
     if (snapshot.liquidityUsd === null || snapshot.liquidityUsd < needed) {
       return { skipped: 'liquidity below every alert threshold', alertIds: [] };
     }
 
-    const since = new Date(now.getTime() - HISTORY_MS);
-    const [history, holders, reports] = await Promise.all([
+    const since = new Date(now.getTime() - LOOKBACK_MS);
+    const [history, holders, reports, trades] = await Promise.all([
       recentSnapshots(db, token.chain, token.address, since),
       recentHolderSnapshots(db, token.chain, token.address, since),
       latestSafetyReports(db, token.chain, token.address),
+      this.deps.tradeData ? this.deps.tradeData(token, since) : Promise.resolve(null),
     ]);
-    const earlier = history.filter((s) => s.observedAt.getTime() < snapshot.observedAt.getTime());
+    const snapshots = history.some((s) => s.observedAt.getTime() === snapshot.observedAt.getTime())
+      ? history
+      : [snapshot, ...history];
     const safety = aggregateSafety(reports, this.deps.minExternalSafety);
     const age = tokenAge(token, snapshot.pairCreatedAt, now);
-    const ctx = { now, current: snapshot, history: earlier, holders, tokenAgeMs: age?.ms ?? null };
-    const measurements = measureAll(ctx);
-    const score = computeScore(
-      measurements,
-      { safetyVerdict: safety.verdict, top10Pct: holders[0]?.top10Pct ?? null, liquidityChange5mPct: liquidityChange5mPct(ctx) },
-      this.spec,
+
+    const signal = detectMomentum(
+      {
+        chain: token.chain,
+        address: token.address,
+        tokenType: snapshot.dexId,
+        tokenAgeMs: age?.ms ?? null,
+        snapshots,
+        holders,
+        trades,
+      },
+      now.getTime(),
+      thresholds,
+      profile,
     );
-    const result: Evaluation = { score, alertIds: [] };
-    const common = { token, snapshot, holders: holders[0] ?? null, safety, age, measurements, now };
+    if (signal.signalType !== 'NO_SIGNAL') {
+      logger.debug(
+        { token: token.address, signalType: signal.signalType, score: signal.score, reasons: signal.reasons },
+        'momentum engine result',
+      );
+    }
+
+    const result: Evaluation = { signal, alertIds: [] };
+    const common = { token, snapshot, holders: holders[0] ?? null, safety, age, now };
 
     const newKey = dedupeKey('NEW_TOKEN', token.chain, token.address);
     if (!(await alertExists(db, newKey))) {
@@ -95,12 +140,12 @@ export class SignalService {
     }
 
     result.momentum = evaluateMomentum(
-      { now, snapshot, score, safety, lastAlert: await lastAlert(db, token.chain, token.address, 'MOMENTUM') },
+      { now, snapshot, signal, safety, lastAlert: await lastAlert(db, token.chain, token.address, 'MOMENTUM') },
       alerts,
     );
     if (result.momentum.eligible) {
       const key = dedupeKey('MOMENTUM', token.chain, token.address, now.getTime());
-      const id = await this.createAlert('MOMENTUM', key, common, score, result.momentum.gates);
+      const id = await this.createAlert('MOMENTUM', key, common, signal, result.momentum.gates);
       if (id !== null) result.alertIds.push(id);
     }
     return result;
@@ -115,10 +160,9 @@ export class SignalService {
       holders: HolderSnapshot | null;
       safety: SafetySummary;
       age: TokenAge | null;
-      measurements: Measurement[];
       now: Date;
     },
-    score: ScoreResult | null,
+    signal: MomentumSignal | null,
     gates: GateResult[],
   ): Promise<number | null> {
     const { db, alerts, logger, metrics } = this.deps;
@@ -126,13 +170,18 @@ export class SignalService {
     const suppressedReason = recent >= alerts.maxPerHour ? `limit of ${alerts.maxPerHour} alerts per hour reached` : null;
     const payload = buildAlertPayload({
       type,
-      token: { chain: c.token.chain, address: c.token.address, symbol: c.token.symbol ?? c.snapshot.symbol, name: c.token.name ?? c.snapshot.name },
+      token: {
+        chain: c.token.chain,
+        address: c.token.address,
+        symbol: c.token.symbol ?? c.snapshot.symbol,
+        name: c.token.name ?? c.snapshot.name,
+      },
       now: c.now,
       age: c.age,
       snapshot: c.snapshot,
       holders: c.holders,
       safety: c.safety,
-      score,
+      score: signal ? toScoreSummary(signal) : null,
       gates,
     });
     const client = await db.connect();
@@ -146,10 +195,7 @@ export class SignalService {
         status: suppressedReason ? 'SUPPRESSED' : 'PENDING',
         suppressedReason,
         payload,
-        score,
-        measurements: score ? c.measurements : [],
-        detectorVersion: DETECTOR_VERSION,
-        now: c.now,
+        momentum: signal,
       });
     } finally {
       client.release();
@@ -157,7 +203,7 @@ export class SignalService {
     if (id !== null) {
       const status = suppressedReason ? 'SUPPRESSED' : 'PENDING';
       metrics.alerts.inc({ type, status });
-      logger.info({ alertId: id, type, token: c.token.address, score: score?.score ?? null, status }, 'alert created');
+      logger.info({ alertId: id, type, token: c.token.address, score: signal?.score ?? null, status }, 'alert created');
     }
     return id;
   }

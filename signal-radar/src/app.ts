@@ -173,6 +173,7 @@ export async function createApp(config: AppConfig, overrides: AppOverrides = {})
   const signals = new SignalService({
     db: pool,
     alerts: config.alerts,
+    momentum: config.momentum,
     minExternalSafety: config.safety.minExternalPasses,
     logger,
     metrics,

@@ -115,7 +115,7 @@ export async function recentSnapshots(
   chain: Chain,
   address: string,
   since: Date,
-  limit = 500,
+  limit = 2_000,
 ): Promise<MarketSnapshot[]> {
   const { rows } = await db.query<SnapshotRow>(
     `SELECT s.*, t.symbol, t.name
