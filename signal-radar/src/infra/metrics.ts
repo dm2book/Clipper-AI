@@ -73,6 +73,12 @@ export class Metrics {
     labelNames: ['type', 'status'] as const,
     registers: [this.registry],
   });
+  readonly walletEvents = new Counter({
+    name: 'radar_wallet_events_total',
+    help: 'Wallet events received, by outcome (inserted, duplicate, invalid)',
+    labelNames: ['outcome'] as const,
+    registers: [this.registry],
+  });
   readonly notifications = new Counter({
     name: 'radar_notifications_total',
     help: 'Notification delivery attempts by outcome',

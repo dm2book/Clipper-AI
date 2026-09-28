@@ -1,6 +1,6 @@
 import type { AlertSettings } from '../config/env.js';
 import { evaluateMomentum, evaluateNewToken, type Decision } from '../core/alertRules.js';
-import { buildAlertPayload, dedupeKey, type AlertType, type GateResult, type ScoreSummary } from '../core/alerts.js';
+import { buildAlertPayload, dedupeKey, type GateResult, type ScoreSummary, type TokenAlertType } from '../core/alerts.js';
 import type { HolderSnapshot } from '../core/holders.js';
 import type { MarketSnapshot } from '../core/marketSnapshot.js';
 import { aggregateSafety, type SafetySummary } from '../core/safety.js';
@@ -152,7 +152,7 @@ export class SignalService {
   }
 
   private async createAlert(
-    type: AlertType,
+    type: TokenAlertType,
     key: string,
     c: {
       token: Token;

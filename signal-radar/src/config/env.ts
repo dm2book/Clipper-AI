@@ -5,6 +5,7 @@
  */
 import { z } from 'zod';
 import { DEFAULT_THRESHOLDS, parseOverrides, resolveThresholds, type ThresholdConfig } from '../momentum/thresholds.js';
+import { DEFAULT_ACTIVITY, DEFAULT_CRITERIA, type WalletIntelligenceConfig } from '../wallets/criteria.js';
 
 export interface TierIntervals {
   HOT: number;
@@ -63,6 +64,8 @@ export interface AppConfig {
   alerts: AlertSettings;
   /** Momentum Detection Engine thresholds (defaults + per chain/token-type overrides). */
   momentum: ThresholdConfig;
+  /** Wallet Intelligence: classification criteria, whale/tracked/cluster thresholds, watchlist. */
+  wallets: WalletIntelligenceConfig;
   tiers: TierSettings;
   enrichConcurrency: number;
   retentionDays: number;
@@ -89,6 +92,9 @@ const csv = z.string().transform((s) =>
     .split(',')
     .map((x) => x.trim())
     .filter(Boolean),
+);
+const addressList = csv.pipe(
+  z.array(z.string().regex(/^[1-9A-HJ-NP-Za-km-z]{32,44}$/, 'must be a comma-separated list of base58 addresses')),
 );
 const customSources = z
   .string()
@@ -185,6 +191,33 @@ export const envSchema = z.object({
       }
     })
     .optional(),
+  // Wallet Intelligence (src/wallets/criteria.ts documents each value)
+  WALLET_CRITERIA_VERSION: z.string().min(1).max(64).default(DEFAULT_CRITERIA.version),
+  WALLET_STATS_WINDOW_DAYS: int(1).default(DEFAULT_CRITERIA.statsWindowDays),
+  WALLET_MIN_CLOSED_POSITIONS: int(1).default(DEFAULT_CRITERIA.minClosedPositions),
+  WALLET_MIN_WIN_RATE: num(0).max(1).default(DEFAULT_CRITERIA.minWinRate),
+  WALLET_MIN_WIN_RATE_LOWER_BOUND: num(0).max(1).default(DEFAULT_CRITERIA.minWinRateLowerBound),
+  WALLET_MIN_AVG_RETURN_PCT: z.coerce.number().default(DEFAULT_CRITERIA.minAvgReturnPct),
+  WALLET_MIN_MEDIAN_RETURN_PCT: z.coerce.number().default(DEFAULT_CRITERIA.minMedianReturnPct),
+  WALLET_MIN_REALIZED_PNL_USD: z.coerce.number().default(DEFAULT_CRITERIA.minRealizedPnlUsd),
+  WALLET_MAX_LARGEST_WIN_SHARE: num(0.01).max(1).default(DEFAULT_CRITERIA.maxLargestWinShare),
+  WALLET_MAX_TRADES_PER_DAY: num(0.01).default(DEFAULT_CRITERIA.maxTradesPerDay),
+  WALLET_AUTO_TRACK_QUALIFIED: z.stringbool().default(DEFAULT_CRITERIA.autoTrackQualified),
+  WHALE_MIN_TRADE_USD: num(1).default(DEFAULT_ACTIVITY.whaleMinTradeUsd),
+  WHALE_MIN_LIQUIDITY_SHARE: num(0.001).max(1).default(DEFAULT_ACTIVITY.whaleMinLiquidityShare),
+  WHALE_LIQUIDITY_SHARE_FLOOR_USD: num(0).default(DEFAULT_ACTIVITY.whaleLiquidityShareFloorUsd),
+  WHALE_MAX_ALERTS_PER_WALLET_PER_HOUR: int(1).default(DEFAULT_ACTIVITY.whaleMaxAlertsPerWalletPerHour),
+  TRACKED_MIN_TRADE_USD: num(0).default(DEFAULT_ACTIVITY.trackedMinTradeUsd),
+  CLUSTER_WINDOW_MINUTES: num(0.5).default(DEFAULT_ACTIVITY.clusterWindowMinutes),
+  CLUSTER_MIN_WALLETS: int(2).default(DEFAULT_ACTIVITY.clusterMinWallets),
+  CLUSTER_MAX_WALLET_SHARE: num(0.01).max(1).default(DEFAULT_ACTIVITY.clusterMaxWalletShare),
+  CLUSTER_COOLDOWN_MINUTES: num(0).default(DEFAULT_ACTIVITY.clusterCooldownMinutes),
+  WALLET_EXCLUDE_PROGRAM_OWNED: z.stringbool().default(DEFAULT_ACTIVITY.excludeProgramOwned),
+  WALLET_IGNORE_LIST: addressList.optional(),
+  TRACKED_WALLETS: addressList.optional(),
+  WALLET_ALERT_MAX_EVENT_AGE_SECONDS: int(1).default(300),
+  WALLET_STATS_REFRESH_MINUTES: int(1).default(60),
+  WALLET_EVENT_RETENTION_DAYS: int(1).default(365),
   ALERT_COOLDOWN_MINUTES: num(0).default(15),
   ALERT_ESCALATION_POINTS: num(0).default(15),
   ALERTS_MAX_PER_HOUR: int(1).default(30),
@@ -238,6 +271,12 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): AppConfig {
   }
   if (e.ARCHIVE_AFTER_HOURS * 60 <= e.TIER_WARM_MINUTES) {
     throw new ConfigError(['ARCHIVE_AFTER_HOURS: must be later than TIER_WARM_MINUTES']);
+  }
+  if (e.CLUSTER_MAX_WALLET_SHARE * e.CLUSTER_MIN_WALLETS < 1) {
+    throw new ConfigError(['CLUSTER_MAX_WALLET_SHARE: must be at least 1 / CLUSTER_MIN_WALLETS']);
+  }
+  if (e.WALLET_EVENT_RETENTION_DAYS < e.WALLET_STATS_WINDOW_DAYS) {
+    throw new ConfigError(['WALLET_EVENT_RETENTION_DAYS: must be at least WALLET_STATS_WINDOW_DAYS']);
   }
 
   const config: AppConfig = {
@@ -319,6 +358,38 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): AppConfig {
         minConfidence: e.MOMENTUM_MIN_CONFIDENCE,
       },
       overrides: e.MOMENTUM_THRESHOLD_OVERRIDES ?? {},
+    },
+    wallets: {
+      criteria: {
+        version: e.WALLET_CRITERIA_VERSION,
+        statsWindowDays: e.WALLET_STATS_WINDOW_DAYS,
+        minClosedPositions: e.WALLET_MIN_CLOSED_POSITIONS,
+        minWinRate: e.WALLET_MIN_WIN_RATE,
+        minWinRateLowerBound: e.WALLET_MIN_WIN_RATE_LOWER_BOUND,
+        minAvgReturnPct: e.WALLET_MIN_AVG_RETURN_PCT,
+        minMedianReturnPct: e.WALLET_MIN_MEDIAN_RETURN_PCT,
+        minRealizedPnlUsd: e.WALLET_MIN_REALIZED_PNL_USD,
+        maxLargestWinShare: e.WALLET_MAX_LARGEST_WIN_SHARE,
+        maxTradesPerDay: e.WALLET_MAX_TRADES_PER_DAY,
+        autoTrackQualified: e.WALLET_AUTO_TRACK_QUALIFIED,
+      },
+      activity: {
+        whaleMinTradeUsd: e.WHALE_MIN_TRADE_USD,
+        whaleMinLiquidityShare: e.WHALE_MIN_LIQUIDITY_SHARE,
+        whaleLiquidityShareFloorUsd: e.WHALE_LIQUIDITY_SHARE_FLOOR_USD,
+        whaleMaxAlertsPerWalletPerHour: e.WHALE_MAX_ALERTS_PER_WALLET_PER_HOUR,
+        trackedMinTradeUsd: e.TRACKED_MIN_TRADE_USD,
+        clusterWindowMinutes: e.CLUSTER_WINDOW_MINUTES,
+        clusterMinWallets: e.CLUSTER_MIN_WALLETS,
+        clusterMaxWalletShare: e.CLUSTER_MAX_WALLET_SHARE,
+        clusterCooldownMinutes: e.CLUSTER_COOLDOWN_MINUTES,
+        excludeProgramOwned: e.WALLET_EXCLUDE_PROGRAM_OWNED,
+        ignoredWallets: e.WALLET_IGNORE_LIST ?? [],
+      },
+      manualWallets: [...new Set(e.TRACKED_WALLETS ?? [])],
+      alertMaxEventAgeSec: e.WALLET_ALERT_MAX_EVENT_AGE_SECONDS,
+      statsRefreshMinutes: e.WALLET_STATS_REFRESH_MINUTES,
+      eventRetentionDays: e.WALLET_EVENT_RETENTION_DAYS,
     },
     tiers: {
       hotMinutes: e.TIER_HOT_MINUTES,

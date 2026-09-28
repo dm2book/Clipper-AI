@@ -67,6 +67,6 @@ describe('WalletProvider placeholder', () => {
   it('fails loudly instead of returning empty history', async () => {
     const w = new UnconfiguredWalletProvider();
     expect(w.available).toBe(false);
-    await expect(w.getTrades()).rejects.toBeInstanceOf(NotConfiguredError);
+    await expect(w.getHistory()).rejects.toBeInstanceOf(NotConfiguredError);
   });
 });

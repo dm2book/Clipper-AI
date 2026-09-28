@@ -1,7 +1,11 @@
 import type { SafetyVerdict } from './safety.js';
 import type { Chain } from './types.js';
 
-export const ALERT_TYPES = ['NEW_TOKEN', 'MOMENTUM'] as const;
+export const TOKEN_ALERT_TYPES = ['NEW_TOKEN', 'MOMENTUM'] as const;
+export const WALLET_ALERT_TYPES = ['WHALE', 'TRACKED_WALLET', 'TRACKED_CLUSTER'] as const;
+export const ALERT_TYPES = [...TOKEN_ALERT_TYPES, ...WALLET_ALERT_TYPES] as const;
+export type TokenAlertType = (typeof TOKEN_ALERT_TYPES)[number];
+export type WalletAlertType = (typeof WALLET_ALERT_TYPES)[number];
 export type AlertType = (typeof ALERT_TYPES)[number];
 
 export interface GateResult {
@@ -16,8 +20,14 @@ export interface GateResult {
  * audited later exactly as it was decided — and so notification providers
  * never query anything themselves.
  */
-export interface AlertPayload {
-  type: AlertType;
+export type AlertPayload = TokenAlertPayload | WalletAlertPayload;
+
+export function isWalletAlert(p: AlertPayload): p is WalletAlertPayload {
+  return (WALLET_ALERT_TYPES as readonly string[]).includes(p.type);
+}
+
+export interface TokenAlertPayload {
+  type: TokenAlertType;
   chain: Chain;
   tokenAddress: string;
   /** Creator-chosen, untrusted text. Providers must sanitise before display. */
@@ -66,8 +76,75 @@ export function dedupeKey(type: AlertType, chain: Chain, address: string, suffix
   return suffix === undefined ? `${type}:${chain}:${address}` : `${type}:${chain}:${address}:${suffix}`;
 }
 
+/**
+ * Wallet activity alert (Wallet Intelligence). WHALE is about trade SIZE
+ * only; TRACKED_WALLET / TRACKED_CLUSTER are about wallets on the watchlist.
+ * Statistics are historical and measured over a stated window: they describe
+ * the past and are no prediction.
+ */
+export interface WalletAlertPayload {
+  type: WalletAlertType;
+  chain: Chain;
+  tokenAddress: string;
+  /** Creator-chosen, untrusted text. Providers must sanitise before display. */
+  symbol: string | null;
+  name: string | null;
+  decidedAt: string;
+  /** The triggering swap (WHALE / TRACKED_WALLET). */
+  trade: {
+    wallet: string;
+    side: 'buy' | 'sell';
+    valueUsd: number;
+    amountRaw: string;
+    signature: string;
+    blockTime: string;
+    source: string;
+  } | null;
+  /** Why the trade counts as whale activity; null when it does not. */
+  whaleReason: string | null;
+  /** Why the wallet is on the watchlist and its measured history. */
+  tracked: {
+    source: 'manual' | 'criteria';
+    reason: string;
+    stats: WalletStatsSummary | null;
+  } | null;
+  /** The wallet's position in this token after the trade, from the events the radar stored. */
+  exposure: {
+    qtyRaw: string;
+    costUsd: number | null;
+    valueUsd: number | null;
+    /** False when part of the position arrived by transfer or before the stored history. */
+    complete: boolean;
+  } | null;
+  cluster: {
+    wallets: { wallet: string; buyUsd: number; sharePct: number }[];
+    totalUsd: number;
+    /** Sum after the per-wallet share cap: no single wallet dominates this number. */
+    cappedTotalUsd: number;
+    maxWalletShare: number;
+    windowMinutes: number;
+    firstAt: string;
+    lastAt: string;
+  } | null;
+  market: { source: string; observedAt: string; priceUsd: number | null; liquidityUsd: number | null; marketCapUsd: number | null } | null;
+  notes: string[];
+}
+
+export interface WalletStatsSummary {
+  classification: string;
+  criteriaVersion: string;
+  windowDays: number;
+  reliableClosedPositions: number;
+  winRate: number | null;
+  winRateLowerBound: number | null;
+  avgReturnPct: number | null;
+  realizedPnlUsd: number;
+  avgHoldingSec: number | null;
+  computedAt: string;
+}
+
 export interface PayloadInput {
-  type: AlertType;
+  type: TokenAlertType;
   token: { chain: Chain; address: string; symbol: string | null; name: string | null };
   now: Date;
   age: { ms: number; source: 'onchain' | 'provider' } | null;
@@ -90,7 +167,7 @@ export interface PayloadInput {
 }
 
 /** Freezes the decision context into the stored/sent payload. */
-export function buildAlertPayload(i: PayloadInput): AlertPayload {
+export function buildAlertPayload(i: PayloadInput): TokenAlertPayload {
   return {
     type: i.type,
     chain: i.token.chain,

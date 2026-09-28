@@ -6,12 +6,21 @@ import type { Metrics } from '../infra/metrics.js';
 import { deleteHolderSnapshotsBefore, deleteProviderErrorsBefore } from '../repositories/enrichment.js';
 import { deleteSnapshotsBefore } from '../repositories/snapshots.js';
 import { deleteTradesBefore } from '../repositories/trades.js';
+import { deleteWalletEventsBefore } from '../repositories/wallets.js';
 import { archiveTokens, countByTier, updateTiers } from '../repositories/tokens.js';
 
 /** Tiering, archiving and data retention. */
 export class MaintenanceService {
   constructor(
-    private readonly deps: { db: Pool; tiers: TierSettings; retentionDays: number; logger: Logger; metrics: Metrics },
+    private readonly deps: {
+      db: Pool;
+      tiers: TierSettings;
+      retentionDays: number;
+      /** Wallet history is kept longer: statistics need the whole window. */
+      walletEventRetentionDays?: number;
+      logger: Logger;
+      metrics: Metrics;
+    },
   ) {}
 
   async tiersOnce(): Promise<void> {
@@ -32,8 +41,11 @@ export class MaintenanceService {
     const holders = await deleteHolderSnapshotsBefore(db, cutoff);
     const trades = await deleteTradesBefore(db, cutoff);
     const providerErrors = await deleteProviderErrorsBefore(db, new Date(Date.now() - 14 * 86_400_000));
-    if (snapshots || holders || trades || providerErrors) {
-      logger.info({ snapshots, holders, trades, providerErrors }, 'old data removed');
+    const walletEvents = this.deps.walletEventRetentionDays
+      ? await deleteWalletEventsBefore(db, new Date(Date.now() - this.deps.walletEventRetentionDays * 86_400_000))
+      : 0;
+    if (snapshots || holders || trades || providerErrors || walletEvents) {
+      logger.info({ snapshots, holders, trades, providerErrors, walletEvents }, 'old data removed');
     }
   }
 }

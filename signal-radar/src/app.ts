@@ -30,6 +30,7 @@ import type {
   NotificationProvider,
   SafetyProvider,
   TokenDiscoveryProvider,
+  WalletActivitySource,
   WalletProvider,
 } from './providers/interfaces.js';
 import { RugCheckSafetyProvider } from './providers/rugcheck/safety.js';
@@ -39,7 +40,8 @@ import { SolanaRpcHolderProvider } from './providers/solana/holders.js';
 import { MintInfoLoader } from './providers/solana/mintInfo.js';
 import { SolanaOnchainSafetyProvider } from './providers/solana/onchainSafety.js';
 import { SolanaRpcClient } from './providers/solana/rpcClient.js';
-import { UnconfiguredWalletProvider } from './providers/wallet/unconfigured.js';
+import { isOnCurve } from './providers/solana/pubkey.js';
+import { UnconfiguredWalletActivitySource, UnconfiguredWalletProvider } from './providers/wallet/unconfigured.js';
 import { recordProviderError } from './repositories/enrichment.js';
 import { outboxBacklog } from './repositories/alerts.js';
 import { DiscoveryService } from './services/discoveryService.js';
@@ -48,6 +50,7 @@ import { MaintenanceService } from './services/maintenanceService.js';
 import { MarketDataService } from './services/marketDataService.js';
 import { NotificationService } from './services/notificationService.js';
 import { SignalService } from './services/signalService.js';
+import { WalletIntelligenceService } from './services/walletIntelligenceService.js';
 import { Scheduler } from './workers/scheduler.js';
 
 export interface AppOverrides {
@@ -58,8 +61,9 @@ export interface AppOverrides {
   holders?: HolderProvider | null;
   notifier?: NotificationProvider;
   wallet?: WalletProvider;
+  walletActivity?: WalletActivitySource;
   /** Job intervals, shortened in tests. */
-  intervalsMs?: Partial<Record<'marketData' | 'enrichment' | 'notifications' | 'tiers' | 'retention', number>>;
+  intervalsMs?: Partial<Record<'marketData' | 'enrichment' | 'notifications' | 'tiers' | 'retention' | 'walletStats', number>>;
 }
 
 export interface App {
@@ -158,6 +162,7 @@ export async function createApp(config: AppConfig, overrides: AppOverrides = {})
   ];
   const holders = overrides.holders !== undefined ? overrides.holders : new SolanaRpcHolderProvider({ rpc, mints });
   const wallet = overrides.wallet ?? new UnconfiguredWalletProvider();
+  const walletActivity = overrides.walletActivity ?? new UnconfiguredWalletActivitySource();
   const notifier =
     overrides.notifier ??
     (config.discord.webhookUrl
@@ -206,7 +211,25 @@ export async function createApp(config: AppConfig, overrides: AppOverrides = {})
     },
   });
   const notificationService = new NotificationService({ db: pool, provider: notifier, logger, metrics });
-  const maintenance = new MaintenanceService({ db: pool, tiers: config.tiers, retentionDays: config.retentionDays, logger, metrics });
+  const wallets = new WalletIntelligenceService({
+    db: pool,
+    chain: 'solana',
+    config: config.wallets,
+    alerts: config.alerts,
+    isOnCurve,
+    logger,
+    metrics,
+    source: walletActivity,
+    history: wallet,
+  });
+  const maintenance = new MaintenanceService({
+    db: pool,
+    tiers: config.tiers,
+    retentionDays: config.retentionDays,
+    walletEventRetentionDays: config.wallets.eventRetentionDays,
+    logger,
+    metrics,
+  });
 
   const iv = overrides.intervalsMs ?? {};
   const scheduler = new Scheduler(logger, metrics)
@@ -214,7 +237,8 @@ export async function createApp(config: AppConfig, overrides: AppOverrides = {})
     .add({ name: 'enrichment', intervalMs: iv.enrichment ?? 1_000, run: (s) => enrichmentService.runOnce(s) })
     .add({ name: 'notifications', intervalMs: iv.notifications ?? 1_000, run: (s) => notificationService.runOnce(s) })
     .add({ name: 'tiers', intervalMs: iv.tiers ?? 30_000, run: () => maintenance.tiersOnce() })
-    .add({ name: 'retention', intervalMs: iv.retention ?? 3_600_000, run: () => maintenance.retentionOnce() });
+    .add({ name: 'retention', intervalMs: iv.retention ?? 3_600_000, run: () => maintenance.retentionOnce() })
+    .add({ name: 'wallet-stats', intervalMs: iv.walletStats ?? 10_000, run: (s) => wallets.statsOnce(s) });
 
   let health: HealthServer | null = null;
   let stopping = false;
@@ -252,7 +276,9 @@ export async function createApp(config: AppConfig, overrides: AppOverrides = {})
           safety: safety.map((s) => s.name),
           holders: holders?.name ?? null,
           notifier: notifier.name,
-          wallet: wallet.available ? wallet.name : 'not connected (roadmap phase 4)',
+          walletHistory: wallet.available ? wallet.name : 'not connected',
+          walletActivity: walletActivity.available ? walletActivity.name : 'not connected',
+          trackedWalletsManual: config.wallets.manualWallets.length,
           cache: cache!.kind,
         },
         'starting signal-radar',
@@ -261,6 +287,7 @@ export async function createApp(config: AppConfig, overrides: AppOverrides = {})
         logger.warn('DISCORD_WEBHOOK_URL not set: alerts are logged (dry run), not sent');
       }
       await discoveryService.start();
+      await wallets.start();
       scheduler.start();
       health = await startHealthServer({
         host: config.health.host,
@@ -275,6 +302,7 @@ export async function createApp(config: AppConfig, overrides: AppOverrides = {})
         stopping = true;
         logger.info('stopping: no new work; finishing in-flight work');
         await discoveryService.stop();
+        await wallets.stop().catch((err: unknown) => logger.warn({ err: String(err) }, 'wallet source did not stop cleanly'));
         const clean = await scheduler.stop(Math.max(1_000, config.shutdownTimeoutMs - 2_000));
         if (!clean) logger.warn('some jobs did not finish in time; their leases will expire and they will be retried');
         await health?.close();

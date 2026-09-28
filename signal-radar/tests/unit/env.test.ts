@@ -68,4 +68,31 @@ describe('loadConfig', () => {
   it('rejects inconsistent tier boundaries', () => {
     expect(() => loadConfig(baseEnv({ TIER_HOT_MINUTES: '60', TIER_WARM_MINUTES: '30' }))).toThrow(/TIER_WARM_MINUTES/);
   });
+
+  it('maps every Wallet Intelligence criterion and threshold from the environment', () => {
+    const w = 'Wa11et1111111111111111111111111111111111111';
+    const c = loadConfig(
+      baseEnv({
+        WALLET_MIN_CLOSED_POSITIONS: '40',
+        WALLET_MIN_WIN_RATE: '0.6',
+        WALLET_MIN_AVG_RETURN_PCT: '-5',
+        WHALE_MIN_TRADE_USD: '50000',
+        CLUSTER_WINDOW_MINUTES: '5',
+        CLUSTER_MIN_WALLETS: '4',
+        TRACKED_WALLETS: `${w}, ${w}`,
+        WALLET_IGNORE_LIST: w,
+      }),
+    );
+    expect(c.wallets.criteria).toMatchObject({ minClosedPositions: 40, minWinRate: 0.6, minAvgReturnPct: -5 });
+    expect(c.wallets.activity).toMatchObject({ whaleMinTradeUsd: 50_000, clusterWindowMinutes: 5, clusterMinWallets: 4, ignoredWallets: [w] });
+    expect(c.wallets.manualWallets).toEqual([w]);
+  });
+
+  it('rejects invalid wallet settings', () => {
+    expect(() => loadConfig(baseEnv({ TRACKED_WALLETS: 'not-an-address' }))).toThrow(/TRACKED_WALLETS/);
+    expect(() => loadConfig(baseEnv({ WALLET_MIN_WIN_RATE: '1.5' }))).toThrow(/WALLET_MIN_WIN_RATE/);
+    // a per-wallet cap below 1/N cannot be satisfied
+    expect(() => loadConfig(baseEnv({ CLUSTER_MIN_WALLETS: '2', CLUSTER_MAX_WALLET_SHARE: '0.3' }))).toThrow(/CLUSTER_MAX_WALLET_SHARE/);
+    expect(() => loadConfig(baseEnv({ WALLET_EVENT_RETENTION_DAYS: '30' }))).toThrow(/WALLET_EVENT_RETENTION_DAYS/);
+  });
 });

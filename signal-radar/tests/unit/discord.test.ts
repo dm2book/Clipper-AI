@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { AlertPayload } from '../../src/core/alerts.js';
+import type { TokenAlertPayload, WalletAlertPayload } from '../../src/core/alerts.js';
 import { DISCLAIMER, looksSpoofed, renderAlert, sanitize } from '../../src/providers/discord/formatter.js';
 import { DiscordWebhookProvider } from '../../src/providers/discord/webhook.js';
 import { scriptedFetch, testHttp } from '../support/http.js';
@@ -7,7 +7,7 @@ import { scriptedFetch, testHttp } from '../support/http.js';
 const ADDRESS = 'Token11111111111111111111111111111111111111';
 
 /** SYNTHETIC alert payload for rendering tests. */
-function payload(overrides: Partial<AlertPayload> = {}): AlertPayload {
+function payload(overrides: Partial<TokenAlertPayload> = {}): TokenAlertPayload {
   return {
     type: 'NEW_TOKEN',
     chain: 'solana',
@@ -128,5 +128,98 @@ describe('DiscordWebhookProvider', () => {
     expect(calls[0]!.url).toBe('https://discord.com/api/webhooks/1/tok?wait=true');
     expect(calls[0]!.method).toBe('POST');
     expect(calls[0]!.body).toMatchObject({ allowed_mentions: { parse: [] }, username: 'Signal Radar' });
+  });
+});
+
+/** SYNTHETIC wallet alert payload for rendering tests. */
+function walletPayload(overrides: Partial<WalletAlertPayload> = {}): WalletAlertPayload {
+  return {
+    type: 'WHALE',
+    chain: 'solana',
+    tokenAddress: ADDRESS,
+    symbol: 'TOKEN',
+    name: 'Token',
+    decidedAt: '2026-01-01T12:00:00.000Z',
+    trade: {
+      wallet: 'Wa11et1111111111111111111111111111111111111',
+      side: 'buy',
+      valueUsd: 48_000,
+      amountRaw: '1000',
+      signature: 'sig',
+      blockTime: '2026-01-01T11:59:50.000Z',
+      source: 'test',
+    },
+    whaleReason: '$48,000 ≥ $25,000',
+    tracked: null,
+    exposure: null,
+    cluster: null,
+    market: null,
+    notes: [],
+    ...overrides,
+  };
+}
+
+describe('wallet alert rendering', () => {
+  it('uses the agreed titles for whale, tracked and cluster alerts', () => {
+    expect(renderAlert(walletPayload(), 'x').embeds[0].title).toBe('🐋 Wallet bought $48,000 of TOKEN');
+    const tracked = walletPayload({
+      type: 'TRACKED_WALLET',
+      trade: { ...walletPayload().trade!, valueUsd: 12_400 },
+      whaleReason: null,
+      tracked: { source: 'criteria', reason: 'voldoet aan volgcriteria wallet-criteria-v1', stats: null },
+    });
+    expect(renderAlert(tracked, 'x').embeds[0].title).toBe('👁️ Tracked wallet bought $12,400 of TOKEN');
+    const cluster = walletPayload({
+      type: 'TRACKED_CLUSTER',
+      trade: null,
+      cluster: {
+        wallets: [1, 2, 3, 4].map((i) => ({ wallet: `W${i}`, buyUsd: 1_000, sharePct: 25 })),
+        totalUsd: 4_000,
+        cappedTotalUsd: 4_000,
+        maxWalletShare: 0.4,
+        windowMinutes: 3,
+        firstAt: '2026-01-01T11:57:00.000Z',
+        lastAt: '2026-01-01T11:59:00.000Z',
+      },
+    });
+    expect(renderAlert(cluster, 'x').embeds[0].title).toBe('👥 4 tracked wallets bought TOKEN within 3 minutes');
+  });
+
+  it('sanitises the untrusted symbol and never says "smart money"', () => {
+    const body = renderAlert(walletPayload({ symbol: '@everyone **X**' }), 'x');
+    const text = JSON.stringify(body);
+    expect(body.embeds[0].title).not.toContain('@everyone');
+    expect(body.allowed_mentions.parse).toEqual([]);
+    expect(text.toLowerCase()).not.toContain('smart money');
+    expect(body.embeds[0].footer.text).toBe(DISCLAIMER);
+  });
+
+  it('shows the tracked wallet statistics as history, with the sample size', () => {
+    const body = renderAlert(
+      walletPayload({
+        type: 'TRACKED_WALLET',
+        tracked: {
+          source: 'criteria',
+          reason: 'voldoet aan volgcriteria wallet-criteria-v1',
+          stats: {
+            classification: 'QUALIFIED',
+            criteriaVersion: 'wallet-criteria-v1',
+            windowDays: 90,
+            reliableClosedPositions: 34,
+            winRate: 0.62,
+            winRateLowerBound: 0.48,
+            avgReturnPct: 21,
+            realizedPnlUsd: 18_200,
+            avgHoldingSec: 5_400,
+            computedAt: '2026-01-01T11:00:00.000Z',
+          },
+        },
+      }),
+      'x',
+    );
+    const field = body.embeds[0].fields.find((f) => f.name === 'Gevolgde wallet')!;
+    expect(field.value).toContain('34 gesloten posities in 90d');
+    expect(field.value).toContain('winrate 62%');
+    expect(field.value).toContain('geen voorspelling');
   });
 });

@@ -27,7 +27,7 @@ Ontwerp: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) · Status per databron: 
 | NEW TOKEN- en MOMENTUM-alerts naar Discord (outbox, retries, rate limits) | ✅ |
 | Realtime monitoring in tiers (15 s → 60 s → 5 min → archief) | ✅ |
 | Unieke kopers/verkopers, wash-trading, extreme-trade-filter | ✅ in de engine · ❌ databron (trade stream, fase 3) nog niet gekoppeld |
-| Wallets met aantoonbare historie volgen | ❌ fase 4 (`WalletProvider` bestaat als interface, niet gekoppeld) |
+| Wallet Intelligence: whale-activiteit, gevolgde wallets, clusters, PnL/winrate/classificatie | ✅ module en tests ([docs/WALLETS.md](docs/WALLETS.md)) · ❌ databron voor wallet-events nog niet gekoppeld |
 
 ## Snel starten (lokaal)
 
@@ -106,6 +106,13 @@ Cooldown van 15 min per token. Daarbinnen komt er alleen een nieuwe alert als de
 
 Globaal gaan er maximaal `ALERTS_MAX_PER_HOUR` alerts uit. Alerts boven die limiet worden als `SUPPRESSED` vastgelegd, met reden.
 
+**Wallet-alerts** ([`docs/WALLETS.md`](docs/WALLETS.md)). Er zijn drie soorten, bewust gescheiden:
+- **WHALE** (`🐋 Wallet bought $48,000 of TOKEN`): één swap ≥ `WHALE_MIN_TRADE_USD`, of ≥ 5% van de pool-liquiditeit. Dit zegt alleen iets over de omvang, niets over de kwaliteit van de trader.
+- **TRACKED_WALLET** (`👁️ Tracked wallet bought $12,400 of TOKEN`): een wallet op de volglijst. Die komt daar handmatig (`TRACKED_WALLETS`) of omdat hij aan **alle** ingestelde, meetbare criteria voldoet. Het label "smart money" wordt nergens gebruikt.
+- **TRACKED_CLUSTER** (`👥 4 tracked wallets bought TOKEN within 3 minutes`): meerdere gevolgde wallets kopen binnen het venster. Per wallet telt maximaal `CLUSTER_MAX_WALLET_SHARE` mee.
+
+Wallet-alerts gaan alleen uit voor tokens die de radar volgt, en alleen voor verse, geslaagde swaps. Een backfill geeft nooit alerts.
+
 ### Momentum Score (voorbeeld, berekend op synthetische testdata)
 
 ```
@@ -179,11 +186,13 @@ src/
   index.ts            startpunt, signalen, graceful shutdown
   app.ts              composition root (bouwt en verbindt alles)
   config/env.ts       validatie van environment variables
-  core/               domein, puur (token, snapshot, safety, holders, signals, scoring, alertRules, alerts)
+  core/               domein, puur (token, snapshot, safety, holders, alertRules, alerts)
+  momentum/           Momentum Detection Engine (puur)
+  wallets/            Wallet Intelligence (puur): ledger/PnL, stats, classificatie, whale/cluster
   infra/              db, http (retry/timeout/429), rateLimiter, circuitBreaker, cache, metrics, logger
   providers/          interfaces.ts + solana/, dexscreener/, rugcheck/, goplus/, discord/, console/, wallet/
   repositories/       alle SQL
-  services/           discovery, marketData, enrichment, signal, notification, maintenance
+  services/           discovery, marketData, enrichment, signal, walletIntelligence, notification, maintenance
   workers/scheduler.ts
   http/healthServer.ts
 migrations/           genummerde SQL-migraties

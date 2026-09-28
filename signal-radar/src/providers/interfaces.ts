@@ -11,6 +11,7 @@ import type { MarketSnapshot } from '../core/marketSnapshot.js';
 import type { SafetyReport } from '../core/safety.js';
 import type { DiscoveredToken } from '../core/token.js';
 import type { Chain } from '../core/types.js';
+import type { WalletEvent } from '../wallets/model.js';
 
 export interface DiscoveryHealth {
   connected: boolean;
@@ -54,26 +55,31 @@ export interface HolderProvider {
   getHolders(chain: Chain, address: string, signal?: AbortSignal): Promise<HolderSnapshot>;
 }
 
-export interface WalletTrade {
-  chain: Chain;
-  wallet: string;
-  tokenAddress: string;
-  side: 'buy' | 'sell';
-  /** Raw token amount as a decimal string. */
-  amountToken: string;
-  valueUsd: number | null;
-  signature: string;
-  blockTime: Date;
-}
-
 /**
- * Wallet history for "smart wallet" tracking (roadmap phase 4). No
- * implementation is connected yet: see providers/wallet/unconfigured.ts.
+ * Wallet history (Wallet Intelligence): used to backfill a wallet that was
+ * just added to the watchlist, so its statistics do not start from zero.
+ * NOT CONNECTED YET: see providers/wallet/unconfigured.ts and docs/PROVIDERS.md.
  */
 export interface WalletProvider {
   readonly name: string;
   readonly available: boolean;
-  getTrades(chain: Chain, wallet: string, since: Date, signal?: AbortSignal): Promise<WalletTrade[]>;
+  /** Every swap/transfer of `wallet` since `since`, failed transactions included (status 'failed'). */
+  getHistory(chain: Chain, wallet: string, since: Date, signal?: AbortSignal): Promise<WalletEvent[]>;
+}
+
+/**
+ * Live wallet-level swaps and transfers (Wallet Intelligence). Each event
+ * must carry its signature + instruction index (dedupe), status, raw amount
+ * and — only when the source actually knows it — the USD value.
+ * NOT CONNECTED YET: see providers/wallet/unconfigured.ts and docs/PROVIDERS.md.
+ */
+export interface WalletActivitySource {
+  readonly name: string;
+  readonly available: boolean;
+  start(handler: (events: WalletEvent[]) => Promise<void>): Promise<void>;
+  stop(): Promise<void>;
+  /** The watchlist; a source that sees every swap may use it only for priority. */
+  setWatchlist(chain: Chain, wallets: readonly string[]): void;
 }
 
 /** Delivers an alert somewhere (Discord, console, …). */

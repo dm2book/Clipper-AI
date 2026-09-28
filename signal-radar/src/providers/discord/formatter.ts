@@ -9,7 +9,7 @@
  *  - no link is built from token metadata; only fixed explorer URLs with the
  *    (base58-validated) address
  */
-import type { AlertPayload } from '../../core/alerts.js';
+import { isWalletAlert, type AlertPayload, type TokenAlertPayload, type WalletAlertPayload } from '../../core/alerts.js';
 
 export const DISCLAIMER = 'Meetbare signalen, geen financieel advies en geen koersvoorspelling.';
 
@@ -60,7 +60,22 @@ function cap(text: string, max: number): string {
   return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 }
 
-const COLORS = { NEW_TOKEN: 0x3b82f6, MOMENTUM: 0xf59e0b } as const;
+const COLORS = {
+  NEW_TOKEN: 0x3b82f6,
+  MOMENTUM: 0xf59e0b,
+  WHALE: 0x64748b,
+  TRACKED_WALLET: 0x10b981,
+  TRACKED_CLUSTER: 0x8b5cf6,
+} as const;
+
+/** Exact dollar amount for wallet alert titles: "$48,000". */
+export function usdExact(v: number): string {
+  return `$${Math.round(v).toLocaleString('en-US')}`;
+}
+
+function pctOrUnknown(v: number | null, digits = 0): string {
+  return v === null ? 'onbekend' : `${(v * 100).toFixed(digits)}%`;
+}
 
 export interface DiscordEmbed {
   title: string;
@@ -79,6 +94,22 @@ export interface DiscordWebhookBody {
 }
 
 export function renderAlert(p: AlertPayload, username: string): DiscordWebhookBody {
+  const embed = isWalletAlert(p) ? walletEmbed(p) : tokenEmbed(p);
+  return { username: cap(username, 80), allowed_mentions: { parse: [] }, embeds: [enforceTotal(embed)] };
+}
+
+function fieldList() {
+  const fields: DiscordEmbed['fields'] = [];
+  const add = (name: string, value: string, inline = true) =>
+    fields.push({ name: cap(name, LIMITS.fieldName), value: cap(value || '—', LIMITS.fieldValue), inline });
+  return { fields, add };
+}
+
+function addressLinks(address: string): string {
+  return `\`${address}\`\n[DexScreener](https://dexscreener.com/solana/${address}) · [Solscan](https://solscan.io/token/${address})`;
+}
+
+function tokenEmbed(p: TokenAlertPayload): DiscordEmbed {
   const symbol = sanitize(p.symbol, 24);
   const address = BASE58.test(p.tokenAddress) ? p.tokenAddress : null;
   const title =
@@ -86,9 +117,7 @@ export function renderAlert(p: AlertPayload, username: string): DiscordWebhookBo
       ? `🆕 Nieuwe token: ${symbol}`
       : `📈 Uitzonderlijke activiteit: ${symbol} — Momentum Score ${p.score?.value.toFixed(0) ?? '?'}/100`;
 
-  const fields: DiscordEmbed['fields'] = [];
-  const add = (name: string, value: string, inline = true) =>
-    fields.push({ name: cap(name, LIMITS.fieldName), value: cap(value || '—', LIMITS.fieldValue), inline });
+  const { fields, add } = fieldList();
 
   add('Token', `${sanitize(p.name, 48)} (${symbol})${looksSpoofed(p.symbol) ? '\n⚠️ ongebruikelijke tekens in ticker' : ''}`);
   add('Leeftijd', p.age ? `${duration(p.age.seconds)} (${p.age.source === 'onchain' ? 'on-chain' : 'volgens marktdata'})` : 'onbekend');
@@ -132,10 +161,10 @@ export function renderAlert(p: AlertPayload, username: string): DiscordWebhookBo
     false,
   );
   if (address) {
-    add('Adres', `\`${address}\`\n[DexScreener](https://dexscreener.com/solana/${address}) · [Solscan](https://solscan.io/token/${address})`, false);
+    add('Adres', addressLinks(address), false);
   }
 
-  const embed: DiscordEmbed = {
+  return {
     title: cap(title, LIMITS.title),
     ...(address ? { url: `https://dexscreener.com/solana/${address}` } : {}),
     color: COLORS[p.type],
@@ -143,7 +172,84 @@ export function renderAlert(p: AlertPayload, username: string): DiscordWebhookBo
     footer: { text: DISCLAIMER },
     timestamp: p.decidedAt,
   };
-  return { username: cap(username, 80), allowed_mentions: { parse: [] }, embeds: [enforceTotal(embed)] };
+}
+
+const shortAddr = (a: string) => (BASE58.test(a) ? `${a.slice(0, 4)}…${a.slice(-4)}` : '—');
+
+function walletTitle(p: WalletAlertPayload, symbol: string): string {
+  if (p.type === 'TRACKED_CLUSTER' && p.cluster) {
+    return `👥 ${p.cluster.wallets.length} tracked wallets bought ${symbol} within ${p.cluster.windowMinutes} minutes`;
+  }
+  const t = p.trade;
+  if (!t) return `Wallet activity: ${symbol}`;
+  const verb = t.side === 'buy' ? 'bought' : 'sold';
+  return p.type === 'TRACKED_WALLET'
+    ? `👁️ Tracked wallet ${verb} ${usdExact(t.valueUsd)} of ${symbol}`
+    : `🐋 Wallet ${verb} ${usdExact(t.valueUsd)} of ${symbol}`;
+}
+
+function walletEmbed(p: WalletAlertPayload): DiscordEmbed {
+  const symbol = sanitize(p.symbol, 24);
+  const address = BASE58.test(p.tokenAddress) ? p.tokenAddress : null;
+  const { fields, add } = fieldList();
+
+  add('Token', `${sanitize(p.name, 48)} (${symbol})${looksSpoofed(p.symbol) ? '\n⚠️ ongebruikelijke tekens in ticker' : ''}`);
+  if (p.trade) {
+    const w = BASE58.test(p.trade.wallet) ? p.trade.wallet : null;
+    add(
+      'Wallet',
+      w ? `\`${shortAddr(w)}\` · [Solscan](https://solscan.io/account/${w})` : '—',
+    );
+    add(p.trade.side === 'buy' ? 'Koop' : 'Verkoop', `${usdExact(p.trade.valueUsd)} · ${new Date(p.trade.blockTime).toISOString().slice(11, 19)} UTC`);
+  }
+  if (p.whaleReason) add('Whale-activiteit', `Grote transactie: ${sanitize(p.whaleReason, 120)}`, false);
+  if (p.tracked) {
+    const lines = [`Gevolgd: ${p.tracked.source === 'manual' ? 'handmatig toegevoegd' : sanitize(p.tracked.reason, 200)}`];
+    const s = p.tracked.stats;
+    if (s) {
+      lines.push(
+        `${s.reliableClosedPositions} gesloten posities in ${s.windowDays}d · winrate ${pctOrUnknown(s.winRate)} (ondergrens ${pctOrUnknown(s.winRateLowerBound)})`,
+        `gem. return ${s.avgReturnPct === null ? 'onbekend' : `${s.avgReturnPct.toFixed(0)}%`} · gerealiseerd ${usd(s.realizedPnlUsd)}${s.avgHoldingSec === null ? '' : ` · gem. houdduur ${duration(s.avgHoldingSec)}`}`,
+        `${s.classification} · ${s.criteriaVersion} · historisch, geen voorspelling`,
+      );
+    } else {
+      lines.push('Nog geen berekende historie.');
+    }
+    add('Gevolgde wallet', lines.join('\n'), false);
+  }
+  if (p.exposure) {
+    add(
+      'Positie na deze trade',
+      `${p.exposure.valueUsd === null ? 'waarde onbekend' : usd(p.exposure.valueUsd)} · kostprijs ${usd(p.exposure.costUsd)}${p.exposure.complete ? '' : '\n(onvolledig: deel via transfer of van vóór de opgeslagen historie)'}`,
+      false,
+    );
+  }
+  if (p.cluster) {
+    const c = p.cluster;
+    const lines = c.wallets
+      .slice(0, 10)
+      .map((w) => `• \`${shortAddr(w.wallet)}\` ${usdExact(w.buyUsd)} (${w.sharePct.toFixed(0)}%)`);
+    if (c.wallets.length > 10) lines.push(`… en ${c.wallets.length - 10} meer`);
+    lines.push(
+      `Totaal ${usdExact(c.totalUsd)} · gewogen ${usdExact(c.cappedTotalUsd)} (max ${(c.maxWalletShare * 100).toFixed(0)}% per wallet)`,
+    );
+    add('Gevolgde wallets', lines.join('\n'), false);
+  }
+  if (p.market) {
+    add('Liquiditeit', usd(p.market.liquidityUsd));
+    add('Market cap', usd(p.market.marketCapUsd));
+  }
+  if (p.notes.length) add('Let op', p.notes.slice(0, 5).map((n) => `• ${sanitize(n, 160)}`).join('\n'), false);
+  if (address) add('Adres', addressLinks(address), false);
+
+  return {
+    title: cap(walletTitle(p, symbol), LIMITS.title),
+    ...(address ? { url: `https://dexscreener.com/solana/${address}` } : {}),
+    color: COLORS[p.type],
+    fields: fields.slice(0, LIMITS.fields),
+    footer: { text: DISCLAIMER },
+    timestamp: p.decidedAt,
+  };
 }
 
 /** Discord rejects embeds over 6000 characters in total; trim the longest fields first. */

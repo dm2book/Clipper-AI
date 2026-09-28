@@ -69,6 +69,15 @@ export async function countAlertsSince(db: Queryable, since: Date): Promise<numb
   return Number(rows[0]!.n);
 }
 
+/** Alerts of one type about one wallet since `since` (delivered or pending ones). */
+export async function countWalletAlertsSince(db: Queryable, wallet: string, type: AlertType, since: Date): Promise<number> {
+  const { rows } = await db.query<{ n: string }>(
+    `SELECT count(*) AS n FROM alerts WHERE wallet = $1 AND type = $2 AND created_at >= $3 AND status IN ('PENDING', 'SENT')`,
+    [wallet, type, since],
+  );
+  return Number(rows[0]!.n);
+}
+
 /**
  * Stores the engine output (if any) and the alert in one transaction: an
  * alert never exists without its evidence. Returns the alert id, or null
@@ -85,6 +94,8 @@ export async function createAlertWithEvidence(
     suppressedReason: string | null;
     payload: AlertPayload;
     momentum: MomentumSignal | null;
+    /** The wallet a wallet alert is about (for per-wallet limits). */
+    wallet?: string | null;
   },
 ): Promise<number | null> {
   await client.query('BEGIN');
@@ -113,8 +124,8 @@ export async function createAlertWithEvidence(
       signalId = Number(rows[0]!.id);
     }
     const { rows } = await client.query<{ id: string }>(
-      `INSERT INTO alerts (chain, token_address, type, momentum_signal_id, score, dedupe_key, status, suppressed_reason, payload)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      `INSERT INTO alerts (chain, token_address, type, momentum_signal_id, score, dedupe_key, status, suppressed_reason, payload, wallet)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
        ON CONFLICT (dedupe_key) DO NOTHING RETURNING id`,
       [
         a.chain,
@@ -126,6 +137,7 @@ export async function createAlertWithEvidence(
         a.status,
         a.suppressedReason,
         JSON.stringify(a.payload),
+        a.wallet ?? null,
       ],
     );
     if (!rows[0]) {

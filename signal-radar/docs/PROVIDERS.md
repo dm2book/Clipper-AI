@@ -24,7 +24,8 @@ documentatie en in de code als `SYNTHETIC` gemarkeerd.
 | `SafetyProvider` (extern) | `RugCheckSafetyProvider` | ⚠️ | RugCheck Swagger |
 | `SafetyProvider` (extern) | `GoPlusSafetyProvider` | ⚠️ (API zelf is **beta**) | GoPlus docs |
 | `HolderProvider` | `SolanaRpcHolderProvider` | ✅ RPC-methoden · ⚠️ `getProgramAccounts` is bij veel providers beperkt | Solana JSON-RPC-spec |
-| `WalletProvider` | `UnconfiguredWalletProvider` | ❌ gooit `NotConfiguredError` | roadmap fase 4 |
+| `WalletProvider` (historie, backfill) | `UnconfiguredWalletProvider` | ❌ gooit `NotConfiguredError` | nog te kiezen |
+| `WalletActivitySource` (live wallet-events) | `UnconfiguredWalletActivitySource` | ❌ niet gekoppeld: Wallet Intelligence krijgt geen events | nog te kiezen |
 | `NotificationProvider` | `DiscordWebhookProvider` | ✅ | Discord API: Execute Webhook |
 | `NotificationProvider` | `ConsoleNotificationProvider` | ✅ dry run (zonder webhook-URL) | — |
 
@@ -79,7 +80,7 @@ documentatie en in de code als `SYNTHETIC` gemarkeerd.
 
 | Wat | Waarom nodig | Richting |
 |---|---|---|
-| `WalletProvider` | Wallets met aantoonbare historie volgen (fase 4) | Helius Enhanced Transactions of de eigen `trades`-tabel (fase 3) |
+| `WalletActivitySource` + `WalletProvider` | Wallet Intelligence: de module (ledger, PnL, classificatie, alerts) is klaar en getest, maar krijgt geen events. Eisen aan de bron: zie [WALLETS.md](WALLETS.md#databron-koppelen) | Een geparste transactiestroom (bijv. Helius Enhanced Transactions/webhooks) of een eigen swap-decoder (fase 3). ⚠️ Eerst documentatie verifiëren en antwoorden opnemen |
 | Trade stream | Unieke kopers/verkopers, wash-trading-heuristiek en extreme-trade-filter in de Momentum Engine: de engine en de tabel `trades` staan klaar, alleen de databron ontbreekt (fase 3) | Helius Enhanced WebSocket / LaserStream (⚠️ beschikbaarheid per abonnement) |
 | Helius DAS `getTokenAccounts` | Holders tellen zonder `getProgramAccounts` | Tweede `HolderProvider` |
 | Birdeye | Fallback voor launches en marktdata | `new_listing` + WebSocket (⚠️ afhankelijk van het pakket) |

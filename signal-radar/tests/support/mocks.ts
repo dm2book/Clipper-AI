@@ -4,6 +4,7 @@
  * without network access. Never wired into the application.
  */
 import type { AlertPayload } from '../../src/core/alerts.js';
+import type { WalletEvent } from '../../src/wallets/model.js';
 import { TransientError } from '../../src/core/errors.js';
 import type { HolderSnapshot } from '../../src/core/holders.js';
 import type { MarketSnapshot } from '../../src/core/marketSnapshot.js';
@@ -17,8 +18,8 @@ import type {
   NotificationProvider,
   SafetyProvider,
   TokenDiscoveryProvider,
+  WalletActivitySource,
   WalletProvider,
-  WalletTrade,
 } from '../../src/providers/interfaces.js';
 import { makeHolders, makeSafety, makeSnapshot, type SnapshotOverrides } from './factories.js';
 
@@ -119,9 +120,31 @@ export class MockNotificationProvider implements NotificationProvider {
 export class MockWalletProvider implements WalletProvider {
   readonly name = 'mock-wallet';
   readonly available = true;
-  readonly trades: WalletTrade[] = [];
+  readonly events: WalletEvent[] = [];
 
-  async getTrades(chain: Chain, wallet: string, since: Date): Promise<WalletTrade[]> {
-    return this.trades.filter((t) => t.chain === chain && t.wallet === wallet && t.blockTime >= since);
+  async getHistory(chain: Chain, wallet: string, since: Date): Promise<WalletEvent[]> {
+    return this.events.filter((e) => e.chain === chain && e.wallet === wallet && e.blockTime >= since);
+  }
+}
+
+/** Test-only activity source: `emit` pushes synthetic events into the handler. */
+export class MockWalletActivitySource implements WalletActivitySource {
+  readonly name = 'mock-wallet-activity';
+  readonly available = true;
+  watchlist: string[] = [];
+  private handler: ((events: WalletEvent[]) => Promise<void>) | null = null;
+
+  async start(handler: (events: WalletEvent[]) => Promise<void>): Promise<void> {
+    this.handler = handler;
+  }
+  async stop(): Promise<void> {
+    this.handler = null;
+  }
+  setWatchlist(_chain: Chain, wallets: readonly string[]): void {
+    this.watchlist = [...wallets];
+  }
+  async emit(events: WalletEvent[]): Promise<void> {
+    if (!this.handler) throw new Error('activity source not started');
+    await this.handler(events);
   }
 }

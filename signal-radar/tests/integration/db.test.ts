@@ -15,7 +15,7 @@ describe.skipIf(!hasDatabase)('database schema and migrations', () => {
   it('is idempotent', async () => {
     expect(await migrate(pool, silentLogger())).toEqual([]);
     const { rows } = await pool.query('SELECT name FROM schema_migrations');
-    expect(rows.map((r) => r.name)).toEqual(['0001_init.sql', '0002_momentum_engine.sql']);
+    expect(rows.map((r) => r.name)).toEqual(['0001_init.sql', '0002_momentum_engine.sql', '0003_wallet_intelligence.sql']);
   });
 
   it('creates every table the services use', async () => {
@@ -33,7 +33,10 @@ describe.skipIf(!hasDatabase)('database schema and migrations', () => {
       'schema_migrations',
       'system_state',
       'tokens',
+      'tracked_wallets',
       'trades',
+      'wallet_events',
+      'wallets',
     ]);
   });
 
@@ -58,6 +61,25 @@ describe.skipIf(!hasDatabase)('database schema and migrations', () => {
     await expect(
       pool.query(`INSERT INTO alerts (chain, token_address, type, dedupe_key, status, payload)
                   VALUES ('solana', 'A', 'MOMENTUM', 'k2', 'SUPPRESSED', '{}')`),
+    ).rejects.toThrow(/check/i);
+  });
+
+  it('dedupes wallet events and accepts the wallet alert types', async () => {
+    const ins = `INSERT INTO wallet_events (chain, signature, ix_index, wallet, token_address, kind, status, amount_raw, block_time, source)
+                 VALUES ('solana', 's', 0, 'W', 'T', 'buy', 'success', 1, now(), 'test')`;
+    await pool.query(ins);
+    await expect(pool.query(ins)).rejects.toThrow(/duplicate key/i);
+    await expect(pool.query(ins.replace("'buy'", "'swap'").replace("'s', 0", "'s2', 0"))).rejects.toThrow(/check/i);
+    for (const type of ['WHALE', 'TRACKED_WALLET', 'TRACKED_CLUSTER']) {
+      await pool.query(
+        `INSERT INTO alerts (chain, token_address, type, dedupe_key, status, payload, wallet)
+         VALUES ('solana', 'A', $1, $2, 'PENDING', '{}', 'W')`,
+        [type, `k-${type}`],
+      );
+    }
+    await expect(
+      pool.query(`INSERT INTO alerts (chain, token_address, type, dedupe_key, status, payload)
+                  VALUES ('solana', 'A', 'SMART_MONEY', 'k-x', 'PENDING', '{}')`),
     ).rejects.toThrow(/check/i);
   });
 
